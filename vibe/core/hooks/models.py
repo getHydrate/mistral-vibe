@@ -20,6 +20,8 @@ class HookMessageSeverity(StrEnum):
 class HookType(StrEnum):
     POST_AGENT_TURN = auto()
     USER_PROMPT_SUBMIT = auto()
+    PRE_COMPACT = auto()
+    SESSION_START = auto()
 
 
 # --- Declarative hook config (TOML on disk) ---
@@ -64,6 +66,13 @@ class HookInvocation(BaseModel):
     prompt: str | None = None
     message_id: str | None = None
     project: str | None = None
+    # session_start fields
+    source: str | None = None
+    parent_session_id: str | None = None
+    # pre_compact fields
+    reason: str | None = None
+    token_estimate_before: int | None = None
+    auto_compact_threshold: int | None = None
 
 
 # --- Hook result parsing ---

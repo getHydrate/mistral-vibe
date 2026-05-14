@@ -337,6 +337,7 @@ class AgentLoop:
         self.hook_config_issues = (
             hook_config_result.issues if hook_config_result else []
         )
+        self._pending_session_start_source: str | None = "new"
         self.rewind_manager = RewindManager(
             messages=self.messages,
             save_messages=self._save_messages,
@@ -815,6 +816,29 @@ class AgentLoop:
             self._hooks_manager.reset_retry_count()
 
         try:
+            if self._pending_session_start_source is not None:
+                source = self._pending_session_start_source
+                self._pending_session_start_source = None
+                if self._hooks_manager and self._hooks_manager.has_hooks(
+                    HookType.SESSION_START
+                ):
+                    async for hook_event in self._hooks_manager.run_session_start(
+                        source=source,
+                        session_id=self.session_id,
+                        session_logger=self.session_logger,
+                        parent_session_id=self.parent_session_id,
+                    ):
+                        if isinstance(hook_event, HookInjectedContext):
+                            self.messages.append(
+                                LLMMessage(
+                                    role=Role.user,
+                                    content=hook_event.content,
+                                    injected=True,
+                                )
+                            )
+                        else:
+                            yield hook_event
+
             if self._hooks_manager and self._hooks_manager.has_hooks(
                 HookType.USER_PROMPT_SUBMIT
             ):
@@ -1546,6 +1570,7 @@ class AgentLoop:
             forked.tool_manager,
             forked.agent_profile,
         )
+        forked._pending_session_start_source = "fork"
         return forked
 
     def _messages_for_fork(self, message_id: str | None) -> list[LLMMessage]:
@@ -1600,6 +1625,7 @@ class AgentLoop:
         self.middleware_pipeline.reset()
         self.tool_manager.reset_all()
         self._reset_session(keep_parent=False)
+        self._pending_session_start_source = "clear"
 
     @requires_init
     async def compact(self, extra_instructions: str = "") -> str:
@@ -1619,6 +1645,21 @@ class AgentLoop:
                     f"\n\n## Additional Instructions\n{extra_instructions}"
                 )
             self.stats.steps += 1
+
+            if self._hooks_manager and self._hooks_manager.has_hooks(HookType.PRE_COMPACT):
+                token_estimate = self.stats.context_tokens
+                try:
+                    threshold = self.config.get_active_model().auto_compact_threshold
+                except ValueError:
+                    threshold = None
+                async for _ in self._hooks_manager.run_pre_compact(
+                    session_id=self.session_id,
+                    session_logger=self.session_logger,
+                    reason="auto_compact",
+                    token_estimate_before=token_estimate,
+                    auto_compact_threshold=threshold,
+                ):
+                    pass
 
             with self.messages.silent():
                 self.messages.append(
@@ -1640,6 +1681,7 @@ class AgentLoop:
 
             active_model = self.config.get_active_model()
             self._reset_session()
+            self._pending_session_start_source = "continue"
 
             actual_context_tokens = await self.backend.count_tokens(
                 model=active_model,
