@@ -24,7 +24,13 @@ from vibe.core.agents.manager import AgentManager
 from vibe.core.agents.models import AgentProfile, BuiltinAgentName
 from vibe.core.config import ModelConfig, ProviderConfig, VibeConfig
 from vibe.core.hooks.manager import HooksManager
-from vibe.core.hooks.models import HookConfigResult, HookType, HookUserMessage
+from vibe.core.hooks.models import (
+    HookConfigResult,
+    HookDenied,
+    HookInjectedContext,
+    HookType,
+    HookUserMessage,
+)
 from vibe.core.llm.backend.factory import BACKEND_FACTORY
 from vibe.core.llm.exceptions import BackendError
 from vibe.core.llm.format import (
@@ -809,6 +815,34 @@ class AgentLoop:
             self._hooks_manager.reset_retry_count()
 
         try:
+            if self._hooks_manager and self._hooks_manager.has_hooks(
+                HookType.USER_PROMPT_SUBMIT
+            ):
+                hook_context: HookInjectedContext | None = None
+                async for hook_event in self._hooks_manager.run_user_prompt_submit(
+                    prompt=user_msg,
+                    session_id=self.session_id,
+                    session_logger=self.session_logger,
+                    message_id=user_message.message_id,
+                    project=Path.cwd().name,
+                ):
+                    if isinstance(hook_event, HookDenied):
+                        reason = hook_event.reason or "Hook denied this prompt."
+                        yield AssistantEvent(content=reason)
+                        return
+                    elif isinstance(hook_event, HookInjectedContext):
+                        hook_context = hook_event
+                    else:
+                        yield hook_event
+                if hook_context is not None:
+                    self.messages.append(
+                        LLMMessage(
+                            role=Role.user,
+                            content=hook_context.content,
+                            injected=True,
+                        )
+                    )
+
             should_break_loop = False
             first_llm_turn = True
             while not should_break_loop:
