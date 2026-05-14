@@ -6,7 +6,7 @@ from enum import IntEnum
 import json
 import logging
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vibe.core.hooks.config import HookConfig
 from vibe.core.hooks.executor import HookExecutor
@@ -306,6 +306,68 @@ class HooksManager:
 
         yield HookRunEndEvent()
 
+    async def run_post_tool_use(
+        self,
+        session_id: str,
+        session_logger: SessionLogger,
+        *,
+        tool_name: str,
+        tool_call_id: str,
+        tool_input: dict[str, Any] | None = None,
+        tool_result: Any | None = None,
+        tool_error: str | None = None,
+        exit_code: int | None = None,
+        duration_ms: int | None = None,
+    ) -> AsyncGenerator[BaseEvent | HookInjectedContext]:
+        hooks = self._hooks_by_type.get(HookType.POST_TOOL_USE, [])
+        if not hooks:
+            return
+        invocation = _build_invocation(
+            HookType.POST_TOOL_USE,
+            session_id,
+            session_logger,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            tool_input=tool_input,
+            tool_result=tool_result,
+            tool_error=tool_error,
+            exit_code=exit_code,
+            duration_ms=duration_ms,
+        )
+
+        yield HookRunStartEvent()
+        for hook in hooks:
+            yield HookStartEvent(hook_name=hook.name)
+            result = await self._executor.run(hook, invocation)
+
+            if result.timed_out or result.exit_code is None:
+                yield HookEndEvent(
+                    hook_name=hook.name,
+                    status=HookMessageSeverity.WARNING,
+                    content=f"Timed out after {hook.timeout}s",
+                )
+                continue
+
+            if result.exit_code == HookExitCode.SUCCESS:
+                decision_result = _parse_post_tool_use_result(result.stdout)
+                if isinstance(decision_result, HookInjectedContext):
+                    yield HookEndEvent(hook_name=hook.name, status=HookMessageSeverity.OK)
+                    yield decision_result
+                else:
+                    yield HookEndEvent(hook_name=hook.name, status=HookMessageSeverity.OK)
+            else:
+                yield HookEndEvent(
+                    hook_name=hook.name,
+                    status=HookMessageSeverity.WARNING,
+                    content=(
+                        result.stdout
+                        or result.stderr
+                        or f"Exited with code {result.exit_code}"
+                    ),
+                )
+
+        yield HookRunEndEvent()
+
 
 def _build_invocation(
     hook_type: HookType,
@@ -320,6 +382,13 @@ def _build_invocation(
     reason: str | None = None,
     token_estimate_before: int | None = None,
     auto_compact_threshold: int | None = None,
+    tool_name: str | None = None,
+    tool_call_id: str | None = None,
+    tool_input: dict[str, Any] | None = None,
+    tool_result: Any | None = None,
+    tool_error: str | None = None,
+    exit_code: int | None = None,
+    duration_ms: int | None = None,
 ) -> HookInvocation:
     transcript_path = ""
     if session_logger.enabled and session_logger.session_dir is not None:
@@ -342,6 +411,13 @@ def _build_invocation(
         reason=reason,
         token_estimate_before=token_estimate_before,
         auto_compact_threshold=auto_compact_threshold,
+        tool_name=tool_name,
+        tool_call_id=tool_call_id,
+        tool_input=tool_input,
+        tool_result=tool_result,
+        tool_error=tool_error,
+        exit_code=exit_code,
+        duration_ms=duration_ms,
     )
 
 
@@ -376,3 +452,33 @@ def _parse_user_prompt_submit_result(
 
     # Plain text stdout: inject as additional context
     return HookInjectedContext(content=stdout)
+
+
+def _parse_post_tool_use_result(
+    stdout: str,
+) -> HookInjectedContext | None:
+    """Parse hook stdout for post_tool_use.
+
+    Plain text is logged only — not injected. Only an explicit JSON
+    ``{decision: "inject", additional_context: "..."}`` triggers injection.
+    ``deny`` is not supported (tool already ran); it is logged as a warning.
+    """
+    if not stdout:
+        return None
+
+    try:
+        data = json.loads(stdout)
+        if isinstance(data, dict) and "decision" in data:
+            decision = HookDecision.model_validate(data)
+            if decision.decision == "inject" and decision.additional_context:
+                return HookInjectedContext(content=decision.additional_context)
+            if decision.decision == "deny":
+                logger.warning(
+                    "post_tool_use hook returned deny, but tool already ran — ignoring"
+                )
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    # Plain text or unhandled JSON: log at debug level, do not inject.
+    logger.debug("post_tool_use hook stdout (not injected): %s", stdout)
+    return None

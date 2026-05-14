@@ -22,6 +22,7 @@ class HookType(StrEnum):
     USER_PROMPT_SUBMIT = auto()
     PRE_COMPACT = auto()
     SESSION_START = auto()
+    POST_TOOL_USE = auto()
 
 
 # --- Declarative hook config (TOML on disk) ---
@@ -73,6 +74,14 @@ class HookInvocation(BaseModel):
     reason: str | None = None
     token_estimate_before: int | None = None
     auto_compact_threshold: int | None = None
+    # post_tool_use fields
+    tool_name: str | None = None
+    tool_call_id: str | None = None
+    tool_input: dict[str, Any] | None = None
+    tool_result: Any | None = None
+    tool_error: str | None = None
+    exit_code: int | None = None
+    duration_ms: int | None = None
 
 
 # --- Hook result parsing ---

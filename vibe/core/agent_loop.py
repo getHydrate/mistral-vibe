@@ -1103,6 +1103,24 @@ class AgentLoop:
             extra = tool_instance.get_result_extra(result_model)
             if extra:
                 text += "\n\n" + extra
+
+            if self._hooks_manager and self._hooks_manager.has_hooks(
+                HookType.POST_TOOL_USE
+            ):
+                async for hook_event in self._hooks_manager.run_post_tool_use(
+                    session_id=self.session_id,
+                    session_logger=self.session_logger,
+                    tool_name=tool_call.tool_name,
+                    tool_call_id=tool_call.call_id,
+                    tool_input=tool_call.validated_args.model_dump(),
+                    tool_result=result_dict,
+                    duration_ms=int(duration * 1000),
+                ):
+                    if isinstance(hook_event, HookInjectedContext):
+                        text += f"\n\n{hook_event.content}"
+                    else:
+                        yield hook_event
+
             self._handle_tool_response(
                 tool_call, text, "success", decision, result_dict, span=span
             )
