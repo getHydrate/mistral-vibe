@@ -306,6 +306,56 @@ class HooksManager:
 
         yield HookRunEndEvent()
 
+    async def run_pre_tool_use(
+        self,
+        session_id: str,
+        session_logger: SessionLogger,
+        *,
+        tool_name: str,
+        tool_call_id: str,
+        tool_input: dict[str, Any] | None = None,
+    ) -> AsyncGenerator[BaseEvent | HookDenied]:
+        hooks = self._hooks_by_type.get(HookType.PRE_TOOL_USE, [])
+        if not hooks:
+            return
+        invocation = _build_invocation(
+            HookType.PRE_TOOL_USE,
+            session_id,
+            session_logger,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            tool_input=tool_input,
+        )
+
+        yield HookRunStartEvent()
+        for hook in hooks:
+            yield HookStartEvent(hook_name=hook.name)
+            result = await self._executor.run(hook, invocation)
+
+            if result.timed_out or result.exit_code is None:
+                yield HookEndEvent(
+                    hook_name=hook.name,
+                    status=HookMessageSeverity.WARNING,
+                    content=f"Timed out after {hook.timeout}s",
+                )
+                continue
+
+            decision_result = _parse_pre_tool_use_result(result.stdout, result.stderr, result.exit_code)
+
+            if isinstance(decision_result, HookDenied):
+                yield HookEndEvent(
+                    hook_name=hook.name,
+                    status=HookMessageSeverity.ERROR,
+                    content=f"Tool blocked: {decision_result.reason or 'no reason given'}",
+                )
+                yield decision_result
+                yield HookRunEndEvent()
+                return
+
+            yield HookEndEvent(hook_name=hook.name, status=HookMessageSeverity.OK)
+
+        yield HookRunEndEvent()
+
     async def run_post_tool_use(
         self,
         session_id: str,
@@ -452,6 +502,39 @@ def _parse_user_prompt_submit_result(
 
     # Plain text stdout: inject as additional context
     return HookInjectedContext(content=stdout)
+
+
+def _parse_pre_tool_use_result(
+    stdout: str,
+    stderr: str,
+    exit_code: int,
+) -> HookDenied | None:
+    """Parse hook stdout/exit_code for pre_tool_use.
+
+    Exit code 2 means deny (reason from stderr). JSON {decision:"deny"} means deny.
+    Everything else (empty, plain text, JSON allow, non-zero other) means allow (fail open).
+    """
+    # Exit code 2 is an explicit deny signal.
+    if exit_code == HookExitCode.RETRY:
+        reason = stderr.strip() or stdout.strip() or None
+        return HookDenied(reason=reason)
+
+    if stdout:
+        try:
+            data = json.loads(stdout)
+            if isinstance(data, dict) and "decision" in data:
+                decision = HookDecision.model_validate(data)
+                if decision.decision == "deny":
+                    return HookDenied(reason=decision.reason)
+                # allow / inject / other: fall through
+                return None
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+        # Plain text: debug-log only, allow through.
+        logger.debug("pre_tool_use hook stdout (allow): %s", stdout)
+
+    return None
 
 
 def _parse_post_tool_use_result(

@@ -1067,6 +1067,29 @@ class AgentLoop:
 
             self.stats.tool_calls_agreed += 1
 
+            if self._hooks_manager and self._hooks_manager.has_hooks(
+                HookType.PRE_TOOL_USE
+            ):
+                denied = False
+                async for hook_event in self._hooks_manager.run_pre_tool_use(
+                    session_id=self.session_id,
+                    session_logger=self.session_logger,
+                    tool_name=tool_call.tool_name,
+                    tool_call_id=tool_call.call_id,
+                    tool_input=tool_call.validated_args.model_dump(),
+                ):
+                    if isinstance(hook_event, HookDenied):
+                        denied = True
+                        reason = hook_event.reason or "no reason given"
+                        error_msg = f"<{TOOL_ERROR_TAG}>Tool call blocked by pre_tool_use hook: {reason}</{TOOL_ERROR_TAG}>"
+                        self.stats.tool_calls_agreed -= 1
+                        self.stats.tool_calls_rejected += 1
+                        yield self._tool_failure_event(tool_call, error_msg, decision, span=span)
+                    else:
+                        yield hook_event
+                if denied:
+                    return
+
             snapshot = tool_instance.get_file_snapshot(tool_call.validated_args)
             if snapshot is not None:
                 self.rewind_manager.add_snapshot(snapshot)
