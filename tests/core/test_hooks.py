@@ -17,9 +17,11 @@ from vibe.core.hooks.config import (
     load_hooks_from_fs,
 )
 from vibe.core.hooks.executor import HookExecutor
-from vibe.core.hooks.manager import HooksManager
+from vibe.core.hooks.manager import HooksManager, _parse_user_prompt_submit_result
 from vibe.core.hooks.models import (
+    HookDenied,
     HookEndEvent,
+    HookInjectedContext,
     HookInvocation,
     HookMessageSeverity,
     HookStartEvent,
@@ -502,3 +504,324 @@ class TestAgentLoopIntegration:
             e for e in events if isinstance(e, (HookStartEvent, HookEndEvent))
         ]
         assert hook_events == []
+
+
+class TestUserPromptSubmitResultParser:
+    def test_empty_stdout_returns_none(self) -> None:
+        assert _parse_user_prompt_submit_result("") is None
+
+    def test_plain_text_returns_injected_context(self) -> None:
+        result = _parse_user_prompt_submit_result("some context")
+        assert isinstance(result, HookInjectedContext)
+        assert result.content == "some context"
+
+    def test_json_decision_inject(self) -> None:
+        import json
+
+        payload = json.dumps({"decision": "inject", "additional_context": "extra info"})
+        result = _parse_user_prompt_submit_result(payload)
+        assert isinstance(result, HookInjectedContext)
+        assert result.content == "extra info"
+
+    def test_json_decision_allow_no_context(self) -> None:
+        import json
+
+        payload = json.dumps({"decision": "allow"})
+        result = _parse_user_prompt_submit_result(payload)
+        assert result is None
+
+    def test_json_decision_allow_with_context(self) -> None:
+        import json
+
+        payload = json.dumps({"decision": "allow", "additional_context": "ctx"})
+        result = _parse_user_prompt_submit_result(payload)
+        assert isinstance(result, HookInjectedContext)
+        assert result.content == "ctx"
+
+    def test_json_decision_deny(self) -> None:
+        import json
+
+        payload = json.dumps({"decision": "deny", "reason": "not allowed"})
+        result = _parse_user_prompt_submit_result(payload)
+        assert isinstance(result, HookDenied)
+        assert result.reason == "not allowed"
+
+    def test_json_decision_deny_no_reason(self) -> None:
+        import json
+
+        payload = json.dumps({"decision": "deny"})
+        result = _parse_user_prompt_submit_result(payload)
+        assert isinstance(result, HookDenied)
+        assert result.reason is None
+
+    def test_claude_style_additional_context(self) -> None:
+        import json
+
+        payload = json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": "hydrate context here",
+            }
+        })
+        result = _parse_user_prompt_submit_result(payload)
+        assert isinstance(result, HookInjectedContext)
+        assert result.content == "hydrate context here"
+
+    def test_claude_style_missing_additional_context(self) -> None:
+        import json
+
+        payload = json.dumps({
+            "hookSpecificOutput": {"hookEventName": "UserPromptSubmit"}
+        })
+        result = _parse_user_prompt_submit_result(payload)
+        assert result is None
+
+    def test_invalid_json_treated_as_plain_text(self) -> None:
+        result = _parse_user_prompt_submit_result("not json {")
+        assert isinstance(result, HookInjectedContext)
+        assert result.content == "not json {"
+
+
+class TestHookTypeConfig:
+    def test_user_prompt_submit_loads_from_toml(
+        self, config_dir: Path, config_hooks_enabled: VibeConfig
+    ) -> None:
+        _write_hooks_toml(
+            config_dir / "hooks.toml",
+            [
+                {
+                    "name": "ctx-hook",
+                    "type": "user_prompt_submit",
+                    "command": "echo context",
+                }
+            ],
+        )
+        result = load_hooks_from_fs(config_hooks_enabled)
+        assert len(result.hooks) == 1
+        assert result.hooks[0].type == HookType.USER_PROMPT_SUBMIT
+        assert result.issues == []
+
+    def test_invalid_hook_type_reported(
+        self, config_dir: Path, config_hooks_enabled: VibeConfig
+    ) -> None:
+        _write_hooks_toml(
+            config_dir / "hooks.toml",
+            [{"name": "bad", "type": "nonexistent_type", "command": "echo"}],
+        )
+        result = load_hooks_from_fs(config_hooks_enabled)
+        assert result.hooks == []
+        assert len(result.issues) == 1
+
+    def test_both_hook_types_load(
+        self, config_dir: Path, config_hooks_enabled: VibeConfig
+    ) -> None:
+        _write_hooks_toml(
+            config_dir / "hooks.toml",
+            [
+                {"name": "h1", "type": "post_agent_turn", "command": "echo a"},
+                {"name": "h2", "type": "user_prompt_submit", "command": "echo b"},
+            ],
+        )
+        result = load_hooks_from_fs(config_hooks_enabled)
+        assert len(result.hooks) == 2
+        types = {h.type for h in result.hooks}
+        assert HookType.POST_AGENT_TURN in types
+        assert HookType.USER_PROMPT_SUBMIT in types
+
+
+class TestHooksManagerUserPromptSubmit:
+    def _make_logger(self):
+        from vibe.core.config import SessionLoggingConfig
+        from vibe.core.session.session_logger import SessionLogger
+
+        return SessionLogger(SessionLoggingConfig(enabled=False), "test-id")
+
+    def _make_ups_hook(
+        self, name: str = "ctx-hook", command: str = "echo ok", timeout: float = 30.0
+    ) -> HookConfig:
+        return HookConfig(
+            name=name, type=HookType.USER_PROMPT_SUBMIT, command=command, timeout=timeout
+        )
+
+    @pytest.mark.asyncio
+    async def test_plain_stdout_yields_injected_context(self) -> None:
+        handler = HooksManager([self._make_ups_hook(command="echo extra context")])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_user_prompt_submit(
+                "hello", "sess", logger
+            )
+        ]
+        injected = [e for e in events if isinstance(e, HookInjectedContext)]
+        assert len(injected) == 1
+        assert injected[0].content == "extra context"
+
+    @pytest.mark.asyncio
+    async def test_json_inject_yields_injected_context(self) -> None:
+        import json
+
+        payload = json.dumps({"decision": "inject", "additional_context": "ctx-data"})
+        handler = HooksManager([self._make_ups_hook(command=f"echo '{payload}'")])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_user_prompt_submit(
+                "hello", "sess", logger
+            )
+        ]
+        injected = [e for e in events if isinstance(e, HookInjectedContext)]
+        assert len(injected) == 1
+        assert injected[0].content == "ctx-data"
+
+    @pytest.mark.asyncio
+    async def test_json_deny_yields_hook_denied(self) -> None:
+        import json
+
+        payload = json.dumps({"decision": "deny", "reason": "blocked"})
+        handler = HooksManager([self._make_ups_hook(command=f"echo '{payload}'")])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_user_prompt_submit(
+                "hello", "sess", logger
+            )
+        ]
+        denied = [e for e in events if isinstance(e, HookDenied)]
+        assert len(denied) == 1
+        assert denied[0].reason == "blocked"
+
+    @pytest.mark.asyncio
+    async def test_claude_style_output_yields_injected_context(self) -> None:
+        import json
+
+        payload = json.dumps({
+            "hookSpecificOutput": {
+                "hookEventName": "UserPromptSubmit",
+                "additionalContext": "recall data",
+            }
+        })
+        handler = HooksManager([self._make_ups_hook(command=f"echo '{payload}'")])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_user_prompt_submit(
+                "hello", "sess", logger
+            )
+        ]
+        injected = [e for e in events if isinstance(e, HookInjectedContext)]
+        assert len(injected) == 1
+        assert injected[0].content == "recall data"
+
+    @pytest.mark.asyncio
+    async def test_timeout_fails_open(self) -> None:
+        handler = HooksManager([
+            self._make_ups_hook(command="sleep 60", timeout=0.5)
+        ])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_user_prompt_submit(
+                "hello", "sess", logger
+            )
+        ]
+        denied = [e for e in events if isinstance(e, HookDenied)]
+        assert denied == []
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+
+
+class TestAgentLoopUserPromptSubmitIntegration:
+    @pytest.mark.asyncio
+    async def test_context_injected_before_llm_turn(self) -> None:
+        backend = FakeBackend(mock_llm_chunk(content="Hi there!"))
+        hooks = [
+            HookConfig(
+                name="ctx",
+                type=HookType.USER_PROMPT_SUBMIT,
+                command="echo hydrate-context",
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        events = [ev async for ev in agent_loop.act("tell me something")]
+        event_types = [type(e).__name__ for e in events]
+        assert "HookStartEvent" in event_types
+        assert "HookEndEvent" in event_types
+        injected = [
+            m
+            for m in agent_loop.messages
+            if m.role.value == "user" and m.injected
+        ]
+        assert any("hydrate-context" in (m.content or "") for m in injected)
+
+    @pytest.mark.asyncio
+    async def test_deny_blocks_llm_turn(self) -> None:
+        import json
+
+        payload = json.dumps({"decision": "deny", "reason": "policy violation"})
+        backend = FakeBackend(mock_llm_chunk(content="Should not be reached"))
+        hooks = [
+            HookConfig(
+                name="guard",
+                type=HookType.USER_PROMPT_SUBMIT,
+                command=f"echo '{payload}'",
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        events = [ev async for ev in agent_loop.act("do something bad")]
+        from vibe.core.types import AssistantEvent
+
+        assistant_events = [e for e in events if isinstance(e, AssistantEvent)]
+        assert len(assistant_events) == 1
+        assert "policy violation" in (assistant_events[0].content or "")
+        # LLM backend should not have been called
+        assert len(backend.requests_messages) == 0
+
+    @pytest.mark.asyncio
+    async def test_post_agent_turn_retry_unchanged(self) -> None:
+        backend = FakeBackend([
+            [mock_llm_chunk(content="first")],
+            [mock_llm_chunk(content="second")],
+        ])
+        counter_file = Path.cwd() / ".hook_counter2"
+        script = (
+            f'{sys.executable} -c "'
+            f"from pathlib import Path; "
+            f"p = Path({str(counter_file)!r}); "
+            f"c = int(p.read_text()) if p.exists() else 0; "
+            f"p.write_text(str(c + 1)); "
+            f"import sys; "
+            f"print('retry please'); "
+            f"sys.exit(2 if c == 0 else 0)"
+            f'"'
+        )
+        hooks = [
+            HookConfig(
+                name="post-retry",
+                type=HookType.POST_AGENT_TURN,
+                command=script,
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        events = [ev async for ev in agent_loop.act("hi")]
+        from vibe.core.types import AssistantEvent
+
+        assistant_events = [e for e in events if isinstance(e, AssistantEvent)]
+        assert len(assistant_events) == 2
+        injected = [
+            m for m in agent_loop.messages if m.role.value == "user" and m.injected
+        ]
+        assert any("retry please" in (m.content or "") for m in injected)

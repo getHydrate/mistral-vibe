@@ -12,7 +12,7 @@ class HookExecutor:
     async def run(
         self, hook: HookConfig, invocation: HookInvocation
     ) -> HookExecutionResult:
-        stdin_data = invocation.model_dump_json().encode()
+        stdin_data = invocation.model_dump_json(exclude_none=True).encode()
 
         try:
             process = await asyncio.create_subprocess_shell(

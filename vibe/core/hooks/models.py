@@ -2,8 +2,9 @@ from __future__ import annotations
 
 from enum import auto
 from pathlib import Path
+from typing import Any, Literal
 
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator
 
 from vibe.core.types import BaseEvent, StrEnum
 
@@ -18,6 +19,7 @@ class HookMessageSeverity(StrEnum):
 
 class HookType(StrEnum):
     POST_AGENT_TURN = auto()
+    USER_PROMPT_SUBMIT = auto()
 
 
 # --- Declarative hook config (TOML on disk) ---
@@ -56,6 +58,31 @@ class HookInvocation(BaseModel):
     transcript_path: str
     cwd: str
     hook_event_name: str
+    timestamp: str | None = None
+    vibe_version: str | None = None
+    # user_prompt_submit fields
+    prompt: str | None = None
+    message_id: str | None = None
+    project: str | None = None
+
+
+# --- Hook result parsing ---
+
+
+class HookDecision(BaseModel):
+    decision: Literal["allow", "deny", "inject", "rewrite", "retry"] = "allow"
+    reason: str | None = None
+    additional_context: str | None = None
+    updated_input: dict[str, Any] | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class HookInjectedContext(BaseModel):
+    content: str
+
+
+class HookDenied(BaseModel):
+    reason: str | None = None
 
 
 class HookExecutionResult(BaseModel):
