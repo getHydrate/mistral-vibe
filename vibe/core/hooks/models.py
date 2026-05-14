@@ -23,6 +23,7 @@ class HookType(StrEnum):
     PRE_COMPACT = auto()
     SESSION_START = auto()
     POST_TOOL_USE = auto()
+    PRE_TOOL_USE = auto()
 
 
 # --- Declarative hook config (TOML on disk) ---

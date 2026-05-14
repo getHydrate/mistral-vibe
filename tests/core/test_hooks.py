@@ -1354,3 +1354,257 @@ class TestAgentLoopPostToolUseIntegration:
         event_types = [type(e).__name__ for e in events]
         assert "HookStartEvent" in event_types
         assert "HookEndEvent" in event_types
+
+
+class TestPreToolUseConfig:
+    def test_pre_tool_use_loads_from_toml(
+        self, config_dir: Path, config_hooks_enabled: VibeConfig
+    ) -> None:
+        _write_hooks_toml(
+            config_dir / "hooks.toml",
+            [{"name": "guard", "type": "pre_tool_use", "command": "echo ok"}],
+        )
+        result = load_hooks_from_fs(config_hooks_enabled)
+        assert len(result.hooks) == 1
+        assert result.hooks[0].type == HookType.PRE_TOOL_USE
+
+
+class TestPreToolUseResultParser:
+    def _parse(self, stdout: str, stderr: str = "", exit_code: int = 0):
+        from vibe.core.hooks.manager import _parse_pre_tool_use_result
+
+        return _parse_pre_tool_use_result(stdout, stderr, exit_code)
+
+    def test_empty_stdout_exit0_allows(self) -> None:
+        assert self._parse("", exit_code=0) is None
+
+    def test_json_deny_returns_denied(self) -> None:
+        import json
+
+        payload = json.dumps({"decision": "deny", "reason": "blocked by policy"})
+        result = self._parse(payload, exit_code=0)
+        assert isinstance(result, HookDenied)
+        assert result.reason == "blocked by policy"
+
+    def test_json_allow_returns_none(self) -> None:
+        import json
+
+        payload = json.dumps({"decision": "allow"})
+        assert self._parse(payload, exit_code=0) is None
+
+    def test_exit_code_2_denies(self) -> None:
+        result = self._parse("", stderr="rm -rf denied", exit_code=2)
+        assert isinstance(result, HookDenied)
+        assert result.reason == "rm -rf denied"
+
+    def test_exit_code_2_reason_from_stdout_if_no_stderr(self) -> None:
+        result = self._parse("blocked stdout", stderr="", exit_code=2)
+        assert isinstance(result, HookDenied)
+        assert result.reason == "blocked stdout"
+
+    def test_plain_text_allows(self) -> None:
+        result = self._parse("some diagnostic text", exit_code=0)
+        assert result is None
+
+    def test_invalid_json_allows(self) -> None:
+        result = self._parse("not json {", exit_code=0)
+        assert result is None
+
+    def test_nonzero_other_exit_allows(self) -> None:
+        result = self._parse("", exit_code=1)
+        assert result is None
+
+
+class TestHooksManagerPreToolUse:
+    def _make_logger(self):
+        from vibe.core.config import SessionLoggingConfig
+        from vibe.core.session.session_logger import SessionLogger
+
+        return SessionLogger(SessionLoggingConfig(enabled=False), "test-id")
+
+    def _make_hook(self, command: str, name: str = "guard-hook") -> HookConfig:
+        return HookConfig(
+            name=name, type=HookType.PRE_TOOL_USE, command=command, timeout=30.0
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_contains_tool_fields(self) -> None:
+        hook = self._make_hook(
+            f"{sys.executable} -c \""
+            f"import sys,json; d=json.load(sys.stdin); "
+            f"assert d['tool_name']=='bash'; "
+            f"assert d['tool_call_id']=='call_99'; "
+            f"assert d['hook_event_name']=='pre_tool_use'; "
+            f"print('ok')\""
+        )
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_pre_tool_use(
+                "sess",
+                logger,
+                tool_name="bash",
+                tool_call_id="call_99",
+                tool_input={"command": "echo hi"},
+            )
+        ]
+        end_events = [e for e in events if isinstance(e, HookEndEvent)]
+        assert any(e.status == HookMessageSeverity.OK for e in end_events)
+
+    @pytest.mark.asyncio
+    async def test_json_deny_yields_hook_denied(self) -> None:
+        import json
+
+        payload = json.dumps({"decision": "deny", "reason": "not allowed"})
+        hook = self._make_hook(f"echo '{payload}'")
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_pre_tool_use(
+                "sess",
+                logger,
+                tool_name="bash",
+                tool_call_id="call_1",
+            )
+        ]
+        denied = [e for e in events if isinstance(e, HookDenied)]
+        assert len(denied) == 1
+        assert denied[0].reason == "not allowed"
+
+    @pytest.mark.asyncio
+    async def test_json_allow_yields_no_denied(self) -> None:
+        import json
+
+        payload = json.dumps({"decision": "allow"})
+        hook = self._make_hook(f"echo '{payload}'")
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_pre_tool_use(
+                "sess",
+                logger,
+                tool_name="bash",
+                tool_call_id="call_2",
+            )
+        ]
+        assert not any(isinstance(e, HookDenied) for e in events)
+
+    @pytest.mark.asyncio
+    async def test_empty_stdout_allows(self) -> None:
+        hook = self._make_hook("true")
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_pre_tool_use(
+                "sess",
+                logger,
+                tool_name="bash",
+                tool_call_id="call_3",
+            )
+        ]
+        assert not any(isinstance(e, HookDenied) for e in events)
+
+    @pytest.mark.asyncio
+    async def test_exit_code_2_yields_denied(self) -> None:
+        hook = self._make_hook(f"{sys.executable} -c \"import sys; sys.exit(2)\"")
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_pre_tool_use(
+                "sess",
+                logger,
+                tool_name="bash",
+                tool_call_id="call_4",
+            )
+        ]
+        denied = [e for e in events if isinstance(e, HookDenied)]
+        assert len(denied) == 1
+
+    @pytest.mark.asyncio
+    async def test_timeout_fails_open(self) -> None:
+        hook = HookConfig(
+            name="slow", type=HookType.PRE_TOOL_USE, command="sleep 60", timeout=0.5
+        )
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_pre_tool_use(
+                "sess",
+                logger,
+                tool_name="bash",
+                tool_call_id="call_5",
+            )
+        ]
+        assert not any(isinstance(e, HookDenied) for e in events)
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+
+
+class TestAgentLoopPreToolUseIntegration:
+    @pytest.mark.asyncio
+    async def test_deny_prevents_tool_execution(self) -> None:
+        import json
+        from unittest.mock import patch
+
+        from tests.conftest import build_test_vibe_config
+        from vibe.core.agents.models import BuiltinAgentName
+        from vibe.core.tools.base import ToolPermission
+        from vibe.core.types import FunctionCall, ToolCall
+
+        tool_call = ToolCall(
+            id="call_block",
+            index=0,
+            function=FunctionCall(name="todo", arguments='{"action": "read"}'),
+        )
+        backend = FakeBackend([
+            [mock_llm_chunk(content="let me check todos", tool_calls=[tool_call])],
+            [mock_llm_chunk(content="ok blocked")],
+        ])
+        config = build_test_vibe_config(
+            enabled_tools=["todo"],
+            tools={"todo": {"permission": ToolPermission.ALWAYS.value}},
+        )
+        deny_payload = json.dumps({"decision": "deny", "reason": "blocked by test"})
+        hooks = [
+            HookConfig(
+                name="guard",
+                type=HookType.PRE_TOOL_USE,
+                command=f"echo '{deny_payload}'",
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            config=config,
+            agent_name=BuiltinAgentName.AUTO_APPROVE,
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+
+        invoke_calls: list[str] = []
+
+        from vibe.core.tools.builtins.todo import Todo
+        original_invoke = Todo.invoke
+
+        async def tracking_invoke(self_tool, *args, **kwargs):
+            invoke_calls.append("invoked")
+            async for item in original_invoke(self_tool, *args, **kwargs):
+                yield item
+
+        with patch.object(Todo, "invoke", tracking_invoke):
+            events = [ev async for ev in agent_loop.act("check todos")]
+
+        assert len(invoke_calls) == 0, "Tool should not have been invoked when pre_tool_use denies"
+        error_events = [
+            e for e in events
+            if hasattr(e, "error") and e.error and "blocked by pre_tool_use hook" in e.error
+        ]
+        assert len(error_events) >= 1
