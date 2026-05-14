@@ -825,3 +825,276 @@ class TestAgentLoopUserPromptSubmitIntegration:
             m for m in agent_loop.messages if m.role.value == "user" and m.injected
         ]
         assert any("retry please" in (m.content or "") for m in injected)
+
+
+class TestSessionStartAndPreCompactConfig:
+    def test_session_start_loads_from_toml(
+        self, config_dir: Path, config_hooks_enabled: VibeConfig
+    ) -> None:
+        _write_hooks_toml(
+            config_dir / "hooks.toml",
+            [{"name": "ss", "type": "session_start", "command": "echo ok"}],
+        )
+        result = load_hooks_from_fs(config_hooks_enabled)
+        assert len(result.hooks) == 1
+        assert result.hooks[0].type == HookType.SESSION_START
+
+    def test_pre_compact_loads_from_toml(
+        self, config_dir: Path, config_hooks_enabled: VibeConfig
+    ) -> None:
+        _write_hooks_toml(
+            config_dir / "hooks.toml",
+            [{"name": "pc", "type": "pre_compact", "command": "echo ok"}],
+        )
+        result = load_hooks_from_fs(config_hooks_enabled)
+        assert len(result.hooks) == 1
+        assert result.hooks[0].type == HookType.PRE_COMPACT
+
+    def test_all_four_types_load(
+        self, config_dir: Path, config_hooks_enabled: VibeConfig
+    ) -> None:
+        _write_hooks_toml(
+            config_dir / "hooks.toml",
+            [
+                {"name": "a", "type": "post_agent_turn", "command": "echo a"},
+                {"name": "b", "type": "user_prompt_submit", "command": "echo b"},
+                {"name": "c", "type": "session_start", "command": "echo c"},
+                {"name": "d", "type": "pre_compact", "command": "echo d"},
+            ],
+        )
+        result = load_hooks_from_fs(config_hooks_enabled)
+        assert len(result.hooks) == 4
+        types = {h.type for h in result.hooks}
+        assert types == {
+            HookType.POST_AGENT_TURN,
+            HookType.USER_PROMPT_SUBMIT,
+            HookType.SESSION_START,
+            HookType.PRE_COMPACT,
+        }
+
+
+class TestHooksManagerSessionStart:
+    def _make_logger(self):
+        from vibe.core.config import SessionLoggingConfig
+        from vibe.core.session.session_logger import SessionLogger
+
+        return SessionLogger(SessionLoggingConfig(enabled=False), "test-id")
+
+    def _make_hook(self, command: str, name: str = "ss-hook") -> HookConfig:
+        return HookConfig(
+            name=name, type=HookType.SESSION_START, command=command, timeout=30.0
+        )
+
+    @pytest.mark.asyncio
+    async def test_new_source_in_payload(self) -> None:
+        hook = self._make_hook(
+            f"{sys.executable} -c \"import sys,json; d=json.load(sys.stdin); print(d['source'])\""
+        )
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev async for ev in handler.run_session_start("new", "sess", logger)
+        ]
+        end_events = [e for e in events if isinstance(e, HookEndEvent)]
+        assert any(e.status == HookMessageSeverity.OK for e in end_events)
+
+    @pytest.mark.asyncio
+    async def test_resume_source_in_payload(self) -> None:
+        hook = self._make_hook(
+            f"{sys.executable} -c \"import sys,json; d=json.load(sys.stdin); assert d['source']=='resume'; print('ok')\""
+        )
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev async for ev in handler.run_session_start("resume", "sess", logger)
+        ]
+        end_events = [e for e in events if isinstance(e, HookEndEvent)]
+        assert any(e.status == HookMessageSeverity.OK for e in end_events)
+
+    @pytest.mark.asyncio
+    async def test_plain_stdout_yields_injected_context(self) -> None:
+        hook = self._make_hook("echo session-context-data")
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev async for ev in handler.run_session_start("new", "sess", logger)
+        ]
+        injected = [e for e in events if isinstance(e, HookInjectedContext)]
+        assert len(injected) == 1
+        assert injected[0].content == "session-context-data"
+
+    @pytest.mark.asyncio
+    async def test_timeout_fails_open(self) -> None:
+        hook = HookConfig(
+            name="slow", type=HookType.SESSION_START, command="sleep 60", timeout=0.5
+        )
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev async for ev in handler.run_session_start("new", "sess", logger)
+        ]
+        assert not any(isinstance(e, HookDenied) for e in events)
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+
+
+class TestHooksManagerPreCompact:
+    def _make_logger(self):
+        from vibe.core.config import SessionLoggingConfig
+        from vibe.core.session.session_logger import SessionLogger
+
+        return SessionLogger(SessionLoggingConfig(enabled=False), "test-id")
+
+    def _make_hook(self, command: str, name: str = "pc-hook") -> HookConfig:
+        return HookConfig(
+            name=name, type=HookType.PRE_COMPACT, command=command, timeout=30.0
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_contains_reason_and_tokens(self) -> None:
+        hook = self._make_hook(
+            f"{sys.executable} -c \""
+            f"import sys,json; d=json.load(sys.stdin); "
+            f"assert d['reason']=='auto_compact'; "
+            f"assert d['token_estimate_before']==50000; "
+            f"print('ok')\""
+        )
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_pre_compact(
+                "sess",
+                logger,
+                reason="auto_compact",
+                token_estimate_before=50000,
+                auto_compact_threshold=200000,
+            )
+        ]
+        end_events = [e for e in events if isinstance(e, HookEndEvent)]
+        assert any(e.status == HookMessageSeverity.OK for e in end_events)
+
+    @pytest.mark.asyncio
+    async def test_stdout_is_ignored_not_injected(self) -> None:
+        hook = self._make_hook("echo some-output")
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev async for ev in handler.run_pre_compact("sess", logger)
+        ]
+        assert not any(isinstance(e, HookInjectedContext) for e in events)
+
+    @pytest.mark.asyncio
+    async def test_timeout_fails_open(self) -> None:
+        hook = HookConfig(
+            name="slow", type=HookType.PRE_COMPACT, command="sleep 60", timeout=0.5
+        )
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [ev async for ev in handler.run_pre_compact("sess", logger)]
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+
+
+class TestAgentLoopSessionStartIntegration:
+    @pytest.mark.asyncio
+    async def test_session_start_fires_on_first_act(self) -> None:
+        backend = FakeBackend(mock_llm_chunk(content="hello"))
+        hooks = [
+            HookConfig(
+                name="ss",
+                type=HookType.SESSION_START,
+                command="echo session-init-data",
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        events = [ev async for ev in agent_loop.act("hi")]
+        event_types = [type(e).__name__ for e in events]
+        assert "HookStartEvent" in event_types
+        injected = [
+            m for m in agent_loop.messages if m.role.value == "user" and m.injected
+        ]
+        assert any("session-init-data" in (m.content or "") for m in injected)
+
+    @pytest.mark.asyncio
+    async def test_session_start_fires_only_once(self) -> None:
+        backend = FakeBackend([
+            [mock_llm_chunk(content="first")],
+            [mock_llm_chunk(content="second")],
+        ])
+        hooks = [
+            HookConfig(
+                name="ss",
+                type=HookType.SESSION_START,
+                command="echo once",
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        await agent_loop.act("first prompt").__anext__()
+        # drain first act
+        [ev async for ev in agent_loop.act("first prompt")]
+        injected_after_first = [
+            m for m in agent_loop.messages if m.role.value == "user" and m.injected
+        ]
+        count_after_first = sum(
+            1 for m in injected_after_first if "once" in (m.content or "")
+        )
+
+        # Second act — session_start should NOT fire again
+        [ev async for ev in agent_loop.act("second prompt")]
+        injected_after_second = [
+            m for m in agent_loop.messages if m.role.value == "user" and m.injected
+        ]
+        count_after_second = sum(
+            1 for m in injected_after_second if "once" in (m.content or "")
+        )
+        assert count_after_second == count_after_first
+
+    @pytest.mark.asyncio
+    async def test_pre_compact_hook_fires_before_compaction(self) -> None:
+        from unittest.mock import AsyncMock, patch
+
+        backend = FakeBackend([
+            [mock_llm_chunk(content="summary")],
+        ])
+        fired: list[str] = []
+
+        async def fake_run_pre_compact(*args, **kwargs):
+            fired.append("pre_compact")
+            return
+            yield  # make it an async generator
+
+        hooks = [
+            HookConfig(
+                name="pc",
+                type=HookType.PRE_COMPACT,
+                command="echo ok",
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+
+        with patch.object(
+            agent_loop._hooks_manager,
+            "run_pre_compact",
+            side_effect=fake_run_pre_compact,
+        ):
+            await agent_loop.compact()
+
+        assert "pre_compact" in fired

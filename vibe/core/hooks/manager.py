@@ -201,6 +201,111 @@ class HooksManager:
 
         yield HookRunEndEvent()
 
+    async def run_session_start(
+        self,
+        source: str,
+        session_id: str,
+        session_logger: SessionLogger,
+        *,
+        parent_session_id: str | None = None,
+    ) -> AsyncGenerator[BaseEvent | HookInjectedContext]:
+        hooks = self._hooks_by_type.get(HookType.SESSION_START, [])
+        if not hooks:
+            return
+        invocation = _build_invocation(
+            HookType.SESSION_START,
+            session_id,
+            session_logger,
+            source=source,
+            parent_session_id=parent_session_id,
+        )
+
+        yield HookRunStartEvent()
+        for hook in hooks:
+            yield HookStartEvent(hook_name=hook.name)
+            result = await self._executor.run(hook, invocation)
+
+            if result.timed_out or result.exit_code is None:
+                yield HookEndEvent(
+                    hook_name=hook.name,
+                    status=HookMessageSeverity.WARNING,
+                    content=f"Timed out after {hook.timeout}s",
+                )
+                continue
+
+            if result.exit_code == HookExitCode.SUCCESS:
+                if result.stdout:
+                    # Plain text or JSON inject: reuse the shared parser.
+                    decision_result = _parse_user_prompt_submit_result(result.stdout)
+                    if isinstance(decision_result, HookInjectedContext):
+                        yield HookEndEvent(
+                            hook_name=hook.name, status=HookMessageSeverity.OK
+                        )
+                        yield decision_result
+                        continue
+                yield HookEndEvent(hook_name=hook.name, status=HookMessageSeverity.OK)
+            else:
+                yield HookEndEvent(
+                    hook_name=hook.name,
+                    status=HookMessageSeverity.WARNING,
+                    content=(
+                        result.stdout
+                        or result.stderr
+                        or f"Exited with code {result.exit_code}"
+                    ),
+                )
+
+        yield HookRunEndEvent()
+
+    async def run_pre_compact(
+        self,
+        session_id: str,
+        session_logger: SessionLogger,
+        *,
+        reason: str = "auto_compact",
+        token_estimate_before: int | None = None,
+        auto_compact_threshold: int | None = None,
+    ) -> AsyncGenerator[BaseEvent]:
+        hooks = self._hooks_by_type.get(HookType.PRE_COMPACT, [])
+        if not hooks:
+            return
+        invocation = _build_invocation(
+            HookType.PRE_COMPACT,
+            session_id,
+            session_logger,
+            reason=reason,
+            token_estimate_before=token_estimate_before,
+            auto_compact_threshold=auto_compact_threshold,
+        )
+
+        yield HookRunStartEvent()
+        for hook in hooks:
+            yield HookStartEvent(hook_name=hook.name)
+            result = await self._executor.run(hook, invocation)
+
+            if result.timed_out or result.exit_code is None:
+                yield HookEndEvent(
+                    hook_name=hook.name,
+                    status=HookMessageSeverity.WARNING,
+                    content=f"Timed out after {hook.timeout}s",
+                )
+            elif result.exit_code == HookExitCode.SUCCESS:
+                if result.stdout:
+                    logger.debug("pre_compact hook %s output: %s", hook.name, result.stdout)
+                yield HookEndEvent(hook_name=hook.name, status=HookMessageSeverity.OK)
+            else:
+                yield HookEndEvent(
+                    hook_name=hook.name,
+                    status=HookMessageSeverity.WARNING,
+                    content=(
+                        result.stdout
+                        or result.stderr
+                        or f"Exited with code {result.exit_code}"
+                    ),
+                )
+
+        yield HookRunEndEvent()
+
 
 def _build_invocation(
     hook_type: HookType,
@@ -210,6 +315,11 @@ def _build_invocation(
     prompt: str | None = None,
     message_id: str | None = None,
     project: str | None = None,
+    source: str | None = None,
+    parent_session_id: str | None = None,
+    reason: str | None = None,
+    token_estimate_before: int | None = None,
+    auto_compact_threshold: int | None = None,
 ) -> HookInvocation:
     transcript_path = ""
     if session_logger.enabled and session_logger.session_dir is not None:
@@ -227,6 +337,11 @@ def _build_invocation(
         prompt=prompt,
         message_id=message_id,
         project=project,
+        source=source,
+        parent_session_id=parent_session_id,
+        reason=reason,
+        token_estimate_before=token_estimate_before,
+        auto_compact_threshold=auto_compact_threshold,
     )
 
 
