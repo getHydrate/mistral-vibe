@@ -1098,3 +1098,259 @@ class TestAgentLoopSessionStartIntegration:
             await agent_loop.compact()
 
         assert "pre_compact" in fired
+
+
+class TestPostToolUseConfig:
+    def test_post_tool_use_loads_from_toml(
+        self, config_dir: Path, config_hooks_enabled: VibeConfig
+    ) -> None:
+        _write_hooks_toml(
+            config_dir / "hooks.toml",
+            [{"name": "obs", "type": "post_tool_use", "command": "echo ok"}],
+        )
+        result = load_hooks_from_fs(config_hooks_enabled)
+        assert len(result.hooks) == 1
+        assert result.hooks[0].type == HookType.POST_TOOL_USE
+
+
+class TestPostToolUseResultParser:
+    def test_empty_stdout_returns_none(self) -> None:
+        from vibe.core.hooks.manager import _parse_post_tool_use_result
+
+        assert _parse_post_tool_use_result("") is None
+
+    def test_plain_text_not_injected(self) -> None:
+        from vibe.core.hooks.manager import _parse_post_tool_use_result
+
+        result = _parse_post_tool_use_result("some plain output")
+        assert result is None
+
+    def test_json_inject_returns_context(self) -> None:
+        import json
+
+        from vibe.core.hooks.manager import _parse_post_tool_use_result
+
+        payload = json.dumps({"decision": "inject", "additional_context": "obs-data"})
+        result = _parse_post_tool_use_result(payload)
+        assert isinstance(result, HookInjectedContext)
+        assert result.content == "obs-data"
+
+    def test_json_allow_returns_none(self) -> None:
+        import json
+
+        from vibe.core.hooks.manager import _parse_post_tool_use_result
+
+        payload = json.dumps({"decision": "allow"})
+        assert _parse_post_tool_use_result(payload) is None
+
+    def test_json_deny_returns_none_with_warning(self, caplog) -> None:
+        import json
+        import logging
+
+        from vibe.core.hooks.manager import _parse_post_tool_use_result
+
+        payload = json.dumps({"decision": "deny", "reason": "too late"})
+        with caplog.at_level(logging.WARNING, logger="vibe.core.hooks.manager"):
+            result = _parse_post_tool_use_result(payload)
+        assert result is None
+        assert any("deny" in r.message.lower() for r in caplog.records)
+
+    def test_invalid_json_returns_none(self) -> None:
+        from vibe.core.hooks.manager import _parse_post_tool_use_result
+
+        assert _parse_post_tool_use_result("not json {") is None
+
+
+class TestHooksManagerPostToolUse:
+    def _make_logger(self):
+        from vibe.core.config import SessionLoggingConfig
+        from vibe.core.session.session_logger import SessionLogger
+
+        return SessionLogger(SessionLoggingConfig(enabled=False), "test-id")
+
+    def _make_hook(self, command: str, name: str = "obs-hook") -> HookConfig:
+        return HookConfig(
+            name=name, type=HookType.POST_TOOL_USE, command=command, timeout=30.0
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_contains_tool_fields(self) -> None:
+        hook = self._make_hook(
+            f"{sys.executable} -c \""
+            f"import sys,json; d=json.load(sys.stdin); "
+            f"assert d['tool_name']=='bash'; "
+            f"assert d['tool_call_id']=='call_1'; "
+            f"assert d['duration_ms']==500; "
+            f"print('ok')\""
+        )
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_post_tool_use(
+                "sess",
+                logger,
+                tool_name="bash",
+                tool_call_id="call_1",
+                tool_input={"command": "echo hi"},
+                tool_result={"output": "hi"},
+                duration_ms=500,
+            )
+        ]
+        end_events = [e for e in events if isinstance(e, HookEndEvent)]
+        assert any(e.status == HookMessageSeverity.OK for e in end_events)
+
+    @pytest.mark.asyncio
+    async def test_tool_error_absent_on_clean_result(self) -> None:
+        hook = self._make_hook(
+            f"{sys.executable} -c \""
+            f"import sys,json; d=json.load(sys.stdin); "
+            f"assert 'tool_error' not in d; "
+            f"print('ok')\""
+        )
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_post_tool_use(
+                "sess",
+                logger,
+                tool_name="read",
+                tool_call_id="call_2",
+                tool_result={"content": "file content"},
+                duration_ms=10,
+            )
+        ]
+        end_events = [e for e in events if isinstance(e, HookEndEvent)]
+        assert any(e.status == HookMessageSeverity.OK for e in end_events)
+
+    @pytest.mark.asyncio
+    async def test_tool_error_present_when_set(self) -> None:
+        import json
+
+        hook = self._make_hook(
+            f"{sys.executable} -c \""
+            f"import sys,json; d=json.load(sys.stdin); "
+            f"assert d['tool_error']=='command failed'; "
+            f"print('ok')\""
+        )
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_post_tool_use(
+                "sess",
+                logger,
+                tool_name="bash",
+                tool_call_id="call_3",
+                tool_error="command failed",
+                duration_ms=5,
+            )
+        ]
+        end_events = [e for e in events if isinstance(e, HookEndEvent)]
+        assert any(e.status == HookMessageSeverity.OK for e in end_events)
+
+    @pytest.mark.asyncio
+    async def test_json_inject_yields_context(self) -> None:
+        import json
+
+        payload = json.dumps({"decision": "inject", "additional_context": "obs-note"})
+        hook = self._make_hook(f"echo '{payload}'")
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_post_tool_use(
+                "sess",
+                logger,
+                tool_name="bash",
+                tool_call_id="call_4",
+                duration_ms=1,
+            )
+        ]
+        injected = [e for e in events if isinstance(e, HookInjectedContext)]
+        assert len(injected) == 1
+        assert injected[0].content == "obs-note"
+
+    @pytest.mark.asyncio
+    async def test_plain_stdout_not_injected(self) -> None:
+        hook = self._make_hook("echo plain-observation")
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_post_tool_use(
+                "sess",
+                logger,
+                tool_name="bash",
+                tool_call_id="call_5",
+                duration_ms=1,
+            )
+        ]
+        assert not any(isinstance(e, HookInjectedContext) for e in events)
+
+    @pytest.mark.asyncio
+    async def test_timeout_fails_open(self) -> None:
+        hook = HookConfig(
+            name="slow", type=HookType.POST_TOOL_USE, command="sleep 60", timeout=0.5
+        )
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_post_tool_use(
+                "sess",
+                logger,
+                tool_name="bash",
+                tool_call_id="call_6",
+                duration_ms=1,
+            )
+        ]
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+
+
+class TestAgentLoopPostToolUseIntegration:
+    @pytest.mark.asyncio
+    async def test_post_tool_use_fires_after_tool_execution(self) -> None:
+        from unittest.mock import patch
+
+        from tests.conftest import build_test_vibe_config
+        from vibe.core.agents.models import BuiltinAgentName
+        from vibe.core.tools.base import ToolPermission
+        from vibe.core.types import FunctionCall, ToolCall
+
+        tool_call = ToolCall(
+            id="call_1",
+            index=0,
+            function=FunctionCall(name="todo", arguments='{"action": "read"}'),
+        )
+        backend = FakeBackend([
+            [mock_llm_chunk(content="checking todos", tool_calls=[tool_call])],
+            [mock_llm_chunk(content="done")],
+        ])
+        config = build_test_vibe_config(
+            enabled_tools=["todo"],
+            tools={"todo": {"permission": ToolPermission.ALWAYS.value}},
+        )
+        hooks = [
+            HookConfig(
+                name="obs",
+                type=HookType.POST_TOOL_USE,
+                command="echo observed",
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            config=config,
+            agent_name=BuiltinAgentName.AUTO_APPROVE,
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        events = [ev async for ev in agent_loop.act("check todos")]
+        event_types = [type(e).__name__ for e in events]
+        assert "HookStartEvent" in event_types
+        assert "HookEndEvent" in event_types
