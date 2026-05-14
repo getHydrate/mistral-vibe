@@ -560,12 +560,12 @@ class TestUserPromptSubmitResultParser:
         payload = json.dumps({
             "hookSpecificOutput": {
                 "hookEventName": "UserPromptSubmit",
-                "additionalContext": "hydrate context here",
+                "additionalContext": "injected context here",
             }
         })
         result = _parse_user_prompt_submit_result(payload)
         assert isinstance(result, HookInjectedContext)
-        assert result.content == "hydrate context here"
+        assert result.content == "injected context here"
 
     def test_claude_style_missing_additional_context(self) -> None:
         import json
@@ -743,7 +743,7 @@ class TestAgentLoopUserPromptSubmitIntegration:
             HookConfig(
                 name="ctx",
                 type=HookType.USER_PROMPT_SUBMIT,
-                command="echo hydrate-context",
+                command="echo test-context",
             )
         ]
         agent_loop = build_test_agent_loop(
@@ -759,7 +759,7 @@ class TestAgentLoopUserPromptSubmitIntegration:
             for m in agent_loop.messages
             if m.role.value == "user" and m.injected
         ]
-        assert any("hydrate-context" in (m.content or "") for m in injected)
+        assert any("test-context" in (m.content or "") for m in injected)
 
     @pytest.mark.asyncio
     async def test_deny_blocks_llm_turn(self) -> None:
