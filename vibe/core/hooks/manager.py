@@ -315,6 +315,72 @@ class HooksManager:
 
         yield HookRunEndEvent()
 
+    async def run_session_end(
+        self,
+        session_id: str,
+        session_logger: SessionLogger,
+        *,
+        reason: str,
+        turn_count: int,
+        error: str | None = None,
+    ) -> AsyncGenerator[BaseEvent]:
+        """Fire session_end hooks. Observational only: no decision semantics.
+
+        deny is logged and ignored — the session cannot be kept alive.
+        Plain stdout is debug-logged. Fail-open on every error path.
+        """
+        hooks = self._hooks_by_type.get(HookType.SESSION_END, [])
+        if not hooks:
+            return
+        invocation = _build_invocation(
+            HookType.SESSION_END,
+            session_id,
+            session_logger,
+            reason=reason,
+            turn_count=turn_count,
+            error=error,
+        )
+
+        yield HookRunStartEvent()
+        for hook in hooks:
+            yield HookStartEvent(hook_name=hook.name)
+            result = await self._executor.run(hook, invocation)
+
+            if result.timed_out or result.exit_code is None:
+                yield HookEndEvent(
+                    hook_name=hook.name,
+                    status=HookMessageSeverity.WARNING,
+                    content=f"Timed out after {hook.timeout}s",
+                )
+            elif result.exit_code == HookExitCode.SUCCESS:
+                if result.stdout:
+                    try:
+                        data = json.loads(result.stdout)
+                        if (
+                            isinstance(data, dict)
+                            and data.get("decision") == "deny"
+                        ):
+                            logger.warning(
+                                "session_end hook %s returned deny — session cannot be kept alive, ignoring",
+                                hook.name,
+                            )
+                    except (json.JSONDecodeError, ValueError):
+                        pass
+                    logger.debug("session_end hook %s output: %s", hook.name, result.stdout)
+                yield HookEndEvent(hook_name=hook.name, status=HookMessageSeverity.OK)
+            else:
+                yield HookEndEvent(
+                    hook_name=hook.name,
+                    status=HookMessageSeverity.WARNING,
+                    content=(
+                        result.stdout
+                        or result.stderr
+                        or f"Exited with code {result.exit_code}"
+                    ),
+                )
+
+        yield HookRunEndEvent()
+
     async def run_pre_tool_use(
         self,
         session_id: str,
@@ -448,6 +514,8 @@ def _build_invocation(
     tool_error: str | None = None,
     exit_code: int | None = None,
     duration_ms: int | None = None,
+    turn_count: int | None = None,
+    error: str | None = None,
 ) -> HookInvocation:
     transcript_path = ""
     if session_logger.enabled and session_logger.session_dir is not None:
@@ -477,6 +545,8 @@ def _build_invocation(
         tool_error=tool_error,
         exit_code=exit_code,
         duration_ms=duration_ms,
+        turn_count=turn_count,
+        error=error,
     )
 
 

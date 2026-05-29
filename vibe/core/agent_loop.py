@@ -365,6 +365,8 @@ class AgentLoop:  # noqa: PLR0904
             hook_config_result.issues if hook_config_result else []
         )
         self._pending_session_start_source: str | None = "new"
+        self._session_end_fired: bool = False
+        self._post_agent_turn_count: int = 0
         self.rewind_manager = RewindManager(
             messages=self.messages,
             save_messages=self._save_messages,
@@ -582,6 +584,12 @@ class AgentLoop:  # noqa: PLR0904
         self.telemetry_client.send_session_closed()
 
     async def aclose(self) -> None:
+        # Defensive single-fire of session_end. Callers that know the precise
+        # reason (clean exit / signal / error) should call fire_session_end()
+        # before aclose. If they didn't, treat it as a parent-driven close.
+        with contextlib.suppress(Exception):
+            async for _ in self.fire_session_end("parent_close"):
+                pass
         if (task := self._experiments_task) is not None and not task.done():
             task.cancel()
             with contextlib.suppress(BaseException):
@@ -590,6 +598,31 @@ class AgentLoop:  # noqa: PLR0904
             await self.backend.__aexit__(None, None, None)
         with contextlib.suppress(Exception):
             await self.experiment_manager.aclose()
+
+    async def fire_session_end(
+        self, reason: str, *, error: str | None = None
+    ) -> AsyncGenerator[BaseEvent]:
+        """Fire session_end hooks. Idempotent: subsequent calls are no-ops.
+
+        ``reason`` should be one of: "exit", "signal", "parent_close", "error".
+        Hooks are observational — they cannot block teardown. All errors are
+        suppressed by the caller; this method only yields hook lifecycle events.
+        """
+        if self._session_end_fired:
+            return
+        self._session_end_fired = True
+        if self._hooks_manager is None or not self._hooks_manager.has_hooks(
+            HookType.SESSION_END
+        ):
+            return
+        async for hook_event in self._hooks_manager.run_session_end(
+            session_id=self.session_id,
+            session_logger=self.session_logger,
+            reason=reason,
+            turn_count=self._post_agent_turn_count,
+            error=error,
+        ):
+            yield hook_event
 
     def _create_connector_registry(self) -> ConnectorRegistry | None:
         if not self._base_config.enable_connectors:
@@ -1000,6 +1033,7 @@ class AgentLoop:  # noqa: PLR0904
                             hook_retry = hook_event
                         else:
                             yield hook_event
+                    self._post_agent_turn_count += 1
                     if hook_retry is not None:
                         self.messages.append(
                             LLMMessage(

@@ -22,6 +22,7 @@ class HookType(StrEnum):
     USER_PROMPT_SUBMIT = auto()
     PRE_COMPACT = auto()
     SESSION_START = auto()
+    SESSION_END = auto()
     POST_TOOL_USE = auto()
     PRE_TOOL_USE = auto()
 
@@ -83,6 +84,9 @@ class HookInvocation(BaseModel):
     tool_error: str | None = None
     exit_code: int | None = None
     duration_ms: int | None = None
+    # session_end fields
+    turn_count: int | None = None
+    error: str | None = None
 
 
 # --- Hook result parsing ---

@@ -1057,6 +1057,185 @@ class TestPreCompactResultParser:
         assert _parse_pre_compact_result(payload) is None
 
 
+class TestHooksManagerSessionEnd:
+    def _make_logger(self):
+        from vibe.core.config import SessionLoggingConfig
+        from vibe.core.session.session_logger import SessionLogger
+
+        return SessionLogger(SessionLoggingConfig(enabled=False), "test-id")
+
+    def _make_hook(self, command: str, name: str = "se-hook") -> HookConfig:
+        return HookConfig(
+            name=name, type=HookType.SESSION_END, command=command, timeout=30.0
+        )
+
+    @pytest.mark.asyncio
+    async def test_payload_contains_reason_turn_count_and_error(self) -> None:
+        hook = self._make_hook(
+            f"{sys.executable} -c \""
+            f"import sys,json; d=json.load(sys.stdin); "
+            f"assert d['hook_event_name']=='session_end'; "
+            f"assert d['reason']=='error'; "
+            f"assert d['turn_count']==7; "
+            f"assert d['error']=='boom'; "
+            f"print('ok')\""
+        )
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_session_end(
+                "sess", logger, reason="error", turn_count=7, error="boom"
+            )
+        ]
+        end_events = [e for e in events if isinstance(e, HookEndEvent)]
+        assert any(e.status == HookMessageSeverity.OK for e in end_events)
+
+    @pytest.mark.asyncio
+    async def test_timeout_fails_open(self) -> None:
+        hook = HookConfig(
+            name="slow", type=HookType.SESSION_END, command="sleep 60", timeout=0.5
+        )
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_session_end(
+                "sess", logger, reason="exit", turn_count=0
+            )
+        ]
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_nonzero_exit_warns_does_not_block(self) -> None:
+        hook = self._make_hook("sh -c 'echo whoops >&2; exit 1'")
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_session_end(
+                "sess", logger, reason="exit", turn_count=1
+            )
+        ]
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_deny_decision_is_ignored(self) -> None:
+        payload = json.dumps({"decision": "deny", "reason": "cant block teardown"})
+        hook = self._make_hook(f"echo '{payload}'")
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_session_end(
+                "sess", logger, reason="exit", turn_count=2
+            )
+        ]
+        end_events = [e for e in events if isinstance(e, HookEndEvent)]
+        # Hook completed with OK status — deny was logged-and-ignored, not surfaced
+        assert any(e.status == HookMessageSeverity.OK for e in end_events)
+
+    @pytest.mark.asyncio
+    async def test_missing_binary_fails_open(self) -> None:
+        hook = self._make_hook("/nonexistent/path/to/hook-binary --flag")
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [
+            ev
+            async for ev in handler.run_session_end(
+                "sess", logger, reason="exit", turn_count=0
+            )
+        ]
+        # Some kind of HookEndEvent must be yielded; the generator must not raise
+        assert any(isinstance(e, HookEndEvent) for e in events)
+
+
+class TestAgentLoopSessionEndIntegration:
+    @pytest.mark.asyncio
+    async def test_fire_session_end_is_single_fire(self) -> None:
+        backend = FakeBackend(mock_llm_chunk(content="hello"))
+        hooks = [
+            HookConfig(
+                name="se",
+                type=HookType.SESSION_END,
+                command="echo end-data",
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        first = [ev async for ev in agent_loop.fire_session_end("exit")]
+        second = [ev async for ev in agent_loop.fire_session_end("signal")]
+        assert any(isinstance(e, HookEndEvent) for e in first)
+        # Second call drains immediately — single-fire flag swallows it
+        assert second == []
+
+    @pytest.mark.asyncio
+    async def test_turn_count_matches_post_agent_turns(self) -> None:
+        backend = FakeBackend([
+            [mock_llm_chunk(content="t1")],
+            [mock_llm_chunk(content="t2")],
+            [mock_llm_chunk(content="t3")],
+        ])
+        # session_end hook asserts turn_count==3 in its payload
+        hooks = [
+            HookConfig(
+                name="se",
+                type=HookType.SESSION_END,
+                command=(
+                    f"{sys.executable} -c \""
+                    f"import sys,json; d=json.load(sys.stdin); "
+                    f"assert d['turn_count']==3, f\\\"got {{d['turn_count']}}\\\"; "
+                    f"print('ok')\""
+                ),
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        [ev async for ev in agent_loop.act("p1")]
+        [ev async for ev in agent_loop.act("p2")]
+        [ev async for ev in agent_loop.act("p3")]
+        events = [ev async for ev in agent_loop.fire_session_end("exit")]
+        end_events = [e for e in events if isinstance(e, HookEndEvent)]
+        assert end_events, "no HookEndEvent yielded"
+        assert all(e.status == HookMessageSeverity.OK for e in end_events), (
+            f"turn_count assertion failed in hook: {end_events}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_aclose_fires_session_end_if_not_already_fired(self) -> None:
+        backend = FakeBackend(mock_llm_chunk(content="hi"))
+        marker = Path("/tmp/vibe-session-end-aclose-marker.txt")
+        marker.unlink(missing_ok=True)
+        hooks = [
+            HookConfig(
+                name="se",
+                type=HookType.SESSION_END,
+                command=f"sh -c 'touch {marker}'",
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        await agent_loop.aclose()
+        assert marker.exists()
+        marker.unlink(missing_ok=True)
+
+
 class TestAgentLoopSessionStartIntegration:
     @pytest.mark.asyncio
     async def test_session_start_fires_on_first_act(self) -> None:
