@@ -54,6 +54,87 @@ uv tool install mistral-vibe
 pip install mistral-vibe
 ```
 
+---
+
+## Installing this fork (Hydrate hook-parity build)
+
+This is the **Hydrate fork** of Mistral Vibe. It adds six lifecycle hooks
+(`user_prompt_submit`, `session_start`, `session_end`, `pre_compact`,
+`pre_tool_use`, `post_tool_use`) to the stock `post_agent_turn` hook
+shipped by upstream, so the [Hydrate](https://gethydrate.dev) memory
+layer can deliver context injection and tool guardrails on Vibe at
+parity with Claude Code and OpenAI Codex.
+
+The fork tracks upstream tags; the latest tag is **`v2.12.1-hydrate.1`**
+(based on upstream `v2.12.1`).
+
+### Recommended: `uv` (works on Linux, macOS, Windows)
+
+`uv` is the simplest path because it will fetch a compatible Python
+interpreter for you. If you don't have it:
+
+```bash
+# Linux / macOS
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Windows (PowerShell)
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+```
+
+Then install the fork:
+
+```bash
+uv tool install --python 3.12 "git+https://github.com/getHydrate/mistral-vibe@v2.12.1-hydrate.1"
+```
+
+Verify:
+
+```bash
+vibe --version   # should print 2.12.1
+```
+
+If `vibe` is not found after install, run `uv tool update-shell` and
+restart your shell — `uv tool` puts binaries in `~/.local/bin`
+(Linux/macOS) or `%USERPROFILE%\.local\bin` (Windows), which must be
+on `PATH`.
+
+### Alternative: `pip` (requires Python 3.12+ already installed)
+
+> [!IMPORTANT]
+> Vibe requires **Python 3.12 or newer**. `pip install` will fail with
+> `Package 'mistral-vibe' requires a different Python: 3.X not in '>=3.12'`
+> if your default `python` is older. On Windows, the system Python is
+> often 3.10 — use the `py -3.12` launcher to pin the interpreter:
+
+```bash
+# Linux / macOS (after installing Python 3.12+)
+pip install "git+https://github.com/getHydrate/mistral-vibe@v2.12.1-hydrate.1"
+
+# Windows (after installing Python 3.12 from python.org)
+py -3.12 -m pip install "git+https://github.com/getHydrate/mistral-vibe@v2.12.1-hydrate.1"
+```
+
+### Upgrading
+
+```bash
+uv tool install --force --python 3.12 "git+https://github.com/getHydrate/mistral-vibe@v2.12.1-hydrate.1"
+```
+
+The `--force` flag overrides any previously-installed Vibe (stock or
+older fork tag).
+
+### What's different from stock Vibe
+
+The fork is a **strict superset** of upstream — it adds new hook event
+types and the wiring to fire them, but does not modify any stock
+behaviour. If no Hydrate hooks are configured, the fork behaves
+identically to the upstream `v2.12.1` it is based on.
+
+For details on the hook surface, see
+[gethydrate.dev/docs/integrations/vibe](https://gethydrate.dev).
+
+---
+
 ## Table of Contents
 
 - [Features](#features)
