@@ -1807,20 +1807,22 @@ class AgentLoop:  # noqa: PLR0904
                 )
             self.stats.steps += 1
 
+            pre_compact_injections: list[str] = []
             if self._hooks_manager and self._hooks_manager.has_hooks(HookType.PRE_COMPACT):
                 token_estimate = self.stats.context_tokens
                 try:
                     threshold = self.config.get_active_model().auto_compact_threshold
                 except ValueError:
                     threshold = None
-                async for _ in self._hooks_manager.run_pre_compact(
+                async for hook_event in self._hooks_manager.run_pre_compact(
                     session_id=self.session_id,
                     session_logger=self.session_logger,
                     reason="auto_compact",
                     token_estimate_before=token_estimate,
                     auto_compact_threshold=threshold,
                 ):
-                    pass
+                    if isinstance(hook_event, HookInjectedContext):
+                        pre_compact_injections.append(hook_event.content)
 
             with self.messages.silent():
                 self.messages.append(
@@ -1841,7 +1843,13 @@ class AgentLoop:  # noqa: PLR0904
             system_message = self.messages[0]
             wrapped_summary = f"{summary_prefix}\n{summary_content}"
             summary_message = LLMMessage(role=Role.user, content=wrapped_summary)
-            self.messages.reset([system_message, *prior_user_messages, summary_message])
+            injected_messages = [
+                LLMMessage(role=Role.user, content=content, injected=True)
+                for content in pre_compact_injections
+            ]
+            self.messages.reset(
+                [system_message, *prior_user_messages, summary_message, *injected_messages]
+            )
 
             active_model = self.config.get_active_model()
             await self._reset_session()

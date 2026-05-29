@@ -265,7 +265,7 @@ class HooksManager:
         reason: str = "auto_compact",
         token_estimate_before: int | None = None,
         auto_compact_threshold: int | None = None,
-    ) -> AsyncGenerator[BaseEvent]:
+    ) -> AsyncGenerator[BaseEvent | HookInjectedContext]:
         hooks = self._hooks_by_type.get(HookType.PRE_COMPACT, [])
         if not hooks:
             return
@@ -291,6 +291,15 @@ class HooksManager:
                 )
             elif result.exit_code == HookExitCode.SUCCESS:
                 if result.stdout:
+                    # JSON inject envelope (preferred) surfaces context that
+                    # survives compaction; plain stdout is debug-logged only.
+                    decision_result = _parse_pre_compact_result(result.stdout)
+                    if isinstance(decision_result, HookInjectedContext):
+                        yield HookEndEvent(
+                            hook_name=hook.name, status=HookMessageSeverity.OK
+                        )
+                        yield decision_result
+                        continue
                     logger.debug("pre_compact hook %s output: %s", hook.name, result.stdout)
                 yield HookEndEvent(hook_name=hook.name, status=HookMessageSeverity.OK)
             else:
@@ -502,6 +511,38 @@ def _parse_user_prompt_submit_result(
 
     # Plain text stdout: inject as additional context
     return HookInjectedContext(content=stdout)
+
+
+def _parse_pre_compact_result(
+    stdout: str,
+) -> HookInjectedContext | None:
+    """Parse hook stdout for pre_compact.
+
+    Only an explicit ``{decision: "inject", additional_context: "..."}``
+    (or ``{decision: "allow", additional_context: "..."}``) envelope triggers
+    injection. ``deny`` has no semantics here (compaction proceeds) and is
+    logged as a warning. Plain text is debug-logged only — pre_compact is
+    fire-and-forget unless an envelope opts in.
+    """
+    if not stdout:
+        return None
+
+    try:
+        data = json.loads(stdout)
+        if isinstance(data, dict) and "decision" in data:
+            decision = HookDecision.model_validate(data)
+            if decision.decision == "deny":
+                logger.warning(
+                    "pre_compact hook returned deny — compaction cannot be blocked, ignoring"
+                )
+                return None
+            if decision.additional_context:
+                return HookInjectedContext(content=decision.additional_context)
+            return None
+    except (json.JSONDecodeError, ValueError):
+        pass
+
+    return None
 
 
 def _parse_pre_tool_use_result(

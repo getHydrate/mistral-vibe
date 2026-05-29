@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 import sys
 
@@ -1002,6 +1003,58 @@ class TestHooksManagerPreCompact:
             if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
         ]
         assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_json_inject_envelope_yields_context(self) -> None:
+        payload = json.dumps(
+            {"decision": "inject", "additional_context": "preserved-across-compact"}
+        )
+        hook = self._make_hook(f"echo '{payload}'")
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [ev async for ev in handler.run_pre_compact("sess", logger)]
+        injected = [e for e in events if isinstance(e, HookInjectedContext)]
+        assert len(injected) == 1
+        assert injected[0].content == "preserved-across-compact"
+
+    @pytest.mark.asyncio
+    async def test_json_deny_is_logged_and_ignored(self) -> None:
+        payload = json.dumps({"decision": "deny", "reason": "cannot block"})
+        hook = self._make_hook(f"echo '{payload}'")
+        handler = HooksManager([hook])
+        logger = self._make_logger()
+        events = [ev async for ev in handler.run_pre_compact("sess", logger)]
+        assert not any(isinstance(e, HookInjectedContext) for e in events)
+        end_events = [e for e in events if isinstance(e, HookEndEvent)]
+        assert any(e.status == HookMessageSeverity.OK for e in end_events)
+
+
+class TestPreCompactResultParser:
+    def test_empty_stdout_returns_none(self) -> None:
+        from vibe.core.hooks.manager import _parse_pre_compact_result
+
+        assert _parse_pre_compact_result("") is None
+
+    def test_plain_text_returns_none(self) -> None:
+        from vibe.core.hooks.manager import _parse_pre_compact_result
+
+        assert _parse_pre_compact_result("plain stdout") is None
+
+    def test_inject_envelope_returns_injected_context(self) -> None:
+        from vibe.core.hooks.manager import _parse_pre_compact_result
+
+        payload = json.dumps(
+            {"decision": "inject", "additional_context": "carry-over"}
+        )
+        result = _parse_pre_compact_result(payload)
+        assert isinstance(result, HookInjectedContext)
+        assert result.content == "carry-over"
+
+    def test_deny_returns_none(self) -> None:
+        from vibe.core.hooks.manager import _parse_pre_compact_result
+
+        payload = json.dumps({"decision": "deny", "reason": "x"})
+        assert _parse_pre_compact_result(payload) is None
 
 
 class TestAgentLoopSessionStartIntegration:
