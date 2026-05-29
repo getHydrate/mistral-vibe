@@ -1331,6 +1331,72 @@ class TestAgentLoopSessionStartIntegration:
 
         assert "pre_compact" in fired
 
+    @pytest.mark.asyncio
+    async def test_pre_compact_envelope_content_survives_compaction(
+        self, tmp_path: Path
+    ) -> None:
+        """End-to-end: real hook subprocess emits the JSON inject envelope,
+        compact() runs to completion, and the additional_context lands in
+        the post-compact message list as an injected user message."""
+
+        backend = FakeBackend([
+            [mock_llm_chunk(content="this is the compaction summary")],
+        ])
+        envelope_content = "carried-across-compact-token-XYZ123"
+        envelope = json.dumps(
+            {"decision": "inject", "additional_context": envelope_content}
+        )
+        # Write the envelope to a file the hook script then cats — avoids
+        # shell-quoting issues since the executor uses create_subprocess_shell.
+        envelope_file = tmp_path / "envelope.json"
+        envelope_file.write_text(envelope)
+        command = f"cat {envelope_file}"
+        hooks = [
+            HookConfig(
+                name="precompact-envelope",
+                type=HookType.PRE_COMPACT,
+                command=command,
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+
+        # Seed the message buffer with something to compact (compact() needs
+        # at least one prior user message after the system message).
+        from vibe.core.types import LLMMessage, Role
+
+        agent_loop.messages.append(
+            LLMMessage(role=Role.user, content="prior user turn")
+        )
+        agent_loop.messages.append(
+            LLMMessage(role=Role.assistant, content="prior assistant turn")
+        )
+
+        await agent_loop.compact()
+
+        # The envelope's additional_context must appear as an injected user
+        # message in the post-compact message list. The summary message is
+        # also present; the injected message is appended after it.
+        injected = [
+            m
+            for m in agent_loop.messages
+            if m.role == Role.user and getattr(m, "injected", False)
+        ]
+        assert any(envelope_content in (m.content or "") for m in injected), (
+            f"envelope additional_context did not survive compaction; "
+            f"injected messages: {[m.content for m in injected]}; "
+            f"all messages: {[(m.role.value, (m.content or '')[:80]) for m in agent_loop.messages]}"
+        )
+
+        # And the raw JSON envelope must NOT appear verbatim in any message —
+        # that would indicate the parser fell through and dumped stdout as-is.
+        for m in agent_loop.messages:
+            assert envelope not in (m.content or ""), (
+                f"raw JSON envelope leaked into message: {m.content!r}"
+            )
+
 
 class TestPostToolUseConfig:
     def test_post_tool_use_loads_from_toml(
