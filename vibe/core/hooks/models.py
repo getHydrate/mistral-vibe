@@ -21,6 +21,14 @@ class HookType(StrEnum):
     POST_AGENT_TURN = auto()
     BEFORE_TOOL = auto()
     AFTER_TOOL = auto()
+    USER_PROMPT_SUBMIT = auto()
+    SESSION_START = auto()
+    SESSION_END = auto()
+    PRE_COMPACT = auto()
+
+
+# Tool hooks accept ``match`` / ``strict``; the lifecycle hooks below do not.
+_TOOL_HOOK_TYPES = frozenset({HookType.BEFORE_TOOL, HookType.AFTER_TOOL})
 
 
 ToolStatus = Literal["success", "failure", "cancelled"]
@@ -57,11 +65,11 @@ class HookConfig(BaseModel):
 
     @model_validator(mode="after")
     def _apply_defaults_and_constraints(self) -> Self:
-        if self.match is not None and self.type == HookType.POST_AGENT_TURN:
+        if self.match is not None and self.type not in _TOOL_HOOK_TYPES:
             raise ValueError(
                 "match is only valid for tool hooks (before_tool / after_tool)"
             )
-        if self.strict and self.type == HookType.POST_AGENT_TURN:
+        if self.strict and self.type not in _TOOL_HOOK_TYPES:
             raise ValueError(
                 "strict is only valid for tool hooks (before_tool / after_tool)"
             )
@@ -115,7 +123,43 @@ class AfterToolInvocation(HookSessionContext):
     duration_ms: float
 
 
-HookInvocation = PostAgentTurnInvocation | BeforeToolInvocation | AfterToolInvocation
+class UserPromptSubmitInvocation(HookSessionContext):
+    hook_event_name: Literal[HookType.USER_PROMPT_SUBMIT] = HookType.USER_PROMPT_SUBMIT
+    prompt: str
+    message_id: str | None = None
+    project: str | None = None
+
+
+class SessionStartInvocation(HookSessionContext):
+    hook_event_name: Literal[HookType.SESSION_START] = HookType.SESSION_START
+    # One of: "new", "continue", "clear", "fork".
+    source: str
+
+
+class SessionEndInvocation(HookSessionContext):
+    hook_event_name: Literal[HookType.SESSION_END] = HookType.SESSION_END
+    # One of: "exit", "signal", "parent_close", "error", "clear".
+    reason: str
+    turn_count: int
+    error: str | None = None
+
+
+class PreCompactInvocation(HookSessionContext):
+    hook_event_name: Literal[HookType.PRE_COMPACT] = HookType.PRE_COMPACT
+    reason: str = "auto_compact"
+    token_estimate_before: int | None = None
+    auto_compact_threshold: int | None = None
+
+
+HookInvocation = (
+    PostAgentTurnInvocation
+    | BeforeToolInvocation
+    | AfterToolInvocation
+    | UserPromptSubmitInvocation
+    | SessionStartInvocation
+    | SessionEndInvocation
+    | PreCompactInvocation
+)
 
 
 def build_invocation(
@@ -163,6 +207,19 @@ def build_invocation(
                 tool_output_text=tool_output_text,
                 tool_error=tool_error,
                 duration_ms=duration_ms,
+            )
+        case (
+            HookType.USER_PROMPT_SUBMIT
+            | HookType.SESSION_START
+            | HookType.SESSION_END
+            | HookType.PRE_COMPACT
+        ):
+            # Lifecycle invocations carry event-specific required fields
+            # (prompt / source / reason / turn_count) and are constructed
+            # directly by the agent loop rather than through this factory.
+            raise ValueError(
+                f"{hook_type.value} invocations are constructed directly,"
+                " not via build_invocation()"
             )
         case _:
             assert_never(hook_type)
@@ -238,6 +295,24 @@ class HookTextReplacement(BaseModel):
     """
 
     text: str
+
+
+class HookContextInjection(BaseModel):
+    """user_prompt_submit / session_start / pre_compact allow:
+    ``content`` (the ``hook_specific_output.additional_context`` of an
+    allowing hook) is injected into the conversation as a user message.
+    """
+
+    content: str
+
+
+class HookPromptDenial(BaseModel):
+    """user_prompt_submit deny: the user prompt is blocked before it
+    reaches the model and ``reason`` is surfaced to the user.
+    """
+
+    hook_name: str
+    reason: str
 
 
 # --- Transcript / UI events (BaseEvent) ---

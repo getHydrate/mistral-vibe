@@ -9,9 +9,11 @@ from pydantic import ValidationError
 
 from vibe.core.hooks.config import HookConfig
 from vibe.core.hooks.models import (
+    HookContextInjection,
     HookEvent,
     HookExecutionResult,
     HookInvocation,
+    HookPromptDenial,
     HookStructuredResponse,
     HookTextReplacement,
     HookToolDenial,
@@ -31,6 +33,8 @@ _HookYield = (
     | HookToolDenial
     | HookToolInputRewrite
     | HookTextReplacement
+    | HookContextInjection
+    | HookPromptDenial
 )
 
 

@@ -9,7 +9,11 @@ from typing import Any
 import pytest
 import tomli_w
 
-from tests.conftest import build_test_agent_loop, build_test_vibe_config
+from tests.conftest import (
+    build_test_agent_loop,
+    build_test_vibe_config,
+    make_test_models,
+)
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_tool import FakeTool, FakeToolArgs
@@ -26,9 +30,11 @@ from vibe.core.hooks.manager import HooksManager
 from vibe.core.hooks.models import (
     AfterToolInvocation,
     HookConfig,
+    HookContextInjection,
     HookEndEvent,
     HookEvent,
     HookMessageSeverity,
+    HookPromptDenial,
     HookRunEndEvent,
     HookRunStartEvent,
     HookSessionContext,
@@ -40,6 +46,10 @@ from vibe.core.hooks.models import (
     HookType,
     HookUserMessage,
     PostAgentTurnInvocation,
+    PreCompactInvocation,
+    SessionEndInvocation,
+    SessionStartInvocation,
+    UserPromptSubmitInvocation,
     build_invocation,
 )
 from vibe.core.types import AssistantEvent, FunctionCall, ToolCall, ToolResultEvent
@@ -155,6 +165,11 @@ def _emit_cmd(payload: dict[str, Any]) -> str:
 
 def _deny_cmd(reason: str = "") -> str:
     return _emit_cmd({"decision": "deny", "reason": reason})
+
+
+def _context_cmd(context: str) -> str:
+    """Allowing hook that injects ``context`` via the structured response."""
+    return _emit_cmd({"hook_specific_output": {"additional_context": context}})
 
 
 class TestConfigLoading:
@@ -1906,3 +1921,316 @@ class TestHookOutputCap:
         result = await HookExecutor().run(hook, sample_invocation)
         assert result.exit_code == 0
         assert len(result.stderr) <= _MAX_OUTPUT_BYTES
+
+
+# ---------------------------------------------------------------------------
+# Lifecycle hooks: user_prompt_submit / session_start / session_end /
+# pre_compact. These were added in the Hydrate fork and re-implemented on
+# the v2.16+ HookHandler architecture: they share the strict structured
+# stdout contract (exit 0 + JSON) with the native tool / turn hooks.
+# ---------------------------------------------------------------------------
+
+
+def _user_prompt_invocation(prompt: str = "hi") -> UserPromptSubmitInvocation:
+    return UserPromptSubmitInvocation(
+        session_id="sess", transcript_path="", cwd=str(Path.cwd()), prompt=prompt
+    )
+
+
+class TestUserPromptSubmitHook:
+    @pytest.mark.asyncio
+    async def test_empty_stdout_is_passthrough(self) -> None:
+        handler = HooksManager([
+            _make_hook(command="true", type=HookType.USER_PROMPT_SUBMIT)
+        ])
+        events = [ev async for ev in handler.run(_user_prompt_invocation())]
+        assert not any(isinstance(e, HookPromptDenial) for e in events)
+        assert not any(isinstance(e, HookContextInjection) for e in events)
+        ends = [e for e in events if isinstance(e, HookEndEvent)]
+        assert ends and ends[0].status == HookMessageSeverity.OK
+
+    @pytest.mark.asyncio
+    async def test_additional_context_is_injected(self) -> None:
+        handler = HooksManager([
+            _make_hook(
+                command=_context_cmd("remember X"), type=HookType.USER_PROMPT_SUBMIT
+            )
+        ])
+        events = [ev async for ev in handler.run(_user_prompt_invocation())]
+        injections = [e for e in events if isinstance(e, HookContextInjection)]
+        assert len(injections) == 1
+        assert injections[0].content == "remember X"
+
+    @pytest.mark.asyncio
+    async def test_decision_deny_yields_prompt_denial(self) -> None:
+        handler = HooksManager([
+            _make_hook(command=_deny_cmd("blocked"), type=HookType.USER_PROMPT_SUBMIT)
+        ])
+        events = [ev async for ev in handler.run(_user_prompt_invocation())]
+        denials = [e for e in events if isinstance(e, HookPromptDenial)]
+        assert len(denials) == 1
+        assert denials[0].reason == "blocked"
+        # The deny reason must not leak into the UI end-event content.
+        assert not any(
+            "blocked" in (e.content or "")
+            for e in events
+            if isinstance(e, HookEndEvent)
+        )
+
+    @pytest.mark.asyncio
+    async def test_non_json_stdout_is_fail_open_warning(self) -> None:
+        handler = HooksManager([
+            _make_hook(command="echo chatty", type=HookType.USER_PROMPT_SUBMIT)
+        ])
+        events = [ev async for ev in handler.run(_user_prompt_invocation())]
+        assert not any(isinstance(e, HookPromptDenial) for e in events)
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+
+
+class TestSessionStartHook:
+    def _invocation(self, source: str = "new") -> SessionStartInvocation:
+        return SessionStartInvocation(
+            session_id="sess", transcript_path="", cwd=str(Path.cwd()), source=source
+        )
+
+    @pytest.mark.asyncio
+    async def test_additional_context_is_injected(self) -> None:
+        handler = HooksManager([
+            _make_hook(command=_context_cmd("session note"), type=HookType.SESSION_START)
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        injections = [e for e in events if isinstance(e, HookContextInjection)]
+        assert len(injections) == 1
+        assert injections[0].content == "session note"
+
+    @pytest.mark.asyncio
+    async def test_deny_is_ignored(self) -> None:
+        handler = HooksManager([
+            _make_hook(command=_deny_cmd("no"), type=HookType.SESSION_START)
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        assert not any(isinstance(e, HookContextInjection) for e in events)
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+
+
+class TestPreCompactHook:
+    def _invocation(self) -> PreCompactInvocation:
+        return PreCompactInvocation(
+            session_id="sess",
+            transcript_path="",
+            cwd=str(Path.cwd()),
+            token_estimate_before=1234,
+        )
+
+    @pytest.mark.asyncio
+    async def test_additional_context_is_injected(self) -> None:
+        handler = HooksManager([
+            _make_hook(command=_context_cmd("carry over"), type=HookType.PRE_COMPACT)
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        injections = [e for e in events if isinstance(e, HookContextInjection)]
+        assert len(injections) == 1
+        assert injections[0].content == "carry over"
+
+    @pytest.mark.asyncio
+    async def test_deny_is_ignored(self) -> None:
+        handler = HooksManager([
+            _make_hook(command=_deny_cmd("no"), type=HookType.PRE_COMPACT)
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        assert not any(isinstance(e, HookContextInjection) for e in events)
+
+
+class TestSessionEndHook:
+    def _invocation(self) -> SessionEndInvocation:
+        return SessionEndInvocation(
+            session_id="sess",
+            transcript_path="",
+            cwd=str(Path.cwd()),
+            reason="exit",
+            turn_count=3,
+        )
+
+    @pytest.mark.asyncio
+    async def test_exit_0_emits_ok(self) -> None:
+        handler = HooksManager([
+            _make_hook(command="true", type=HookType.SESSION_END)
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        ends = [e for e in events if isinstance(e, HookEndEvent)]
+        assert ends and ends[0].status == HookMessageSeverity.OK
+
+    @pytest.mark.asyncio
+    async def test_deny_is_ignored(self) -> None:
+        handler = HooksManager([
+            _make_hook(command=_deny_cmd("stay"), type=HookType.SESSION_END)
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+
+
+class TestLifecycleHookConfig:
+    def test_match_rejected_on_user_prompt_submit(self) -> None:
+        with pytest.raises(ValueError, match="match is only valid for tool hooks"):
+            HookConfig(
+                name="x",
+                type=HookType.USER_PROMPT_SUBMIT,
+                command="echo ok",
+                match="*",
+            )
+
+    def test_strict_rejected_on_session_start(self) -> None:
+        with pytest.raises(ValueError, match="strict is only valid for tool hooks"):
+            HookConfig(
+                name="x",
+                type=HookType.SESSION_START,
+                command="echo ok",
+                strict=True,
+            )
+
+
+class TestLifecycleAgentLoopIntegration:
+    @pytest.mark.asyncio
+    async def test_user_prompt_submit_deny_blocks_llm_turn(self) -> None:
+        backend = FakeBackend(mock_llm_chunk(content="Hello!"))
+        hooks = [
+            _make_hook(
+                name="gate",
+                command=_deny_cmd("not allowed"),
+                type=HookType.USER_PROMPT_SUBMIT,
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        events = [ev async for ev in agent_loop.act("hi")]
+        assistant = [e for e in events if isinstance(e, AssistantEvent)]
+        # The denial reason is surfaced and the model's response never runs.
+        assert any(e.content == "not allowed" for e in assistant)
+        assert not any(e.content == "Hello!" for e in assistant)
+
+    @pytest.mark.asyncio
+    async def test_user_prompt_submit_injects_context(self) -> None:
+        backend = FakeBackend(mock_llm_chunk(content="ok"))
+        hooks = [
+            _make_hook(
+                name="ctx",
+                command=_context_cmd("INJECTED"),
+                type=HookType.USER_PROMPT_SUBMIT,
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        _ = [ev async for ev in agent_loop.act("hi")]
+        injected = [
+            m
+            for m in agent_loop.messages
+            if getattr(m, "injected", False) and m.content == "INJECTED"
+        ]
+        assert len(injected) == 1
+
+    @pytest.mark.asyncio
+    async def test_session_start_fires_once(self) -> None:
+        backend = FakeBackend([
+            [mock_llm_chunk(content="one")],
+            [mock_llm_chunk(content="two")],
+        ])
+        hooks = [
+            _make_hook(
+                name="start",
+                command=_context_cmd("STARTED"),
+                type=HookType.SESSION_START,
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        _ = [ev async for ev in agent_loop.act("first")]
+        _ = [ev async for ev in agent_loop.act("second")]
+        injected = [
+            m
+            for m in agent_loop.messages
+            if getattr(m, "injected", False) and m.content == "STARTED"
+        ]
+        assert len(injected) == 1
+
+    @pytest.mark.asyncio
+    async def test_session_end_fires_once_with_turn_count(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "session_end.json"
+        script = (
+            f"{sys.executable} -c {shlex.quote('import sys; open(' + repr(str(out)) + chr(44) + repr('w') + ').write(sys.stdin.read())')}"
+        )
+        hooks = [_make_hook(name="end", command=script, type=HookType.SESSION_END)]
+        backend = FakeBackend([
+            [mock_llm_chunk(content="one")],
+            [mock_llm_chunk(content="two")],
+        ])
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        _ = [ev async for ev in agent_loop.act("first")]
+        _ = [ev async for ev in agent_loop.act("second")]
+        await agent_loop.fire_session_end(reason="exit")
+        # Second call is a no-op (single-fire guard).
+        await agent_loop.fire_session_end(reason="exit")
+
+        payload = json.loads(out.read_text())
+        assert payload["hook_event_name"] == "session_end"
+        assert payload["reason"] == "exit"
+        assert payload["turn_count"] == 2
+
+    @pytest.mark.asyncio
+    async def test_pre_compact_context_survives_compaction(self) -> None:
+        # auto_compact_threshold=1 forces compaction on the first turn; the
+        # pre_compact hook's injected context must survive the message reset.
+        backend = FakeBackend([
+            [mock_llm_chunk(content="<summary>")],
+            [mock_llm_chunk(content="<final>")],
+        ])
+        cfg = build_test_vibe_config(
+            models=make_test_models(auto_compact_threshold=1)
+        )
+        hooks = [
+            _make_hook(
+                name="precompact",
+                command=_context_cmd("SURVIVES"),
+                type=HookType.PRE_COMPACT,
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            config=cfg,
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        agent_loop.stats.context_tokens = 2
+
+        _ = [ev async for ev in agent_loop.act("Hello")]
+
+        survived = [
+            m
+            for m in agent_loop.messages
+            if getattr(m, "injected", False) and m.content == "SURVIVES"
+        ]
+        assert len(survived) == 1

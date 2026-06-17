@@ -31,7 +31,7 @@ from vibe.core.experiments.session import (
     initialize_experiments as session_initialize_experiments,
 )
 from vibe.core.hooks.manager import HooksManager
-from vibe.core.hooks.models import HookConfigResult, HookEvent
+from vibe.core.hooks.models import HookConfigResult, HookContextInjection, HookEvent
 from vibe.core.llm.backend.factory import BACKEND_FACTORY
 from vibe.core.llm.exceptions import BackendError
 from vibe.core.llm.format import (
@@ -374,6 +374,13 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._current_user_message_id: str | None = None
         self._is_user_prompt_call: bool = False
         self._pending_injected_messages: list[LLMMessage] = []
+        # Lifecycle-hook bookkeeping. session_start fires once per session;
+        # the source is set on new / clear / compact / fork. session_end
+        # fires once at teardown; turn_count tracks completed agent turns.
+        self._pending_session_start_source: str | None = "new"
+        self._session_end_fired: bool = False
+        self._turn_count: int = 0
+        self._prompt_blocked: bool = False
 
         self.experiment_manager = ExperimentManager(
             client=RemoteEvalClient.from_settings(
@@ -611,7 +618,24 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
     def emit_session_closed_telemetry(self) -> None:
         self.telemetry_client.send_session_closed()
 
+    async def fire_session_end(
+        self, reason: str = "parent_close", error: str | None = None
+    ) -> None:
+        """Fire session_end hooks exactly once. Observational: hook output
+        cannot block teardown, so events are drained and discarded. Safe to
+        call from teardown paths; subsequent calls are no-ops.
+        """
+        if self._session_end_fired or not self._hooks_manager:
+            return
+        self._session_end_fired = True
+        with contextlib.suppress(Exception):
+            async for _ in self._run_session_end_hooks(
+                reason=reason, turn_count=self._turn_count, error=error
+            ):
+                pass
+
     async def aclose(self) -> None:
+        await self.fire_session_end()
         if (task := self._experiments_task) is not None and not task.done():
             task.cancel()
             with contextlib.suppress(BaseException):
@@ -930,7 +954,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         headers["x-affinity"] = self.session_id
         return headers
 
-    async def _conversation_loop(
+    async def _conversation_loop(  # noqa: PLR0912
         self,
         user_msg: str,
         client_message_id: str | None = None,
@@ -960,6 +984,17 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
         if self._hooks_manager:
             self._hooks_manager.reset_retry_count()
+
+        # session_start (once per session) + user_prompt_submit fire before
+        # the model runs; a user_prompt_submit denial aborts the turn.
+        self._prompt_blocked = False
+        async for ev in self._run_prompt_lifecycle_hooks(
+            user_msg, user_message.message_id
+        ):
+            yield ev
+        if self._prompt_blocked:
+            await self._save_messages()
+            return
 
         try:
             should_break_loop = False
@@ -999,6 +1034,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                     return
 
                 if should_break_loop:
+                    self._turn_count += 1
                     retry_msg, hook_events = await self._dispatch_post_turn_hooks()
                     for hook_event in hook_events:
                         yield hook_event
@@ -1792,6 +1828,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             forked.session_id, parent_session_id=self.session_id
         )
         forked.messages.extend(messages)
+        forked._pending_session_start_source = "fork"
         await forked.session_logger.save_interaction(
             forked.messages,
             forked.stats,
@@ -1853,6 +1890,7 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self.middleware_pipeline.reset()
         self.tool_manager.reset_all()
         await self._reset_session(keep_parent=False)
+        self._pending_session_start_source = "clear"
 
     @requires_init
     async def compact(self, extra_instructions: str = "") -> str:
@@ -1865,6 +1903,17 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 self.tool_manager,
                 self.agent_profile,
             )
+
+            # pre_compact fires before summarization. It cannot block
+            # compaction; any injected context is queued to survive the
+            # reset and reappear on the next turn.
+            pre_compact_injections: list[str] = []
+            async for ev in self._run_pre_compact_hooks(
+                reason="auto_compact",
+                token_estimate_before=self.stats.context_tokens,
+            ):
+                if isinstance(ev, HookContextInjection):
+                    pre_compact_injections.append(ev.content)
 
             summary_prefix = UtilityPrompt.COMPACT_SUMMARY_PREFIX.read()
             prior_user_messages = collect_prior_user_messages(
@@ -1906,8 +1955,15 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 role=Role.user, content=compaction_context, injected=True
             )
             self.messages.reset([system_message, compaction_context_message])
+            for content in pre_compact_injections:
+                self.messages.append(
+                    LLMMessage(role=Role.user, content=content, injected=True)
+                )
 
             await self._reset_session()
+            # The post-compaction conversation is a continuation of the same
+            # logical session; re-arm session_start with the "continue" source.
+            self._pending_session_start_source = "continue"
 
             # Context size is unknown without an API call; reset to 0. The next
             # LLM turn recomputes it accurately from real usage (_update_stats).

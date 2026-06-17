@@ -33,14 +33,20 @@ from pydantic import ValidationError
 from vibe.core.hooks.models import (
     AfterToolInvocation,
     BeforeToolInvocation,
+    HookContextInjection,
     HookEvent,
+    HookPromptDenial,
     HookSessionContext,
     HookTextReplacement,
     HookToolDenial,
     HookToolInputRewrite,
     HookUserMessage,
     PostAgentTurnInvocation,
+    PreCompactInvocation,
+    SessionEndInvocation,
+    SessionStartInvocation,
     ToolStatus,
+    UserPromptSubmitInvocation,
 )
 from vibe.core.llm.format import ResolvedToolCall
 from vibe.core.logger import logger
@@ -56,7 +62,7 @@ if TYPE_CHECKING:
     from vibe.core.agent_loop import ToolDecision
     from vibe.core.hooks.manager import HooksManager
     from vibe.core.session.session_logger import SessionLogger
-    from vibe.core.types import AgentStats, LLMMessage, MessageList
+    from vibe.core.types import AgentStats, BaseEvent, LLMMessage, MessageList
 
 
 class _BeforeToolResolution(NamedTuple):
@@ -82,6 +88,8 @@ class AgentLoopHooksMixin:
     session_logger: SessionLogger
     stats: AgentStats
     messages: MessageList
+    _pending_session_start_source: str | None
+    _prompt_blocked: bool
 
     def _handle_tool_response(
         self,
@@ -168,6 +176,118 @@ class AgentLoopHooksMixin:
         )
         async for ev in self._hooks_manager.run(invocation):
             if isinstance(ev, (HookEvent, HookTextReplacement)):
+                yield ev
+
+    # ------------------------------------------------------------------
+    # Lifecycle hook runners (user_prompt_submit / session_start /
+    # session_end / pre_compact)
+    # ------------------------------------------------------------------
+
+    async def _run_user_prompt_submit_hooks(
+        self,
+        prompt: str,
+        *,
+        message_id: str | None = None,
+        project: str | None = None,
+    ) -> AsyncGenerator[HookEvent | HookContextInjection | HookPromptDenial]:
+        if not self._hooks_manager:
+            return
+        invocation = UserPromptSubmitInvocation(
+            **self._hook_session_context().model_dump(),
+            prompt=prompt,
+            message_id=message_id,
+            project=project,
+        )
+        async for ev in self._hooks_manager.run(invocation):
+            if isinstance(ev, (HookEvent, HookContextInjection, HookPromptDenial)):
+                yield ev
+
+    async def _run_session_start_hooks(
+        self, source: str
+    ) -> AsyncGenerator[HookEvent | HookContextInjection]:
+        if not self._hooks_manager:
+            return
+        invocation = SessionStartInvocation(
+            **self._hook_session_context().model_dump(),
+            source=source,
+        )
+        async for ev in self._hooks_manager.run(invocation):
+            if isinstance(ev, (HookEvent, HookContextInjection)):
+                yield ev
+
+    async def _run_pre_compact_hooks(
+        self,
+        *,
+        reason: str = "auto_compact",
+        token_estimate_before: int | None = None,
+        auto_compact_threshold: int | None = None,
+    ) -> AsyncGenerator[HookEvent | HookContextInjection]:
+        if not self._hooks_manager:
+            return
+        invocation = PreCompactInvocation(
+            **self._hook_session_context().model_dump(),
+            reason=reason,
+            token_estimate_before=token_estimate_before,
+            auto_compact_threshold=auto_compact_threshold,
+        )
+        async for ev in self._hooks_manager.run(invocation):
+            if isinstance(ev, (HookEvent, HookContextInjection)):
+                yield ev
+
+    async def _run_session_end_hooks(
+        self,
+        *,
+        reason: str,
+        turn_count: int,
+        error: str | None = None,
+    ) -> AsyncGenerator[HookEvent]:
+        if not self._hooks_manager:
+            return
+        invocation = SessionEndInvocation(
+            **self._hook_session_context().model_dump(),
+            reason=reason,
+            turn_count=turn_count,
+            error=error,
+        )
+        async for ev in self._hooks_manager.run(invocation):
+            if isinstance(ev, HookEvent):
+                yield ev
+
+    async def _run_prompt_lifecycle_hooks(
+        self, user_msg: str, message_id: str | None
+    ) -> AsyncGenerator[BaseEvent]:
+        """Fire session_start (once per session) then user_prompt_submit.
+
+        Injected context is appended to the conversation as user messages.
+        On a user_prompt_submit denial, the reason is surfaced as an
+        ``AssistantEvent`` and ``_prompt_blocked`` is set so the caller can
+        abort the turn before the model runs.
+        """
+        from vibe.core.types import AssistantEvent, LLMMessage, Role
+
+        if self._pending_session_start_source is not None:
+            source = self._pending_session_start_source
+            self._pending_session_start_source = None
+            async for ev in self._run_session_start_hooks(source):
+                if isinstance(ev, HookContextInjection):
+                    self.messages.append(
+                        LLMMessage(role=Role.user, content=ev.content, injected=True)
+                    )
+                else:
+                    yield ev
+
+        async for ev in self._run_user_prompt_submit_hooks(
+            user_msg, message_id=message_id, project=Path.cwd().name
+        ):
+            if isinstance(ev, HookPromptDenial):
+                self._prompt_blocked = True
+                yield AssistantEvent(content=ev.reason)
+                return
+            if isinstance(ev, HookContextInjection):
+                self.messages.append(
+                    LLMMessage(role=Role.user, content=ev.content, injected=True)
+                )
+            else:
                 yield ev
 
     # ------------------------------------------------------------------

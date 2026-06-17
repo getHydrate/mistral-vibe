@@ -16,6 +16,10 @@ from vibe.core.hooks._handler import (
     _parse_structured_response,
 )
 from vibe.core.hooks._post_agent_turn import PostAgentTurnHandler
+from vibe.core.hooks._pre_compact import PreCompactHandler
+from vibe.core.hooks._session_end import SessionEndHandler
+from vibe.core.hooks._session_start import SessionStartHandler
+from vibe.core.hooks._user_prompt_submit import UserPromptSubmitHandler
 from vibe.core.hooks.config import HookConfig
 from vibe.core.hooks.executor import HookExecutor
 from vibe.core.hooks.models import (
@@ -37,6 +41,10 @@ _HANDLERS: dict[HookType, HookHandler] = {
     HookType.POST_AGENT_TURN: PostAgentTurnHandler(),
     HookType.BEFORE_TOOL: BeforeToolHandler(),
     HookType.AFTER_TOOL: AfterToolHandler(),
+    HookType.USER_PROMPT_SUBMIT: UserPromptSubmitHandler(),
+    HookType.SESSION_START: SessionStartHandler(),
+    HookType.SESSION_END: SessionEndHandler(),
+    HookType.PRE_COMPACT: PreCompactHandler(),
 }
 
 

@@ -24,6 +24,16 @@ Mistral Vibe is a command-line coding assistant powered by Mistral's models. It 
 > [!WARNING]
 > Mistral Vibe works on Windows, but we officially support and target UNIX environments.
 
+> [!NOTE]
+> This is the **[Hydrate](https://gethydrate.dev) fork** of Mistral Vibe,
+> tracking upstream (currently **v2.16.1**). It is a strict superset: it
+> adds four session-lifecycle hook events — `user_prompt_submit`,
+> `session_start`, `pre_compact`, `session_end` — on top of upstream's
+> native `post_agent_turn` / `before_tool` / `after_tool` hooks, so Hydrate
+> can deliver pre-prompt recall and lifecycle guardrails. With no
+> lifecycle hooks configured, behavior is identical to upstream. See
+> [Lifecycle hooks (Hydrate fork)](#lifecycle-hooks-hydrate-fork).
+
 ### One-line install (recommended)
 
 **Linux and macOS**
@@ -683,6 +693,49 @@ Fires per tool call **if and only if the tool body actually ran**. `tool_status`
   - `decision: "deny"` + `reason` — replaces `tool_output_text` with `reason`. Pipeline continues; subsequent hooks see the replacement.
   - `hook_specific_output.additional_context` (string) — **appended** (with a `\n` separator) to `tool_output_text`. Composes with a same-hook deny: deny replaces first, then `additional_context` is appended to the replacement.
   - `system_message` — UI-only.
+
+#### Lifecycle hooks (Hydrate fork)
+
+> Added by the [Hydrate](https://gethydrate.dev) fork. These four
+> session-lifecycle events sit alongside the upstream tool/turn hooks and
+> use the **same** strict stdout contract (`#### Common ground`). They do
+> not accept `match` or `strict` (those remain tool-only). When no
+> lifecycle hooks are configured, behavior is identical to upstream.
+
+##### `user_prompt_submit`
+
+Fires once per user turn, **before** the prompt reaches the model.
+
+- **Receives** (in addition to the session context): `prompt`, `message_id`, `project`.
+- **Can return**:
+  - `decision: "deny"` + `reason` — blocks the prompt; the model never runs and `reason` is surfaced to the user.
+  - `hook_specific_output.additional_context` (string) — injected as a user message ahead of the model turn.
+  - `system_message` — UI-only.
+
+##### `session_start`
+
+Fires once when a session begins. Observational — it cannot block.
+
+- **Receives** (in addition to the session context): `source` (`"new"`, `"continue"`, `"clear"`, or `"fork"`).
+- **Can return**:
+  - `hook_specific_output.additional_context` (string) — injected as a user message at the top of the session.
+  - `system_message` — UI-only. (`decision: "deny"` is logged and ignored.)
+
+##### `pre_compact`
+
+Fires before context compaction. Observational — it cannot block compaction.
+
+- **Receives** (in addition to the session context): `reason`, `token_estimate_before`, `auto_compact_threshold`.
+- **Can return**:
+  - `hook_specific_output.additional_context` (string) — injected as a user message that **survives the compaction reset** and reappears on the next turn.
+  - `system_message` — UI-only. (`decision: "deny"` is logged and ignored.)
+
+##### `session_end`
+
+Fires once when a session ends. Purely observational — it cannot block teardown or inject context.
+
+- **Receives** (in addition to the session context): `reason` (`"exit"`, `"signal"`, `"parent_close"`, `"error"`, or `"clear"`), `turn_count`, `error`.
+- **Can return**: nothing actionable. `system_message` is UI-only; `decision: "deny"` is logged and ignored.
 
 ### Session Management
 
