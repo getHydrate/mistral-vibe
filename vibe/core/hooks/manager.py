@@ -16,6 +16,7 @@ from vibe.core.hooks._handler import (
     _parse_structured_response,
 )
 from vibe.core.hooks._notification import NotificationHandler
+from vibe.core.hooks._permission_request import PermissionRequestHandler
 from vibe.core.hooks._post_agent_turn import PostAgentTurnHandler
 from vibe.core.hooks._post_compact import PostCompactHandler
 from vibe.core.hooks._pre_compact import PreCompactHandler
@@ -55,6 +56,7 @@ _HANDLERS: dict[HookType, HookHandler] = {
     HookType.NOTIFICATION: NotificationHandler(),
     HookType.SUBAGENT_START: SubagentStartHandler(),
     HookType.SUBAGENT_STOP: SubagentStopHandler(),
+    HookType.PERMISSION_REQUEST: PermissionRequestHandler(),
 }
 
 
@@ -126,7 +128,9 @@ class HooksManager:
             )
 
         try:
-            structured = _parse_structured_response(result.stdout)
+            structured = _parse_structured_response(
+                result.stdout, handler.response_model
+            )
         except HookOutputError as e:
             return self._handle_failure(
                 handler, hook, invocation, reason=f"invalid response: {e}"

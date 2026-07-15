@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
+import contextlib
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
@@ -34,6 +35,7 @@ from vibe.core.hooks.models import (
     BeforeToolInvocation,
     HookContextInjection,
     HookEvent,
+    HookPermissionDecision,
     HookPromptDenial,
     HookSessionContext,
     HookTextReplacement,
@@ -41,6 +43,7 @@ from vibe.core.hooks.models import (
     HookToolInputRewrite,
     HookUserMessage,
     NotificationInvocation,
+    PermissionRequestInvocation,
     PostAgentTurnInvocation,
     PostCompactInvocation,
     PreCompactInvocation,
@@ -64,10 +67,12 @@ from vibe.core.utils import (
 
 if TYPE_CHECKING:
     from opentelemetry import trace
+    from pydantic import BaseModel
 
     from vibe.core.agent_loop import ToolDecision
     from vibe.core.hooks.manager import HooksManager
     from vibe.core.session.session_logger import SessionLogger
+    from vibe.core.tools.permissions import RequiredPermission
     from vibe.core.types import AgentStats, BaseEvent, LLMMessage, MessageList
 
 
@@ -381,6 +386,61 @@ class AgentLoopHooksMixin:
         async for ev in self._hooks_manager.run(invocation):
             if isinstance(ev, HookEvent):
                 yield ev
+
+    async def _run_permission_request_hooks(
+        self,
+        *,
+        tool_name: str,
+        tool_call_id: str,
+        tool_input: dict[str, Any],
+        required_permissions: list[dict[str, Any]],
+    ) -> AsyncGenerator[HookEvent | HookPermissionDecision]:
+        if not self._hooks_manager:
+            return
+        invocation = PermissionRequestInvocation(
+            **self._hook_session_context().model_dump(),
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
+            tool_input=tool_input,
+            required_permissions=required_permissions,
+        )
+        async for ev in self._hooks_manager.run(invocation):
+            if isinstance(ev, (HookEvent, HookPermissionDecision)):
+                yield ev
+
+    async def _resolve_permission_request_hooks(
+        self,
+        tool_name: str,
+        args: BaseModel,
+        tool_call_id: str,
+        required_permissions: list[RequiredPermission],
+    ) -> HookPermissionDecision | None:
+        """Run permission_request hooks and return the winning decision.
+
+        The handler stops the chain on the first explicit allow/deny, so
+        at most one ``HookPermissionDecision`` arrives. UI events are
+        drained (non-generator context, like the notification hook in
+        ``_ask_approval``). Fails open: an infrastructure error is
+        suppressed and treated as "no decision" — the normal approval
+        flow proceeds. (Hook-level failures — timeout / non-zero exit /
+        bad stdout — are already handled inside the manager, where
+        ``strict`` escalates them to a deny.)
+        """
+        if not self._hooks_manager:
+            return None
+        decision: HookPermissionDecision | None = None
+        with contextlib.suppress(Exception):
+            async for ev in self._run_permission_request_hooks(
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+                tool_input=args.model_dump(mode="json"),
+                required_permissions=[
+                    rp.model_dump(mode="json") for rp in required_permissions
+                ],
+            ):
+                if isinstance(ev, HookPermissionDecision) and decision is None:
+                    decision = ev
+        return decision
 
     async def _run_prompt_lifecycle_hooks(
         self, user_msg: str, message_id: str | None

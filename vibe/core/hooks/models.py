@@ -30,10 +30,13 @@ class HookType(StrEnum):
     NOTIFICATION = auto()
     SUBAGENT_START = auto()
     SUBAGENT_STOP = auto()
+    PERMISSION_REQUEST = auto()
 
 
 # Tool hooks accept ``match`` / ``strict``; the lifecycle hooks below do not.
-_TOOL_HOOK_TYPES = frozenset({HookType.BEFORE_TOOL, HookType.AFTER_TOOL})
+_TOOL_HOOK_TYPES = frozenset(
+    {HookType.BEFORE_TOOL, HookType.AFTER_TOOL, HookType.PERMISSION_REQUEST}
+)
 
 
 ToolStatus = Literal["success", "failure", "cancelled"]
@@ -72,11 +75,13 @@ class HookConfig(BaseModel):
     def _apply_defaults_and_constraints(self) -> Self:
         if self.match is not None and self.type not in _TOOL_HOOK_TYPES:
             raise ValueError(
-                "match is only valid for tool hooks (before_tool / after_tool)"
+                "match is only valid for tool hooks"
+                " (before_tool / after_tool / permission_request)"
             )
         if self.strict and self.type not in _TOOL_HOOK_TYPES:
             raise ValueError(
-                "strict is only valid for tool hooks (before_tool / after_tool)"
+                "strict is only valid for tool hooks"
+                " (before_tool / after_tool / permission_request)"
             )
         if self.timeout is None:
             self.timeout = _DEFAULT_HOOK_TIMEOUT
@@ -215,6 +220,18 @@ class SubagentStopInvocation(HookSessionContext):
     parent_transcript_path: str = ""
 
 
+class PermissionRequestInvocation(HookSessionContext):
+    hook_event_name: Literal[HookType.PERMISSION_REQUEST] = (
+        HookType.PERMISSION_REQUEST
+    )
+    tool_name: str
+    tool_call_id: str
+    tool_input: dict[str, Any]
+    # One dict per uncovered RequiredPermission (scope / invocation_pattern
+    # / session_pattern / label) — see vibe/core/tools/permissions.py.
+    required_permissions: list[dict[str, Any]]
+
+
 HookInvocation = (
     PostAgentTurnInvocation
     | BeforeToolInvocation
@@ -228,6 +245,7 @@ HookInvocation = (
     | NotificationInvocation
     | SubagentStartInvocation
     | SubagentStopInvocation
+    | PermissionRequestInvocation
 )
 
 
@@ -287,8 +305,10 @@ def build_invocation(
             | HookType.NOTIFICATION
             | HookType.SUBAGENT_START
             | HookType.SUBAGENT_STOP
+            | HookType.PERMISSION_REQUEST
         ):
-            # Lifecycle invocations carry event-specific required fields
+            # Lifecycle invocations (and permission_request, which carries
+            # required_permissions) have event-specific required fields
             # (prompt / source / reason / turn_count / …) and are constructed
             # directly by the agent loop rather than through this factory.
             raise ValueError(
@@ -331,6 +351,17 @@ class HookStructuredResponse(BaseModel):
     reason: str | None = None
     system_message: str | None = None
     hook_specific_output: HookSpecificOutput = Field(default_factory=HookSpecificOutput)
+
+
+class PermissionRequestHookResponse(HookStructuredResponse):
+    """permission_request stdout schema. Unlike other hook types the
+    default ``decision`` is ``"ask"``: only an explicit ``"allow"`` /
+    ``"deny"`` is decisive. ``"ask"`` — or omitting the field — passes
+    through to the next hook and ultimately the normal approval prompt,
+    so an observational hook echoing ``{}`` can never auto-approve.
+    """
+
+    decision: Literal["allow", "deny", "ask"] = "ask"  # pyright: ignore[reportIncompatibleVariableOverride]
 
 
 # --- Decision values (consumed by the agent loop) ---
@@ -389,6 +420,20 @@ class HookPromptDenial(BaseModel):
 
     hook_name: str
     reason: str
+
+
+class HookPermissionDecision(BaseModel):
+    """permission_request: an explicit hook decision replaces the approval
+    prompt. ``allow`` mirrors a user approval; ``deny`` mirrors a user
+    decline (``reason`` becomes the model-visible skip feedback). The
+    first decisive hook wins — the handler stops the chain (same
+    first-answer-wins convention as before_tool's first deny; here either
+    an allow or a deny ends the run).
+    """
+
+    hook_name: str
+    decision: Literal["allow", "deny"]
+    reason: str | None = None
 
 
 # --- Transcript / UI events (BaseEvent) ---

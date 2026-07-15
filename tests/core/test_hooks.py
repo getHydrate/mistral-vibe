@@ -37,6 +37,7 @@ from vibe.core.hooks.models import (
     HookEndEvent,
     HookEvent,
     HookMessageSeverity,
+    HookPermissionDecision,
     HookPromptDenial,
     HookRunEndEvent,
     HookRunStartEvent,
@@ -49,6 +50,8 @@ from vibe.core.hooks.models import (
     HookType,
     HookUserMessage,
     NotificationInvocation,
+    PermissionRequestHookResponse,
+    PermissionRequestInvocation,
     PostAgentTurnInvocation,
     PostCompactInvocation,
     PreCompactInvocation,
@@ -3200,3 +3203,482 @@ class TestTaskToolSubagentHooks:
             "session_end",
             "subagent_stop",
         ]
+
+
+# --- Wave C: permission_request ---
+
+
+def _ask_cmd() -> str:
+    return _emit_cmd({"decision": "ask"})
+
+
+def _allow_cmd() -> str:
+    return _emit_cmd({"decision": "allow"})
+
+
+def _permission_invocation(
+    tool_name: str = "bash",
+    required: list[dict[str, Any]] | None = None,
+) -> PermissionRequestInvocation:
+    return PermissionRequestInvocation(
+        session_id="sess",
+        transcript_path="",
+        cwd=str(Path.cwd()),
+        tool_name=tool_name,
+        tool_call_id="call_1",
+        tool_input={"command": "true"},
+        required_permissions=(
+            required
+            if required is not None
+            else [
+                {
+                    "scope": "command_pattern",
+                    "invocation_pattern": "true",
+                    "session_pattern": "true *",
+                    "label": "true",
+                }
+            ]
+        ),
+    )
+
+
+class TestPermissionRequestHookConfig:
+    def test_loads_from_toml_with_match_and_strict(
+        self, config_dir: Path, config_hooks_enabled: VibeConfig
+    ) -> None:
+        _write_hooks_toml(
+            config_dir / "hooks.toml",
+            [
+                {
+                    "name": "pr",
+                    "type": "permission_request",
+                    "command": "true",
+                    "match": "bash",
+                    "strict": True,
+                }
+            ],
+        )
+        result = load_hooks_from_fs(config_hooks_enabled)
+        assert result.issues == []
+        assert len(result.hooks) == 1
+        hook = result.hooks[0]
+        assert hook.type == HookType.PERMISSION_REQUEST
+        assert hook.match == "bash"
+        assert hook.strict is True
+
+    def test_match_and_strict_accepted_as_tool_hook(self) -> None:
+        hook = HookConfig(
+            name="pr",
+            type=HookType.PERMISSION_REQUEST,
+            command="true",
+            match="bash",
+            strict=True,
+        )
+        assert hook.type == HookType.PERMISSION_REQUEST
+
+
+class TestPermissionRequestResponseParsing:
+    def test_base_schema_rejects_ask(self) -> None:
+        with pytest.raises(HookOutputError):
+            _parse_structured_response('{"decision": "ask"}')
+
+    def test_permission_schema_accepts_ask(self) -> None:
+        resp = _parse_structured_response(
+            '{"decision": "ask"}', PermissionRequestHookResponse
+        )
+        assert resp is not None
+        assert resp.decision == "ask"
+
+    def test_permission_schema_defaults_to_ask(self) -> None:
+        resp = _parse_structured_response("{}", PermissionRequestHookResponse)
+        assert resp is not None
+        assert resp.decision == "ask"
+
+
+class TestPermissionRequestHook:
+    @pytest.mark.asyncio
+    async def test_no_hooks_no_events(self) -> None:
+        handler = HooksManager([])
+        events = [ev async for ev in handler.run(_permission_invocation())]
+        assert events == []
+
+    @pytest.mark.asyncio
+    async def test_matcher_filters_non_matching(self) -> None:
+        handler = HooksManager([
+            _make_tool_hook(
+                "policy",
+                _allow_cmd(),
+                type=HookType.PERMISSION_REQUEST,
+                match="bash",
+            )
+        ])
+        events = [
+            ev async for ev in handler.run(_permission_invocation("read_file"))
+        ]
+        assert events == []
+
+    @pytest.mark.asyncio
+    async def test_explicit_allow_emits_decision_and_stops_chain(self) -> None:
+        handler = HooksManager([
+            _make_tool_hook(
+                "first", _allow_cmd(), type=HookType.PERMISSION_REQUEST
+            ),
+            _make_tool_hook(
+                "second", _deny_cmd("never runs"), type=HookType.PERMISSION_REQUEST
+            ),
+        ])
+        events = [ev async for ev in handler.run(_permission_invocation())]
+        decisions = [e for e in events if isinstance(e, HookPermissionDecision)]
+        assert len(decisions) == 1
+        assert decisions[0].hook_name == "first"
+        assert decisions[0].decision == "allow"
+        starts = [e for e in events if isinstance(e, HookStartEvent)]
+        assert [e.hook_name for e in starts] == ["first"]
+
+    @pytest.mark.asyncio
+    async def test_explicit_deny_with_reason(self) -> None:
+        handler = HooksManager([
+            _make_tool_hook(
+                "guard", _deny_cmd("not on my watch"), type=HookType.PERMISSION_REQUEST
+            )
+        ])
+        events = [ev async for ev in handler.run(_permission_invocation())]
+        decisions = [e for e in events if isinstance(e, HookPermissionDecision)]
+        assert len(decisions) == 1
+        assert decisions[0].decision == "deny"
+        assert decisions[0].reason == "not on my watch"
+
+    @pytest.mark.asyncio
+    async def test_first_decision_wins_deny_then_allow(self) -> None:
+        handler = HooksManager([
+            _make_tool_hook(
+                "first", _deny_cmd("first says no"), type=HookType.PERMISSION_REQUEST
+            ),
+            _make_tool_hook(
+                "second", _allow_cmd(), type=HookType.PERMISSION_REQUEST
+            ),
+        ])
+        events = [ev async for ev in handler.run(_permission_invocation())]
+        decisions = [e for e in events if isinstance(e, HookPermissionDecision)]
+        assert len(decisions) == 1
+        assert decisions[0].hook_name == "first"
+        assert decisions[0].decision == "deny"
+        starts = [e for e in events if isinstance(e, HookStartEvent)]
+        assert [e.hook_name for e in starts] == ["first"]
+
+    @pytest.mark.asyncio
+    async def test_ask_is_passthrough(self) -> None:
+        handler = HooksManager([
+            _make_tool_hook("obs", _ask_cmd(), type=HookType.PERMISSION_REQUEST)
+        ])
+        events = [ev async for ev in handler.run(_permission_invocation())]
+        assert not any(isinstance(e, HookPermissionDecision) for e in events)
+        ends = [e for e in events if isinstance(e, HookEndEvent)]
+        assert ends and ends[0].status == HookMessageSeverity.OK
+
+    @pytest.mark.asyncio
+    async def test_empty_stdout_is_passthrough(self) -> None:
+        handler = HooksManager([
+            _make_tool_hook("obs", "true", type=HookType.PERMISSION_REQUEST)
+        ])
+        events = [ev async for ev in handler.run(_permission_invocation())]
+        assert not any(isinstance(e, HookPermissionDecision) for e in events)
+
+    @pytest.mark.asyncio
+    async def test_empty_json_object_is_passthrough(self) -> None:
+        # Unlike other hook types, the decision default for
+        # permission_request is "ask" — `{}` must NOT auto-allow.
+        handler = HooksManager([
+            _make_tool_hook("obs", _emit_cmd({}), type=HookType.PERMISSION_REQUEST)
+        ])
+        events = [ev async for ev in handler.run(_permission_invocation())]
+        assert not any(isinstance(e, HookPermissionDecision) for e in events)
+        ends = [e for e in events if isinstance(e, HookEndEvent)]
+        assert ends and ends[0].status == HookMessageSeverity.OK
+
+    @pytest.mark.asyncio
+    async def test_plain_text_non_strict_passes_through(self) -> None:
+        handler = HooksManager([
+            _make_tool_hook(
+                "broken", "echo not-json", type=HookType.PERMISSION_REQUEST
+            )
+        ])
+        events = [ev async for ev in handler.run(_permission_invocation())]
+        assert not any(isinstance(e, HookPermissionDecision) for e in events)
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_plain_text_strict_denies(self) -> None:
+        handler = HooksManager([
+            _make_tool_hook(
+                "broken",
+                "echo not-json",
+                type=HookType.PERMISSION_REQUEST,
+                strict=True,
+            )
+        ])
+        events = [ev async for ev in handler.run(_permission_invocation())]
+        decisions = [e for e in events if isinstance(e, HookPermissionDecision)]
+        assert len(decisions) == 1
+        assert decisions[0].decision == "deny"
+        errors = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.ERROR
+        ]
+        assert any("strict" in (e.content or "") for e in errors)
+
+    @pytest.mark.asyncio
+    async def test_non_strict_timeout_passes_through(self) -> None:
+        handler = HooksManager([
+            _make_tool_hook(
+                "slow", "sleep 10", type=HookType.PERMISSION_REQUEST, timeout=0.1
+            )
+        ])
+        events = [ev async for ev in handler.run(_permission_invocation())]
+        assert not any(isinstance(e, HookPermissionDecision) for e in events)
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_strict_timeout_denies(self) -> None:
+        handler = HooksManager([
+            _make_tool_hook(
+                "slow",
+                "sleep 10",
+                type=HookType.PERMISSION_REQUEST,
+                timeout=0.1,
+                strict=True,
+            )
+        ])
+        events = [ev async for ev in handler.run(_permission_invocation())]
+        decisions = [e for e in events if isinstance(e, HookPermissionDecision)]
+        assert len(decisions) == 1
+        assert decisions[0].decision == "deny"
+        assert decisions[0].hook_name == "slow"
+
+    @pytest.mark.asyncio
+    async def test_payload_contains_tool_and_permissions(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "payload.json"
+        handler = HooksManager([
+            _make_tool_hook(
+                "capture", _capture_cmd(out), type=HookType.PERMISSION_REQUEST
+            )
+        ])
+        _ = [ev async for ev in handler.run(_permission_invocation())]
+        payload = json.loads(out.read_text())
+        assert payload["hook_event_name"] == "permission_request"
+        assert payload["tool_name"] == "bash"
+        assert payload["tool_call_id"] == "call_1"
+        assert payload["tool_input"] == {"command": "true"}
+        assert payload["required_permissions"] == [
+            {
+                "scope": "command_pattern",
+                "invocation_pattern": "true",
+                "session_pattern": "true *",
+                "label": "true",
+            }
+        ]
+
+
+class TestPermissionRequestAgentLoopIntegration:
+    def _tool_call_backend(self) -> FakeBackend:
+        tool_call = ToolCall(
+            id="call_pr",
+            index=0,
+            function=FunctionCall(name="bash", arguments='{"command":"true"}'),
+        )
+        return FakeBackend([
+            [mock_llm_chunk(content="Running.", tool_calls=[tool_call])],
+            [mock_llm_chunk(content="Done.")],
+        ])
+
+    def _approval_loop(self, hooks: list[HookConfig]) -> Any:
+        return build_test_agent_loop(
+            config=build_test_vibe_config(enabled_tools=["bash"]),
+            backend=self._tool_call_backend(),
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+
+    def _recording_callback(
+        self, calls: list[str], response: ApprovalResponse = ApprovalResponse.YES
+    ) -> Any:
+        async def approval_callback(
+            tool_name: str, args: Any, tool_call_id: str, required_permissions: Any
+        ) -> tuple[ApprovalResponse, str | None]:
+            calls.append(tool_name)
+            return response, None
+
+        return approval_callback
+
+    @pytest.mark.asyncio
+    async def test_hook_allow_executes_without_prompt_or_notification(
+        self, tmp_path: Path
+    ) -> None:
+        notify_out = tmp_path / "notification.json"
+        hooks = [
+            _make_tool_hook(
+                "policy", _allow_cmd(), type=HookType.PERMISSION_REQUEST
+            ),
+            _make_hook(
+                name="notify",
+                command=_capture_cmd(notify_out),
+                type=HookType.NOTIFICATION,
+            ),
+        ]
+        agent_loop = self._approval_loop(hooks)
+        calls: list[str] = []
+        agent_loop.set_approval_callback(self._recording_callback(calls))
+
+        events = [ev async for ev in agent_loop.act("run true")]
+
+        tool_results = [e for e in events if isinstance(e, ToolResultEvent)]
+        assert len(tool_results) == 1
+        assert tool_results[0].skipped is False
+        assert calls == []  # prompt never shown
+        assert not notify_out.exists()  # notification hook never fired
+
+    @pytest.mark.asyncio
+    async def test_hook_deny_skips_tool_with_model_visible_reason(
+        self, tmp_path: Path
+    ) -> None:
+        notify_out = tmp_path / "notification.json"
+        hooks = [
+            _make_tool_hook(
+                "policy",
+                _deny_cmd("policy: no bash"),
+                type=HookType.PERMISSION_REQUEST,
+            ),
+            _make_hook(
+                name="notify",
+                command=_capture_cmd(notify_out),
+                type=HookType.NOTIFICATION,
+            ),
+        ]
+        agent_loop = self._approval_loop(hooks)
+        calls: list[str] = []
+        agent_loop.set_approval_callback(self._recording_callback(calls))
+
+        events = [ev async for ev in agent_loop.act("run true")]
+
+        tool_results = [e for e in events if isinstance(e, ToolResultEvent)]
+        assert len(tool_results) == 1
+        assert tool_results[0].skipped is True
+        assert "policy: no bash" in (tool_results[0].skip_reason or "")
+        assert calls == []  # prompt never shown
+        assert not notify_out.exists()
+        # The reason reaches the model as the tool response.
+        assert any(
+            "policy: no bash" in (m.content or "") for m in agent_loop.messages
+        )
+
+    @pytest.mark.asyncio
+    async def test_hook_ask_falls_through_to_prompt_and_notification(
+        self, tmp_path: Path
+    ) -> None:
+        notify_out = tmp_path / "notification.json"
+        hooks = [
+            _make_tool_hook("obs", _ask_cmd(), type=HookType.PERMISSION_REQUEST),
+            _make_hook(
+                name="notify",
+                command=_capture_cmd(notify_out),
+                type=HookType.NOTIFICATION,
+            ),
+        ]
+        agent_loop = self._approval_loop(hooks)
+        calls: list[str] = []
+        agent_loop.set_approval_callback(self._recording_callback(calls))
+
+        events = [ev async for ev in agent_loop.act("run true")]
+
+        tool_results = [e for e in events if isinstance(e, ToolResultEvent)]
+        assert len(tool_results) == 1
+        assert tool_results[0].skipped is False
+        assert calls == ["bash"]  # normal prompt flow
+        assert notify_out.exists()  # notification hook still fired
+
+    @pytest.mark.asyncio
+    async def test_headless_hook_allow_executes_tool(self) -> None:
+        # Deliberate divergence from Claude Code: the hook fires even with
+        # no approval_callback, so policy hooks can auto-allow headless.
+        hooks = [
+            _make_tool_hook("policy", _allow_cmd(), type=HookType.PERMISSION_REQUEST)
+        ]
+        agent_loop = self._approval_loop(hooks)
+
+        events = [ev async for ev in agent_loop.act("run true")]
+
+        tool_results = [e for e in events if isinstance(e, ToolResultEvent)]
+        assert len(tool_results) == 1
+        assert tool_results[0].skipped is False
+        assert agent_loop.stats.tool_calls_succeeded == 1
+
+    @pytest.mark.asyncio
+    async def test_headless_passthrough_keeps_skip(self, tmp_path: Path) -> None:
+        # Passthrough (hook fires but declines to decide) preserves the
+        # headless SKIP; the payload capture proves the hook did fire.
+        out = tmp_path / "payload.json"
+        hooks = [
+            _make_tool_hook(
+                "capture", _capture_cmd(out), type=HookType.PERMISSION_REQUEST
+            )
+        ]
+        agent_loop = self._approval_loop(hooks)
+
+        events = [ev async for ev in agent_loop.act("run true")]
+
+        tool_results = [e for e in events if isinstance(e, ToolResultEvent)]
+        assert len(tool_results) == 1
+        assert tool_results[0].skipped is True
+        assert "Tool execution not permitted." in (tool_results[0].skip_reason or "")
+        payload = json.loads(out.read_text())
+        assert payload["hook_event_name"] == "permission_request"
+        assert payload["tool_name"] == "bash"
+        # Serialized from the validated args model (like before_tool's
+        # tool_input), so defaulted fields appear too.
+        assert payload["tool_input"]["command"] == "true"
+        assert isinstance(payload["required_permissions"], list)
+
+    @pytest.mark.asyncio
+    async def test_headless_without_hooks_keeps_skip(self) -> None:
+        agent_loop = self._approval_loop([])
+
+        events = [ev async for ev in agent_loop.act("run true")]
+
+        tool_results = [e for e in events if isinstance(e, ToolResultEvent)]
+        assert len(tool_results) == 1
+        assert tool_results[0].skipped is True
+        assert "Tool execution not permitted." in (tool_results[0].skip_reason or "")
+
+    @pytest.mark.asyncio
+    async def test_hook_deny_matches_only_named_tool(self, tmp_path: Path) -> None:
+        # A deny hook matched to another tool must not affect this call.
+        hooks = [
+            _make_tool_hook(
+                "other-guard",
+                _deny_cmd("wrong tool"),
+                type=HookType.PERMISSION_REQUEST,
+                match="write_file",
+            )
+        ]
+        agent_loop = self._approval_loop(hooks)
+        calls: list[str] = []
+        agent_loop.set_approval_callback(self._recording_callback(calls))
+
+        events = [ev async for ev in agent_loop.act("run true")]
+
+        tool_results = [e for e in events if isinstance(e, ToolResultEvent)]
+        assert len(tool_results) == 1
+        assert tool_results[0].skipped is False
+        assert calls == ["bash"]

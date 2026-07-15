@@ -3,7 +3,7 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 import json
 import logging
-from typing import NamedTuple, TypedDict
+from typing import ClassVar, NamedTuple, TypedDict
 
 from pydantic import ValidationError
 
@@ -13,6 +13,7 @@ from vibe.core.hooks.models import (
     HookEvent,
     HookExecutionResult,
     HookInvocation,
+    HookPermissionDecision,
     HookPromptDenial,
     HookStructuredResponse,
     HookTextReplacement,
@@ -35,6 +36,7 @@ _HookYield = (
     | HookTextReplacement
     | HookContextInjection
     | HookPromptDenial
+    | HookPermissionDecision
 )
 
 
@@ -78,10 +80,15 @@ class HookOutputError(ValueError):
     """
 
 
-def _parse_structured_response(stdout: str) -> HookStructuredResponse | None:
+def _parse_structured_response(
+    stdout: str,
+    response_model: type[HookStructuredResponse] = HookStructuredResponse,
+) -> HookStructuredResponse | None:
     """Return the parsed response, or ``None`` for an empty stdout.
 
-    Raises :class:`HookOutputError` for any other non-conforming output.
+    *response_model* is the handler's stdout schema
+    (:attr:`HookHandler.response_model`). Raises :class:`HookOutputError`
+    for any other non-conforming output.
     """
     if not stdout:
         return None
@@ -96,7 +103,7 @@ def _parse_structured_response(stdout: str) -> HookStructuredResponse | None:
             f"stdout was a JSON {type(parsed).__name__}, expected an object"
         )
     try:
-        return HookStructuredResponse.model_validate(parsed)
+        return response_model.model_validate(parsed)
     except ValidationError as e:
         raise HookOutputError(
             f"stdout JSON did not match the hook response schema: {e}"
@@ -121,6 +128,10 @@ class HookHandler(ABC):
     """Per-type hook semantics. Stateless singleton; per-run state is
     passed in through method parameters.
     """
+
+    # Stdout schema for this hook type. permission_request overrides this
+    # with a model whose ``decision`` defaults to "ask" and accepts it.
+    response_model: ClassVar[type[HookStructuredResponse]] = HookStructuredResponse
 
     @abstractmethod
     def matches(self, hook: HookConfig, invocation: HookInvocation) -> bool: ...
