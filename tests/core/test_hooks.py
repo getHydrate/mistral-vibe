@@ -45,14 +45,27 @@ from vibe.core.hooks.models import (
     HookToolInputRewrite,
     HookType,
     HookUserMessage,
+    NotificationInvocation,
     PostAgentTurnInvocation,
+    PostCompactInvocation,
     PreCompactInvocation,
     SessionEndInvocation,
     SessionStartInvocation,
+    StopFailureInvocation,
     UserPromptSubmitInvocation,
     build_invocation,
 )
-from vibe.core.types import AssistantEvent, FunctionCall, ToolCall, ToolResultEvent
+from vibe.core.llm.exceptions import BackendError, PayloadSummary
+from vibe.core.types import (
+    ApprovalResponse,
+    AssistantEvent,
+    ContextTooLongError,
+    FunctionCall,
+    RateLimitError,
+    ResponseTooLongError,
+    ToolCall,
+    ToolResultEvent,
+)
 
 _AnyHookYield = (
     HookEvent
@@ -170,6 +183,18 @@ def _deny_cmd(reason: str = "") -> str:
 def _context_cmd(context: str) -> str:
     """Allowing hook that injects ``context`` via the structured response."""
     return _emit_cmd({"hook_specific_output": {"additional_context": context}})
+
+
+def _capture_cmd(out: Path) -> str:
+    """Hook command that writes its stdin (the JSON invocation) to *out*."""
+    body = f"import sys; open({str(out)!r}, 'w').write(sys.stdin.read())"
+    return f"{sys.executable} -c {shlex.quote(body)}"
+
+
+def _append_cmd(log: Path, tag: str) -> str:
+    """Hook command that appends *tag* as a line to *log* (ordering probe)."""
+    body = f"open({str(log)!r}, 'a').write({tag!r} + chr(10))"
+    return f"{sys.executable} -c {shlex.quote(body)}"
 
 
 class TestConfigLoading:
@@ -2234,3 +2259,503 @@ class TestLifecycleAgentLoopIntegration:
             if getattr(m, "injected", False) and m.content == "SURVIVES"
         ]
         assert len(survived) == 1
+
+
+def _backend_error(status: int | None, body: str = "") -> BackendError:
+    return BackendError(
+        provider="test",
+        endpoint="http://api.test/v1",
+        status=status,
+        reason=None,
+        headers={},
+        body_text=body,
+        parsed_error=None,
+        model="m",
+        payload_summary=PayloadSummary(
+            model="m",
+            message_count=1,
+            approx_chars=1,
+            temperature=0.0,
+            has_tools=False,
+            tool_choice=None,
+        ),
+    )
+
+
+class TestPostCompactHook:
+    def _invocation(self) -> PostCompactInvocation:
+        return PostCompactInvocation(
+            session_id="sess",
+            transcript_path="",
+            cwd=str(Path.cwd()),
+            summary_text="the summary",
+            token_estimate_before=1234,
+        )
+
+    @pytest.mark.asyncio
+    async def test_additional_context_is_injected(self) -> None:
+        handler = HooksManager([
+            _make_hook(command=_context_cmd("post note"), type=HookType.POST_COMPACT)
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        injections = [e for e in events if isinstance(e, HookContextInjection)]
+        assert len(injections) == 1
+        assert injections[0].content == "post note"
+
+    @pytest.mark.asyncio
+    async def test_deny_is_ignored(self) -> None:
+        handler = HooksManager([
+            _make_hook(command=_deny_cmd("no"), type=HookType.POST_COMPACT)
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        assert not any(isinstance(e, HookContextInjection) for e in events)
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+
+
+class TestStopFailureHook:
+    def _invocation(self) -> StopFailureInvocation:
+        return StopFailureInvocation(
+            session_id="sess",
+            transcript_path="",
+            cwd=str(Path.cwd()),
+            error_type="rate_limit",
+            error_message="rate limited",
+            turn_count=2,
+        )
+
+    @pytest.mark.asyncio
+    async def test_exit_0_emits_ok(self) -> None:
+        handler = HooksManager([
+            _make_hook(command="true", type=HookType.STOP_FAILURE)
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        ends = [e for e in events if isinstance(e, HookEndEvent)]
+        assert ends and ends[0].status == HookMessageSeverity.OK
+
+    @pytest.mark.asyncio
+    async def test_deny_is_ignored(self) -> None:
+        handler = HooksManager([
+            _make_hook(command=_deny_cmd("retry"), type=HookType.STOP_FAILURE)
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        assert not any(isinstance(e, HookContextInjection) for e in events)
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_additional_context_is_ignored(self) -> None:
+        handler = HooksManager([
+            _make_hook(command=_context_cmd("inject me"), type=HookType.STOP_FAILURE)
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        assert not any(isinstance(e, HookContextInjection) for e in events)
+
+
+class TestNotificationHook:
+    def _invocation(self) -> NotificationInvocation:
+        return NotificationInvocation(
+            session_id="sess",
+            transcript_path="",
+            cwd=str(Path.cwd()),
+            notification_type="permission_prompt",
+            message="Approval requested for tool 'bash'",
+            tool_name="bash",
+            tool_call_id="call_1",
+        )
+
+    @pytest.mark.asyncio
+    async def test_exit_0_emits_ok(self) -> None:
+        handler = HooksManager([
+            _make_hook(command="true", type=HookType.NOTIFICATION)
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        ends = [e for e in events if isinstance(e, HookEndEvent)]
+        assert ends and ends[0].status == HookMessageSeverity.OK
+
+    @pytest.mark.asyncio
+    async def test_deny_is_ignored(self) -> None:
+        handler = HooksManager([
+            _make_hook(command=_deny_cmd("no prompt"), type=HookType.NOTIFICATION)
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        assert not any(isinstance(e, HookContextInjection) for e in events)
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+
+    @pytest.mark.asyncio
+    async def test_additional_context_is_ignored(self) -> None:
+        handler = HooksManager([
+            _make_hook(command=_context_cmd("inject me"), type=HookType.NOTIFICATION)
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        assert not any(isinstance(e, HookContextInjection) for e in events)
+
+
+class TestWaveALifecycleHookConfig:
+    def test_new_lifecycle_types_load_from_toml(
+        self, config_dir: Path, config_hooks_enabled: VibeConfig
+    ) -> None:
+        _write_hooks_toml(
+            config_dir / "hooks.toml",
+            [
+                {"name": "pc", "type": "post_compact", "command": "true"},
+                {"name": "sf", "type": "stop_failure", "command": "true"},
+                {"name": "nt", "type": "notification", "command": "true"},
+            ],
+        )
+        result = load_hooks_from_fs(config_hooks_enabled)
+        assert [h.type for h in result.hooks] == [
+            HookType.POST_COMPACT,
+            HookType.STOP_FAILURE,
+            HookType.NOTIFICATION,
+        ]
+        assert result.issues == []
+
+    def test_match_rejected_on_notification(self) -> None:
+        with pytest.raises(ValueError, match="match is only valid for tool hooks"):
+            HookConfig(
+                name="x", type=HookType.NOTIFICATION, command="echo ok", match="*"
+            )
+
+    def test_strict_rejected_on_stop_failure(self) -> None:
+        with pytest.raises(ValueError, match="strict is only valid for tool hooks"):
+            HookConfig(
+                name="x", type=HookType.STOP_FAILURE, command="echo ok", strict=True
+            )
+
+
+class TestTurnFailureClassification:
+    def _classify(self, e: BaseException) -> str:
+        from vibe.core.agent_loop._loop import _classify_turn_failure
+
+        return _classify_turn_failure(e)
+
+    @pytest.mark.parametrize(
+        ("status", "body", "expected"),
+        [
+            (429, "", "rate_limit"),
+            (401, "", "authentication_failed"),
+            (403, "", "authentication_failed"),
+            (402, "", "billing_error"),
+            (404, "", "model_not_found"),
+            (400, "", "invalid_request"),
+            (422, "", "invalid_request"),
+            (400, "maximum context length", "context_too_long"),
+            (422, "max_tokens_exceeded", "max_output_tokens"),
+            (500, "", "server_error"),
+            (502, "", "server_error"),
+            (503, "", "overloaded"),
+            (529, "", "overloaded"),
+            (None, "", "unknown"),
+        ],
+    )
+    def test_backend_error_statuses(
+        self, status: int | None, body: str, expected: str
+    ) -> None:
+        assert self._classify(_backend_error(status, body)) == expected
+
+    def test_wrapped_backend_error_is_classified_via_cause(self) -> None:
+        cause = _backend_error(429)
+        wrapper = RuntimeError("API error from test (model: m): boom")
+        wrapper.__cause__ = cause
+        assert self._classify(wrapper) == "rate_limit"
+
+    def test_loop_error_types(self) -> None:
+        assert self._classify(RateLimitError("p", "m")) == "rate_limit"
+        assert self._classify(ContextTooLongError("p", "m")) == "context_too_long"
+        assert self._classify(ResponseTooLongError("p", "m")) == "max_output_tokens"
+
+    def test_unrelated_exception_is_unknown(self) -> None:
+        assert self._classify(ValueError("boom")) == "unknown"
+
+
+class TestWaveALifecycleAgentLoopIntegration:
+    def _compacting_loop(self, hooks: list[HookConfig]) -> Any:
+        # auto_compact_threshold=1 + context_tokens=2 forces compaction on
+        # the first turn; the backend's first stream answers the compaction
+        # request (a well-formed summary), the second answers the user turn.
+        backend = FakeBackend([
+            [mock_llm_chunk(content="<summary>THE SUMMARY</summary>")],
+            [mock_llm_chunk(content="<final>")],
+        ])
+        cfg = build_test_vibe_config(models=make_test_models(auto_compact_threshold=1))
+        agent_loop = build_test_agent_loop(
+            config=cfg,
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        agent_loop.stats.context_tokens = 2
+        return agent_loop
+
+    @pytest.mark.asyncio
+    async def test_post_compact_fires_after_compaction_with_summary(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "post_compact.json"
+        hooks = [
+            _make_hook(
+                name="postcompact",
+                command=_capture_cmd(out),
+                type=HookType.POST_COMPACT,
+            )
+        ]
+        agent_loop = self._compacting_loop(hooks)
+
+        _ = [ev async for ev in agent_loop.act("Hello")]
+
+        payload = json.loads(out.read_text())
+        assert payload["hook_event_name"] == "post_compact"
+        assert payload["reason"] == "auto_compact"
+        assert payload["summary_text"] == "THE SUMMARY"
+        assert payload["token_estimate_before"] == 2
+
+    @pytest.mark.asyncio
+    async def test_post_compact_injection_lands_after_reset(self) -> None:
+        hooks = [
+            _make_hook(
+                name="postcompact",
+                command=_context_cmd("POST NOTE"),
+                type=HookType.POST_COMPACT,
+            )
+        ]
+        agent_loop = self._compacting_loop(hooks)
+
+        _ = [ev async for ev in agent_loop.act("Hello")]
+
+        injected = [
+            m
+            for m in agent_loop.messages
+            if getattr(m, "injected", False) and m.content == "POST NOTE"
+        ]
+        assert len(injected) == 1
+
+    @pytest.mark.asyncio
+    async def test_pre_compact_fires_before_post_compact(
+        self, tmp_path: Path
+    ) -> None:
+        log = tmp_path / "order.log"
+        hooks = [
+            _make_hook(
+                name="pre",
+                command=_append_cmd(log, "pre"),
+                type=HookType.PRE_COMPACT,
+            ),
+            _make_hook(
+                name="post",
+                command=_append_cmd(log, "post"),
+                type=HookType.POST_COMPACT,
+            ),
+        ]
+        agent_loop = self._compacting_loop(hooks)
+
+        _ = [ev async for ev in agent_loop.act("Hello")]
+
+        assert log.read_text().splitlines() == ["pre", "post"]
+
+    @pytest.mark.asyncio
+    async def test_stop_failure_fires_on_backend_error_and_propagates(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "stop_failure.json"
+        backend = FakeBackend(exception_to_raise=_backend_error(429))
+        hooks = [
+            _make_hook(
+                name="failwatch",
+                command=_capture_cmd(out),
+                type=HookType.STOP_FAILURE,
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+
+        with pytest.raises(RateLimitError):
+            _ = [ev async for ev in agent_loop.act("hi")]
+
+        payload = json.loads(out.read_text())
+        assert payload["hook_event_name"] == "stop_failure"
+        assert payload["error_type"] == "rate_limit"
+        assert payload["turn_count"] == 0
+        assert "Rate limits exceeded" in payload["error_message"]
+
+    @pytest.mark.asyncio
+    async def test_stop_failure_error_message_truncated(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "stop_failure.json"
+        backend = FakeBackend(exception_to_raise=ValueError("x" * 5000))
+        hooks = [
+            _make_hook(
+                name="failwatch",
+                command=_capture_cmd(out),
+                type=HookType.STOP_FAILURE,
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+
+        with pytest.raises(RuntimeError):
+            _ = [ev async for ev in agent_loop.act("hi")]
+
+        payload = json.loads(out.read_text())
+        assert payload["error_type"] == "unknown"
+        assert len(payload["error_message"]) == 2000
+
+    @pytest.mark.asyncio
+    async def test_stop_failure_not_fired_on_clean_turn(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "stop_failure.json"
+        backend = FakeBackend(mock_llm_chunk(content="fine"))
+        hooks = [
+            _make_hook(
+                name="failwatch",
+                command=_capture_cmd(out),
+                type=HookType.STOP_FAILURE,
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+
+        _ = [ev async for ev in agent_loop.act("hi")]
+
+        assert not out.exists()
+
+    @pytest.mark.asyncio
+    async def test_notification_fires_before_approval_and_result_unaffected(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "notification.json"
+        tool_call = ToolCall(
+            id="call_appr",
+            index=0,
+            function=FunctionCall(name="bash", arguments='{"command":"true"}'),
+        )
+        backend = FakeBackend([
+            [mock_llm_chunk(content="Running.", tool_calls=[tool_call])],
+            [mock_llm_chunk(content="Done.")],
+        ])
+        hooks = [
+            _make_hook(
+                name="notify", command=_capture_cmd(out), type=HookType.NOTIFICATION
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            config=build_test_vibe_config(enabled_tools=["bash"]),
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        hook_fired_before_prompt: list[bool] = []
+
+        async def approval_callback(
+            tool_name: str, args: Any, tool_call_id: str, required_permissions: Any
+        ) -> tuple[ApprovalResponse, str | None]:
+            hook_fired_before_prompt.append(out.exists())
+            return ApprovalResponse.YES, None
+
+        agent_loop.set_approval_callback(approval_callback)
+
+        events = [ev async for ev in agent_loop.act("run true")]
+
+        tool_results = [e for e in events if isinstance(e, ToolResultEvent)]
+        assert len(tool_results) == 1
+        assert tool_results[0].skipped is False
+        # The hook payload had landed before the approval callback ran.
+        assert hook_fired_before_prompt == [True]
+        payload = json.loads(out.read_text())
+        assert payload["hook_event_name"] == "notification"
+        assert payload["notification_type"] == "permission_prompt"
+        assert payload["tool_name"] == "bash"
+        assert payload["tool_call_id"] == "call_appr"
+        assert "bash" in payload["message"]
+
+    @pytest.mark.asyncio
+    async def test_notification_not_fired_without_approval_prompt(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "notification.json"
+        backend = FakeBackend(mock_llm_chunk(content="Hello!"))
+        hooks = [
+            _make_hook(
+                name="notify", command=_capture_cmd(out), type=HookType.NOTIFICATION
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+
+        _ = [ev async for ev in agent_loop.act("hi")]
+
+        assert not out.exists()
+
+
+class TestSessionStartResumeSource:
+    def test_arm_session_start_sets_pending_source(self) -> None:
+        agent_loop = build_test_agent_loop()
+        agent_loop.arm_session_start("resume")
+        assert agent_loop._pending_session_start_source == "resume"
+
+    @pytest.mark.asyncio
+    async def test_armed_resume_source_reaches_hook(self, tmp_path: Path) -> None:
+        out = tmp_path / "session_start.json"
+        backend = FakeBackend(mock_llm_chunk(content="hi"))
+        hooks = [
+            _make_hook(
+                name="start", command=_capture_cmd(out), type=HookType.SESSION_START
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        agent_loop.arm_session_start("resume")
+
+        _ = [ev async for ev in agent_loop.act("hello")]
+
+        payload = json.loads(out.read_text())
+        assert payload["hook_event_name"] == "session_start"
+        assert payload["source"] == "resume"
+
+    def test_cli_resume_arms_resume_source(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from vibe.cli import cli as cli_module
+
+        agent_loop = build_test_agent_loop()
+        # act() would normally consume the initial "new" source first.
+        agent_loop._pending_session_start_source = None
+        monkeypatch.setattr(
+            cli_module.SessionLoader,
+            "load_session",
+            staticmethod(
+                lambda path: ([], {"session_id": "sess-1", "parent_session_id": None})
+            ),
+        )
+        monkeypatch.setattr(
+            agent_loop.session_logger,
+            "resume_existing_session",
+            lambda session_id, session_dir: None,
+        )
+
+        cli_module._resume_previous_session(agent_loop, [], tmp_path)
+
+        assert agent_loop._pending_session_start_source == "resume"

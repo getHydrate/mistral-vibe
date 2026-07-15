@@ -40,10 +40,13 @@ from vibe.core.hooks.models import (
     HookToolDenial,
     HookToolInputRewrite,
     HookUserMessage,
+    NotificationInvocation,
     PostAgentTurnInvocation,
+    PostCompactInvocation,
     PreCompactInvocation,
     SessionEndInvocation,
     SessionStartInvocation,
+    StopFailureInvocation,
     ToolStatus,
     UserPromptSubmitInvocation,
 )
@@ -64,6 +67,11 @@ if TYPE_CHECKING:
     from vibe.core.hooks.manager import HooksManager
     from vibe.core.session.session_logger import SessionLogger
     from vibe.core.types import AgentStats, BaseEvent, LLMMessage, MessageList
+
+
+# stop_failure invocations carry the stringified error; cap it so hook
+# subprocesses never receive an unbounded payload on stdin.
+_STOP_FAILURE_MESSAGE_MAX_CHARS = 2000
 
 
 class _BeforeToolResolution(NamedTuple):
@@ -181,7 +189,8 @@ class AgentLoopHooksMixin:
 
     # ------------------------------------------------------------------
     # Lifecycle hook runners (user_prompt_submit / session_start /
-    # session_end / pre_compact)
+    # session_end / pre_compact / post_compact / stop_failure /
+    # notification)
     # ------------------------------------------------------------------
 
     async def _run_user_prompt_submit_hooks(
@@ -235,6 +244,25 @@ class AgentLoopHooksMixin:
             if isinstance(ev, (HookEvent, HookContextInjection)):
                 yield ev
 
+    async def _run_post_compact_hooks(
+        self,
+        *,
+        summary_text: str,
+        reason: str = "auto_compact",
+        token_estimate_before: int | None = None,
+    ) -> AsyncGenerator[HookEvent | HookContextInjection]:
+        if not self._hooks_manager:
+            return
+        invocation = PostCompactInvocation(
+            **self._hook_session_context().model_dump(),
+            reason=reason,
+            summary_text=summary_text,
+            token_estimate_before=token_estimate_before,
+        )
+        async for ev in self._hooks_manager.run(invocation):
+            if isinstance(ev, (HookEvent, HookContextInjection)):
+                yield ev
+
     async def _run_session_end_hooks(
         self,
         *,
@@ -249,6 +277,46 @@ class AgentLoopHooksMixin:
             reason=reason,
             turn_count=turn_count,
             error=error,
+        )
+        async for ev in self._hooks_manager.run(invocation):
+            if isinstance(ev, HookEvent):
+                yield ev
+
+    async def _run_stop_failure_hooks(
+        self,
+        *,
+        error_type: str,
+        error_message: str,
+        turn_count: int,
+    ) -> AsyncGenerator[HookEvent]:
+        if not self._hooks_manager:
+            return
+        invocation = StopFailureInvocation(
+            **self._hook_session_context().model_dump(),
+            error_type=error_type,
+            error_message=error_message[:_STOP_FAILURE_MESSAGE_MAX_CHARS],
+            turn_count=turn_count,
+        )
+        async for ev in self._hooks_manager.run(invocation):
+            if isinstance(ev, HookEvent):
+                yield ev
+
+    async def _run_notification_hooks(
+        self,
+        *,
+        notification_type: str,
+        message: str,
+        tool_name: str | None = None,
+        tool_call_id: str | None = None,
+    ) -> AsyncGenerator[HookEvent]:
+        if not self._hooks_manager:
+            return
+        invocation = NotificationInvocation(
+            **self._hook_session_context().model_dump(),
+            notification_type=notification_type,
+            message=message,
+            tool_name=tool_name,
+            tool_call_id=tool_call_id,
         )
         async for ev in self._hooks_manager.run(invocation):
             if isinstance(ev, HookEvent):

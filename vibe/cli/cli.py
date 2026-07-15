@@ -218,6 +218,7 @@ def _resume_previous_session(
     agent_loop.session_id = session_id
     agent_loop.parent_session_id = metadata.get("parent_session_id")
     agent_loop.session_logger.resume_existing_session(session_id, session_path)
+    agent_loop.arm_session_start("resume")
 
     logger.info(
         "Resumed session %s with %d messages", session_id, len(non_system_messages)

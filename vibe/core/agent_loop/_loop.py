@@ -290,6 +290,60 @@ def _is_response_too_long_error(e: Exception) -> bool:
     return False
 
 
+# 529 is the de-facto "overloaded" status (no HTTPStatus member).
+_HTTP_OVERLOADED = 529
+
+_STOP_FAILURE_TYPE_BY_STATUS: dict[int, str] = {
+    HTTPStatus.TOO_MANY_REQUESTS: "rate_limit",
+    HTTPStatus.UNAUTHORIZED: "authentication_failed",
+    HTTPStatus.FORBIDDEN: "authentication_failed",
+    HTTPStatus.PAYMENT_REQUIRED: "billing_error",
+    HTTPStatus.NOT_FOUND: "model_not_found",
+    HTTPStatus.BAD_REQUEST: "invalid_request",
+    HTTPStatus.UNPROCESSABLE_ENTITY: "invalid_request",
+    HTTPStatus.SERVICE_UNAVAILABLE: "overloaded",
+    _HTTP_OVERLOADED: "overloaded",
+}
+
+_SERVER_ERROR_STATUSES = range(HTTPStatus.INTERNAL_SERVER_ERROR, 600)
+
+
+def _classify_backend_error(e: BackendError) -> str:
+    if e.is_context_too_long:
+        return "context_too_long"
+    if e.is_response_too_long:
+        return "max_output_tokens"
+    status = e.status
+    if status is not None and (mapped := _STOP_FAILURE_TYPE_BY_STATUS.get(status)):
+        return mapped
+    if status is not None and status in _SERVER_ERROR_STATUSES:
+        return "server_error"
+    return "unknown"
+
+
+def _classify_turn_failure(e: BaseException) -> str:
+    """Map an exception aborting a turn to a stop_failure ``error_type``.
+
+    Walks ``__cause__`` so wrapped backend errors (``RuntimeError`` from the
+    completion call, ``RateLimitError`` raised from a 429, …) classify by
+    their root cause. Anything unrecognized is ``unknown``.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = e
+    while current is not None and id(current) not in seen:
+        if isinstance(current, RateLimitError):
+            return "rate_limit"
+        if isinstance(current, ContextTooLongError):
+            return "context_too_long"
+        if isinstance(current, ResponseTooLongError):
+            return "max_output_tokens"
+        if isinstance(current, BackendError):
+            return _classify_backend_error(current)
+        seen.add(id(current))
+        current = current.__cause__
+    return "unknown"
+
+
 def _is_non_retryable_error(e: BaseException) -> bool:
     # Detect Temporal-style ``non_retryable`` flag without importing temporalio.
     # Walks ``__cause__`` so an ``ActivityError`` whose cause is a non-retryable
@@ -448,8 +502,9 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._pending_injected_messages: list[LLMMessage] = []
         self._pending_clear_context: bool = False
         # Lifecycle-hook bookkeeping. session_start fires once per session;
-        # the source is set on new / clear / compact / fork. session_end
-        # fires once at teardown; turn_count tracks completed agent turns.
+        # the source is set on new / clear / compact / fork / resume.
+        # session_end fires once at teardown; turn_count tracks completed
+        # agent turns.
         self._pending_session_start_source: str | None = "new"
         self._session_end_fired: bool = False
         self._turn_count: int = 0
@@ -694,6 +749,15 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
 
     def emit_session_closed_telemetry(self) -> None:
         self.telemetry_client.send_session_closed()
+
+    def arm_session_start(self, source: str) -> None:
+        """Arm the next turn's session_start hook with *source*.
+
+        For front-ends that restore session state from outside the loop
+        (e.g. the CLI resume path arms ``"resume"``). One of: "new",
+        "continue", "clear", "fork", "resume".
+        """
+        self._pending_session_start_source = source
 
     async def fire_session_end(
         self, reason: str = "parent_close", error: str | None = None
@@ -1253,6 +1317,18 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                         yield hook_event
                     should_break_loop = self._queue_post_turn_retry(retry_msg)
 
+        except Exception as e:
+            # stop_failure is observational, fire-and-forget: it must never
+            # swallow or alter the original error, which is re-raised
+            # unchanged. Cancellation (BaseException) is never intercepted.
+            with contextlib.suppress(Exception):
+                async for _ in self._run_stop_failure_hooks(
+                    error_type=_classify_turn_failure(e),
+                    error_message=str(e),
+                    turn_count=self._turn_count,
+                ):
+                    pass
+            raise
         finally:
             await self._save_messages()
 
@@ -1780,6 +1856,17 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 approval_type=ToolPermission.ASK,
                 feedback="Tool execution not permitted.",
             )
+        # notification is observational, fire-and-forget: it must not delay
+        # or alter the approval flow, so failures are suppressed and events
+        # discarded.
+        with contextlib.suppress(Exception):
+            async for _ in self._run_notification_hooks(
+                notification_type="permission_prompt",
+                message=f"Approval requested for tool '{tool_name}'",
+                tool_name=tool_name,
+                tool_call_id=tool_call_id,
+            ):
+                pass
         response, feedback = await self.approval_callback(
             tool_name, args, tool_call_id, required_permissions
         )
@@ -2215,10 +2302,12 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             # pre_compact fires before summarization. It cannot block
             # compaction; any injected context is queued to survive the
             # reset and reappear on the next turn.
+            compact_reason = "auto_compact"
+            token_estimate_before = self.stats.context_tokens
             pre_compact_injections: list[str] = []
             async for ev in self._run_pre_compact_hooks(
-                reason="auto_compact",
-                token_estimate_before=self.stats.context_tokens,
+                reason=compact_reason,
+                token_estimate_before=token_estimate_before,
             ):
                 if isinstance(ev, HookContextInjection):
                     pre_compact_injections.append(ev.content)
@@ -2229,6 +2318,24 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
             # re-appended after the reset so it reappears on the next turn.
             if pre_compact_injections:
                 for content in pre_compact_injections:
+                    self.messages.append(
+                        LLMMessage(role=Role.user, content=content, injected=True)
+                    )
+                await self._save_messages()
+
+            # post_compact observes the completed compaction. The reset has
+            # already happened, so injected context is appended directly
+            # (and saved) rather than queued through the reset.
+            post_compact_injections: list[str] = []
+            async for ev in self._run_post_compact_hooks(
+                reason=compact_reason,
+                summary_text=summary,
+                token_estimate_before=token_estimate_before,
+            ):
+                if isinstance(ev, HookContextInjection):
+                    post_compact_injections.append(ev.content)
+            if post_compact_injections:
+                for content in post_compact_injections:
                     self.messages.append(
                         LLMMessage(role=Role.user, content=content, injected=True)
                     )

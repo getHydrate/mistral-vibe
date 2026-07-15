@@ -740,7 +740,7 @@ Fires per tool call **if and only if the tool body actually ran**. `tool_status`
 
 #### Lifecycle hooks (Hydrate fork)
 
-> Added by the [Hydrate](https://gethydrate.dev) fork. These four
+> Added by the [Hydrate](https://gethydrate.dev) fork. These
 > session-lifecycle events sit alongside the upstream tool/turn hooks and
 > use the **same** strict stdout contract (`#### Common ground`). They do
 > not accept `match` or `strict` (those remain tool-only). When no
@@ -760,7 +760,7 @@ Fires once per user turn, **before** the prompt reaches the model.
 
 Fires once when a session begins. Observational — it cannot block.
 
-- **Receives** (in addition to the session context): `source` (`"new"`, `"continue"`, `"clear"`, or `"fork"`).
+- **Receives** (in addition to the session context): `source` (`"new"`, `"continue"`, `"clear"`, `"fork"`, or `"resume"`).
 - **Can return**:
   - `hook_specific_output.additional_context` (string) — injected as a user message at the top of the session.
   - `system_message` — UI-only. (`decision: "deny"` is logged and ignored.)
@@ -773,6 +773,29 @@ Fires before context compaction. Observational — it cannot block compaction.
 - **Can return**:
   - `hook_specific_output.additional_context` (string) — injected as a user message that **survives the compaction reset** and reappears on the next turn.
   - `system_message` — UI-only. (`decision: "deny"` is logged and ignored.)
+
+##### `post_compact`
+
+Fires after context compaction completed (paired with the preceding `pre_compact`). Observational — the compaction has already happened.
+
+- **Receives** (in addition to the session context): `reason` (mirrors the paired `pre_compact`), `summary_text` (the compaction summary), `token_estimate_before`.
+- **Can return**:
+  - `hook_specific_output.additional_context` (string) — injected as a user message into the fresh post-compaction context.
+  - `system_message` — UI-only. (`decision: "deny"` is logged and ignored.)
+
+##### `stop_failure`
+
+Fires when an agent turn aborts with an error (the model call failed or an unhandled exception ended the turn). Purely observational — the original error is always re-raised unchanged.
+
+- **Receives** (in addition to the session context): `error_type` (one of `"rate_limit"`, `"overloaded"`, `"authentication_failed"`, `"billing_error"`, `"invalid_request"`, `"model_not_found"`, `"server_error"`, `"max_output_tokens"`, `"context_too_long"`, `"unknown"`), `error_message` (truncated to 2000 chars), `turn_count`.
+- **Can return**: nothing actionable. `system_message` is UI-only; `decision: "deny"` and `additional_context` are logged and ignored.
+
+##### `notification`
+
+Fires when Vibe is about to notify / prompt the user. Currently only `notification_type = "permission_prompt"`, fired immediately before the tool-approval prompt. Purely observational — it cannot delay or alter the approval flow.
+
+- **Receives** (in addition to the session context): `notification_type`, `message`, `tool_name`, `tool_call_id` (the latter two are null for non-tool notifications).
+- **Can return**: nothing actionable. `system_message` is UI-only; `decision: "deny"` and `additional_context` are logged and ignored.
 
 ##### `session_end`
 

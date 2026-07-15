@@ -25,6 +25,9 @@ class HookType(StrEnum):
     SESSION_START = auto()
     SESSION_END = auto()
     PRE_COMPACT = auto()
+    POST_COMPACT = auto()
+    STOP_FAILURE = auto()
+    NOTIFICATION = auto()
 
 
 # Tool hooks accept ``match`` / ``strict``; the lifecycle hooks below do not.
@@ -132,7 +135,7 @@ class UserPromptSubmitInvocation(HookSessionContext):
 
 class SessionStartInvocation(HookSessionContext):
     hook_event_name: Literal[HookType.SESSION_START] = HookType.SESSION_START
-    # One of: "new", "continue", "clear", "fork".
+    # One of: "new", "continue", "clear", "fork", "resume".
     source: str
 
 
@@ -151,6 +154,34 @@ class PreCompactInvocation(HookSessionContext):
     auto_compact_threshold: int | None = None
 
 
+class PostCompactInvocation(HookSessionContext):
+    hook_event_name: Literal[HookType.POST_COMPACT] = HookType.POST_COMPACT
+    # Mirrors the reason of the paired pre_compact invocation.
+    reason: str = "auto_compact"
+    summary_text: str
+    token_estimate_before: int | None = None
+
+
+class StopFailureInvocation(HookSessionContext):
+    hook_event_name: Literal[HookType.STOP_FAILURE] = HookType.STOP_FAILURE
+    # One of: "rate_limit", "overloaded", "authentication_failed",
+    # "billing_error", "invalid_request", "model_not_found", "server_error",
+    # "max_output_tokens", "context_too_long", "unknown".
+    error_type: str
+    # Truncated to 2000 characters.
+    error_message: str
+    turn_count: int
+
+
+class NotificationInvocation(HookSessionContext):
+    hook_event_name: Literal[HookType.NOTIFICATION] = HookType.NOTIFICATION
+    # Only "permission_prompt" today; free-form so future types slot in.
+    notification_type: str
+    message: str
+    tool_name: str | None = None
+    tool_call_id: str | None = None
+
+
 HookInvocation = (
     PostAgentTurnInvocation
     | BeforeToolInvocation
@@ -159,6 +190,9 @@ HookInvocation = (
     | SessionStartInvocation
     | SessionEndInvocation
     | PreCompactInvocation
+    | PostCompactInvocation
+    | StopFailureInvocation
+    | NotificationInvocation
 )
 
 
@@ -213,9 +247,12 @@ def build_invocation(
             | HookType.SESSION_START
             | HookType.SESSION_END
             | HookType.PRE_COMPACT
+            | HookType.POST_COMPACT
+            | HookType.STOP_FAILURE
+            | HookType.NOTIFICATION
         ):
             # Lifecycle invocations carry event-specific required fields
-            # (prompt / source / reason / turn_count) and are constructed
+            # (prompt / source / reason / turn_count / …) and are constructed
             # directly by the agent loop rather than through this factory.
             raise ValueError(
                 f"{hook_type.value} invocations are constructed directly,"
@@ -298,9 +335,9 @@ class HookTextReplacement(BaseModel):
 
 
 class HookContextInjection(BaseModel):
-    """user_prompt_submit / session_start / pre_compact allow:
-    ``content`` (the ``hook_specific_output.additional_context`` of an
-    allowing hook) is injected into the conversation as a user message.
+    """user_prompt_submit / session_start / pre_compact / post_compact
+    allow: ``content`` (the ``hook_specific_output.additional_context`` of
+    an allowing hook) is injected into the conversation as a user message.
     """
 
     content: str
