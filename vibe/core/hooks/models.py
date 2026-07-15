@@ -119,6 +119,10 @@ class HookSessionContext(BaseModel):
 
 class PostAgentTurnInvocation(HookSessionContext):
     hook_event_name: Literal[HookType.POST_AGENT_TURN] = HookType.POST_AGENT_TURN
+    # True when this run is a retry caused by this hook's previous deny
+    # (mirrors Claude Code's Stop contract, so loop-guard scripts can
+    # check it to break deny loops).
+    stop_hook_active: bool = False
 
 
 class BeforeToolInvocation(HookSessionContext):

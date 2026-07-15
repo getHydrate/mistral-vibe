@@ -716,9 +716,9 @@ Unknown JSON fields are tolerated at every level (forward-compatible). Fields th
 
 Fires after every assistant turn that ends without pending tool calls.
 
-- **Receives** (in addition to the session context): no extra fields.
+- **Receives** (in addition to the session context): `stop_hook_active` (bool) — `true` when this run is a retry caused by this hook's own previous deny, mirroring Claude Code's Stop contract so loop-guard scripts port unchanged.
 - **Can return**:
-  - `decision: "deny"` + `reason` — `reason` is injected as a new user message asking for a retry. Capped at **3 retries per hook per user turn**; further denies become terminal warnings.
+  - `decision: "deny"` + `reason` — `reason` is injected as a new user message asking for a retry. Capped at **8 retries per hook per user turn** (Claude Code's Stop block cap); further denies become terminal warnings.
   - `system_message` — UI-only.
 
 #### `before_tool`

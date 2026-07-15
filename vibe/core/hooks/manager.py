@@ -197,9 +197,10 @@ class HooksManager:
             yield HookStartEvent(
                 hook_name=hook.name, scope=hook_type, tool_call_id=tool_call_id
             )
-            result = await self._run_subprocess(hook, current, external_attrs)
+            prepared = handler.prepare_invocation(hook, current, self._retry_state)
+            result = await self._run_subprocess(hook, prepared, external_attrs)
 
-            action = self._process_hook_result(handler, hook, current, result)
+            action = self._process_hook_result(handler, hook, prepared, result)
             for ev in action.events:
                 if isinstance(ev, HookEndEvent):
                     yield ev.model_copy(

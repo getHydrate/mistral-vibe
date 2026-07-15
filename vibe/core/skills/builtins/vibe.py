@@ -510,7 +510,7 @@ will produce ``hook 'guard': guard: refused...`` downstream.
 |---|---|
 | `before_tool` | Deny the tool call; `reason` is the tool error returned to the LLM. First deny short-circuits the remaining `before_tool` hooks for this call. |
 | `after_tool` | Replace `tool_output_text` with `reason`. Pipeline continues; subsequent hooks see the replacement. |
-| `post_agent_turn` | Inject `reason` as a retry user message. Capped at 3 retries per hook per user turn. |
+| `post_agent_turn` | Inject `reason` as a retry user message. Capped at 8 retries per hook per user turn; the invocation's `stop_hook_active` is `true` on retries caused by this hook's own previous deny. |
 
 Event-specific payloads:
 

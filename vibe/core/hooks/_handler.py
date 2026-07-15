@@ -25,7 +25,8 @@ from vibe.core.hooks.models import (
 logger = logging.getLogger(__name__)
 
 
-_MAX_RETRIES = 3
+# Matches Claude Code's Stop-hook block cap.
+_MAX_RETRIES = 8
 
 
 _HookYield = (
@@ -59,6 +60,9 @@ class HookRetryState:
 
     def reset(self) -> None:
         self._counts.clear()
+
+    def retry_count(self, hook_name: str) -> int:
+        return self._counts.get(hook_name, 0)
 
     def remaining_retries(self, hook_name: str) -> int:
         return _MAX_RETRIES - self._counts.get(hook_name, 0)
@@ -138,6 +142,18 @@ class HookHandler(ABC):
 
     def external_attributes(self, invocation: HookInvocation) -> HookExternalAttrs:
         return {}
+
+    def prepare_invocation(
+        self,
+        hook: HookConfig,
+        invocation: HookInvocation,
+        retry_state: HookRetryState,
+    ) -> HookInvocation:
+        """Per-hook view of the invocation, computed right before the
+        subprocess runs (e.g. post_agent_turn's ``stop_hook_active``).
+        Default: the invocation unchanged.
+        """
+        return invocation
 
     def on_structured(
         self,

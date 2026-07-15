@@ -633,9 +633,10 @@ class TestPostAgentTurnHook:
 
     @pytest.mark.asyncio
     async def test_max_retry_limit(self, ctx: HookSessionContext) -> None:
+        # Cap matches Claude Code's Stop-hook block cap of 8.
         handler = HooksManager([_make_hook(command=_deny_cmd("retry"))])
 
-        for _ in range(3):
+        for _ in range(8):
             events = [ev async for ev in _run(handler, HookType.POST_AGENT_TURN, ctx)]
             assert any(isinstance(e, HookUserMessage) for e in events)
 
@@ -649,6 +650,56 @@ class TestPostAgentTurnHook:
             and "exhausted" in e.content.lower()
         ]
         assert len(error_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_stop_hook_active_false_then_true_on_retry(
+        self, ctx: HookSessionContext, tmp_path: Path
+    ) -> None:
+        # Mirrors Claude Code's Stop contract: the invocation carries
+        # stop_hook_active=False on the first fire and True when the run
+        # is a retry caused by this hook's previous deny.
+        log = tmp_path / "invocations.jsonl"
+        capture = (
+            f"import sys; open({str(log)!r}, 'a').write(sys.stdin.read().strip()"
+            f" + chr(10)); sys.stdout.write"
+            f"('{{\"decision\": \"deny\", \"reason\": \"again\"}}')"
+        )
+        command = f"{sys.executable} -c {shlex.quote(capture)}"
+        handler = HooksManager([_make_hook(name="loop-guard", command=command)])
+
+        for _ in range(3):
+            _ = [ev async for ev in _run(handler, HookType.POST_AGENT_TURN, ctx)]
+
+        payloads = [json.loads(line) for line in log.read_text().splitlines()]
+        assert [p["stop_hook_active"] for p in payloads] == [False, True, True]
+
+    @pytest.mark.asyncio
+    async def test_stop_hook_active_resets_after_allow(
+        self, ctx: HookSessionContext, tmp_path: Path
+    ) -> None:
+        # deny → retry → allow → the next fire is a fresh stop again.
+        log = tmp_path / "invocations.jsonl"
+        counter = tmp_path / "count"
+        capture = (
+            f"import sys; from pathlib import Path; "
+            f"log = open({str(log)!r}, 'a'); "
+            f"log.write(sys.stdin.read().strip() + chr(10)); "
+            f"p = Path({str(counter)!r}); "
+            f"c = int(p.read_text()) if p.exists() else 0; "
+            f"p.write_text(str(c + 1)); "
+            f"sys.stdout.write("
+            f"'{{\"decision\": \"deny\", \"reason\": \"again\"}}' if c == 0 else '')"
+        )
+        command = f"{sys.executable} -c {shlex.quote(capture)}"
+        handler = HooksManager([_make_hook(name="loop-guard", command=command)])
+
+        for _ in range(3):
+            _ = [ev async for ev in _run(handler, HookType.POST_AGENT_TURN, ctx)]
+
+        payloads = [json.loads(line) for line in log.read_text().splitlines()]
+        # Fire 1: fresh (denies). Fire 2: retry (allows, clearing the
+        # count). Fire 3: fresh again.
+        assert [p["stop_hook_active"] for p in payloads] == [False, True, False]
 
     @pytest.mark.asyncio
     async def test_warning_prefers_stderr_on_nonzero_exit(

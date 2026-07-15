@@ -15,9 +15,19 @@ from vibe.core.hooks.models import (
     HookMessageSeverity,
     HookStructuredResponse,
     HookUserMessage,
+    PostAgentTurnInvocation,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _as_post_agent_turn(invocation: HookInvocation) -> PostAgentTurnInvocation:
+    if not isinstance(invocation, PostAgentTurnInvocation):
+        raise TypeError(
+            f"PostAgentTurnHandler expected PostAgentTurnInvocation, got"
+            f" {type(invocation).__name__}"
+        )
+    return invocation
 
 
 class PostAgentTurnHandler(HookHandler):
@@ -27,6 +37,19 @@ class PostAgentTurnHandler(HookHandler):
 
     def matches(self, hook: HookConfig, invocation: HookInvocation) -> bool:
         return True
+
+    def prepare_invocation(
+        self,
+        hook: HookConfig,
+        invocation: HookInvocation,
+        retry_state: HookRetryState,
+    ) -> HookInvocation:
+        # stop_hook_active mirrors Claude Code's Stop contract: True when
+        # this run is a retry caused by this hook's own previous deny, so
+        # loop-guard scripts can break deny loops.
+        return _as_post_agent_turn(invocation).model_copy(
+            update={"stop_hook_active": retry_state.retry_count(hook.name) > 0}
+        )
 
     def _on_deny(
         self,
