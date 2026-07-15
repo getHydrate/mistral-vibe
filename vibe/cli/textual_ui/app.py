@@ -69,6 +69,7 @@ from vibe.cli.textual_ui.notifications import (
 from vibe.cli.textual_ui.quit_manager import QuitManager
 from vibe.cli.textual_ui.scheduled_loop_runner import ScheduledLoopRunner
 from vibe.cli.textual_ui.session_exit import print_session_resume_message
+from vibe.cli.textual_ui.status_line import build_status_line_payload
 from vibe.cli.textual_ui.widgets.approval_app import ApprovalApp
 from vibe.cli.textual_ui.widgets.banner.banner import Banner
 from vibe.cli.textual_ui.widgets.chat_input import ChatInputContainer
@@ -125,6 +126,7 @@ from vibe.cli.textual_ui.widgets.proxy_setup_app import ProxySetupApp
 from vibe.cli.textual_ui.widgets.question_app import QuestionApp
 from vibe.cli.textual_ui.widgets.rewind_app import RewindApp
 from vibe.cli.textual_ui.widgets.session_picker import SessionPickerApp
+from vibe.cli.textual_ui.widgets.status_line import StatusLine
 from vibe.cli.textual_ui.widgets.teleport_message import TeleportMessage
 from vibe.cli.textual_ui.widgets.theme_picker import ThemePickerApp, sorted_theme_names
 from vibe.cli.textual_ui.widgets.thinking_picker import ThinkingPickerApp
@@ -555,6 +557,7 @@ class VibeApp(App):  # noqa: PLR0904
             narrator_manager or self._make_default_narrator_manager()
         )
 
+        self._status_line_widget: StatusLine | None = None
         self._rewind_mode = False
         self._rewind_highlighted_widget: UserMessage | None = None
         self._fatal_init_error = False
@@ -717,6 +720,29 @@ class VibeApp(App):  # noqa: PLR0904
     def get_default_screen(self) -> Screen:
         return WordSelectScreen(id="_default")
 
+    def _build_status_line_payload(self) -> dict[str, Any]:
+        session_logger = self.agent_loop.session_logger
+        transcript = ""
+        if session_logger.enabled and session_logger.session_dir is not None:
+            transcript = str(session_logger.messages_filepath.resolve())
+        model_id: str | None = None
+        context_size: int | None = None
+        try:
+            model = self.config.get_active_model()
+        except ValueError:
+            pass
+        else:
+            model_id = model.name
+            context_size = model.auto_compact_threshold
+        return build_status_line_payload(
+            session_id=self.agent_loop.session_id,
+            transcript_path=transcript,
+            cwd=str(Path.cwd().resolve()),
+            model_id=model_id,
+            context_size=context_size,
+            input_tokens=self.agent_loop.stats.context_tokens,
+        )
+
     def compose(self) -> ComposeResult:
         with ChatScroll(id="chat"):
             connectors_connected, connectors_total = compute_connector_counts(
@@ -758,6 +784,15 @@ class VibeApp(App):  # noqa: PLR0904
             yield NoMarkupStatic(id="spacer")
             yield ContextProgress()
 
+        if self.config.status_line_command:
+            self._status_line_widget = StatusLine(
+                command=self.config.status_line_command,
+                interval=self.config.status_line_interval,
+                payload_provider=self._build_status_line_payload,
+                id="status-line",
+            )
+            yield self._status_line_widget
+
     @property
     def _messages_area(self) -> Widget:
         if self._cached_messages_area is None:
@@ -797,6 +832,10 @@ class VibeApp(App):  # noqa: PLR0904
                 max_tokens=self.config.get_active_model().auto_compact_threshold,
                 current_tokens=stats.context_tokens,
             )
+            # AgentStats keeps one listener per attribute, so the status
+            # line refresh piggybacks on the context_tokens registration.
+            if self._status_line_widget is not None:
+                self._status_line_widget.trigger_refresh_debounced()
 
         self.agent_loop.stats.add_listener("context_tokens", update_context_progress)
         self.agent_loop.stats.trigger_listeners()
@@ -2146,6 +2185,8 @@ class VibeApp(App):  # noqa: PLR0904
             )
         finally:
             self._narrator_manager.on_turn_end()
+            if self._status_line_widget is not None:
+                self._status_line_widget.trigger_refresh()
             self._agent_running = False
             self._interrupt_requested = False
             self._agent_task = None

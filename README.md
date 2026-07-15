@@ -804,6 +804,36 @@ Fires once when a session ends. Purely observational — it cannot block teardow
 - **Receives** (in addition to the session context): `reason` (`"exit"`, `"signal"`, `"parent_close"`, `"error"`, or `"clear"`), `turn_count`, `error`.
 - **Can return**: nothing actionable. `system_message` is UI-only; `decision: "deny"` is logged and ignored.
 
+### Status line
+
+Vibe can render an external command's output as a one-line status row below the input bar:
+
+```toml
+# config.toml
+status_line_command = "/path/to/my-statusline"   # unset (default) disables the row entirely
+status_line_interval = 5.0                        # seconds between periodic refreshes; 0 = event-driven only
+```
+
+The command runs through the shell and receives a JSON payload on **stdin** describing the current session. The first line of its **stdout** is rendered (ANSI colours supported). The payload shape matches Claude Code's `statusLine` stdin contract, so existing status line scripts port unchanged:
+
+```json
+{
+  "session_id": "...",
+  "transcript_path": "...",
+  "cwd": "...",
+  "model": {"id": "..."},
+  "context_window": {
+    "size": 200000,
+    "used_percentage": 42.5,
+    "current_usage": {"input_tokens": 85000}
+  }
+}
+```
+
+`transcript_path` is the session's `messages.jsonl` (empty string when session logging is off); `context_window.size` is the active model's `auto_compact_threshold`. Unknown-field tolerance is expected on the consumer side — future keys may be added.
+
+The row refreshes on mount, when context token usage changes (debounced to at most once per second), at the end of each agent turn, and every `status_line_interval` seconds. The command has a 2-second budget per run; on timeout, non-zero exit, or empty output the previous line is kept — errors are never rendered into the UI.
+
 ### Session Management
 
 #### Session Continuation and Resumption

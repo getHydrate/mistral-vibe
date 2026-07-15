@@ -302,6 +302,23 @@ class VibeConfig(BaseSettings):
 
     enable_config_orchestrator: bool = Field(default=False, exclude=True)
 
+    status_line_command: str | None = Field(
+        default=None,
+        description=(
+            "Shell command producing the external status line. It receives a "
+            "JSON session payload on stdin and its first line of stdout is "
+            "rendered below the input bar. Unset (default) disables the "
+            "status line entirely."
+        ),
+    )
+    status_line_interval: float = Field(
+        default=5.0,
+        description=(
+            "Seconds between periodic status line refreshes. 0 disables the "
+            "timer (event-driven refreshes only)."
+        ),
+    )
+
     providers: list[ProviderConfig] = Field(
         default_factory=lambda: list(DEFAULT_PROVIDERS)
     )
