@@ -743,6 +743,20 @@ In addition to the tool-name `match`, an `after_tool` TOML entry accepts an opti
   - `hook_specific_output.additional_context` (string) — **appended** (with a `\n` separator) to `tool_output_text`. Composes with a same-hook deny: deny replaces first, then `additional_context` is appended to the replacement.
   - `system_message` — UI-only.
 
+##### Matching skill loads
+
+Skills load through the built-in `skill` tool, so tool hooks target them with `match = "skill"`; the skill name rides in `tool_input.name`:
+
+```toml
+[[hooks]]
+name = "skill-audit"
+type = "before_tool"
+match = "skill"                      # tool_input is {"name": "<skill-name>"}
+command = "/path/to/audit-skill"
+```
+
+This covers **model-invoked** loads — the model calling the `skill` tool — which run the full pipeline: `before_tool` fires (a deny blocks the load), then `after_tool`. A **user-typed** `/skill-name` command is different: Vibe expands it by injecting a synthetic `skill` tool call directly into the transcript, so the tool pipeline never runs and tool hooks do **not** fire for it (the synthetic call is still visible in the transcript). To observe or gate user-typed skill invocations, use a `user_prompt_submit` hook and check for the leading `/` in `prompt`.
+
 #### `permission_request` (Hydrate fork)
 
 > Added by the [Hydrate](https://gethydrate.dev) fork. A **tool hook**

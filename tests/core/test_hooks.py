@@ -4086,3 +4086,149 @@ class TestWorktreeCreateAgentLoopIntegration:
         )
         _ = [ev async for ev in agent_loop.act("hello")]
         assert not out.exists()
+
+
+# ---------------------------------------------------------------------------
+# Skill-invocation tool-hook matching (Wave D — documentation tests)
+# ---------------------------------------------------------------------------
+
+
+class TestSkillInvocationHookMatching:
+    """Pin down the matcher pattern documented in the README hooks
+    section: skills load through the built-in ``skill`` tool, so
+    MODEL-invoked loads run the normal tool pipeline and tool hooks with
+    ``match = "skill"`` fire (skill name in ``tool_input.name``). A
+    USER-typed ``/skill`` command instead injects a synthetic ``skill``
+    tool call straight into the transcript (v2.19.1) — the tool pipeline
+    never runs, so tool hooks do NOT fire on that path.
+    """
+
+    def _install_skill(self, agent_loop: Any, name: str = "myskill") -> None:
+        from types import MappingProxyType
+
+        from vibe.core.skills.models import SkillInfo
+
+        info = SkillInfo(name=name, description="test skill", prompt="Do the thing.")
+        agent_loop.skill_manager.available_skills = MappingProxyType({name: info})
+
+    @pytest.mark.asyncio
+    async def test_tool_hooks_match_skill_on_model_invoked_load(
+        self, tmp_path: Path
+    ) -> None:
+        before_out = tmp_path / "before_skill.json"
+        after_out = tmp_path / "after_skill.json"
+        tool_call = ToolCall(
+            id="call_skill",
+            index=0,
+            function=FunctionCall(name="skill", arguments='{"name": "myskill"}'),
+        )
+        backend = FakeBackend([
+            [mock_llm_chunk(content="Loading.", tool_calls=[tool_call])],
+            [mock_llm_chunk(content="done")],
+        ])
+        hooks = [
+            _make_tool_hook(
+                "before-skill",
+                _capture_cmd(before_out),
+                type=HookType.BEFORE_TOOL,
+                match="skill",
+            ),
+            _make_tool_hook(
+                "after-skill",
+                _capture_cmd(after_out),
+                type=HookType.AFTER_TOOL,
+                match="skill",
+            ),
+        ]
+        agent_loop = build_test_agent_loop(
+            config=build_test_vibe_config(enabled_tools=["skill"]),
+            agent_name=BuiltinAgentName.AUTO_APPROVE,
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        self._install_skill(agent_loop)
+
+        events = [ev async for ev in agent_loop.act("load the skill")]
+
+        before = json.loads(before_out.read_text())
+        assert before["hook_event_name"] == "before_tool"
+        assert before["tool_name"] == "skill"
+        assert before["tool_input"] == {"name": "myskill"}
+
+        after = json.loads(after_out.read_text())
+        assert after["tool_name"] == "skill"
+        assert after["tool_status"] == "success"
+
+        tool_results = [e for e in events if isinstance(e, ToolResultEvent)]
+        assert len(tool_results) == 1
+        assert tool_results[0].skipped is False
+
+    @pytest.mark.asyncio
+    async def test_before_tool_deny_blocks_model_invoked_skill_load(
+        self, tmp_path: Path
+    ) -> None:
+        tool_call = ToolCall(
+            id="call_skill",
+            index=0,
+            function=FunctionCall(name="skill", arguments='{"name": "myskill"}'),
+        )
+        backend = FakeBackend([
+            [mock_llm_chunk(content="Loading.", tool_calls=[tool_call])],
+            [mock_llm_chunk(content="ok then")],
+        ])
+        hooks = [
+            _make_tool_hook(
+                "no-skills",
+                _deny_cmd("skills are locked down"),
+                type=HookType.BEFORE_TOOL,
+                match="skill",
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            config=build_test_vibe_config(enabled_tools=["skill"]),
+            agent_name=BuiltinAgentName.AUTO_APPROVE,
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        self._install_skill(agent_loop)
+
+        events = [ev async for ev in agent_loop.act("load the skill")]
+
+        tool_results = [e for e in events if isinstance(e, ToolResultEvent)]
+        assert len(tool_results) == 1
+        assert tool_results[0].skipped is True
+        assert "skills are locked down" in (tool_results[0].skip_reason or "")
+
+    @pytest.mark.asyncio
+    async def test_user_invoked_skill_command_bypasses_tool_hooks(
+        self, tmp_path: Path
+    ) -> None:
+        # /myskill is expanded by injecting a synthetic `skill` tool call
+        # into the transcript; the tool pipeline never runs, so even a
+        # match-everything before_tool hook must not fire.
+        out = tmp_path / "before.json"
+        backend = FakeBackend(mock_llm_chunk(content="ok"))
+        hooks = [
+            _make_tool_hook(
+                "watch-all", _capture_cmd(out), type=HookType.BEFORE_TOOL, match="*"
+            )
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=backend,
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        self._install_skill(agent_loop)
+
+        _ = [ev async for ev in agent_loop.act("/myskill")]
+
+        # The synthetic skill tool call did land in the transcript ...
+        synthetic_calls = [
+            tc
+            for m in agent_loop.messages
+            if m.tool_calls
+            for tc in m.tool_calls
+            if tc.function.name == "skill"
+        ]
+        assert len(synthetic_calls) == 1
+        # ... but no tool executed, so no tool hook fired.
+        assert not out.exists()
