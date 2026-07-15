@@ -1,7 +1,7 @@
 # Mistral Vibe — Hydrate fork
 
 > [!IMPORTANT]
-> This is the **[Hydrate](https://gethydrate.dev) fork** of
+> This is the **[Hydrate](https://github.com/getHydrate/hydrate-public) fork** of
 > [Mistral Vibe](https://github.com/mistralai/mistral-vibe), tracking
 > upstream (currently **v2.19.1**) as a strict superset. It adds:
 >
@@ -765,7 +765,7 @@ This covers **model-invoked** loads — the model calling the `skill` tool — w
 
 #### `permission_request` (Hydrate fork)
 
-> Added by the [Hydrate](https://gethydrate.dev) fork. A **tool hook**
+> Added by the [Hydrate](https://github.com/getHydrate/hydrate-public) fork. A **tool hook**
 > (accepts `match` / `strict`) like `before_tool` / `after_tool`.
 
 Fires per tool call whose permission verdict is ASK — after `before_tool`, **before** the `notification` hook and before the approval prompt. A hook can approve or decline on the user's behalf, or pass through to the normal prompt. The first hook to return an explicit decision wins (allow OR deny — `before_tool`'s first-deny-wins convention extended to both decisive outcomes); the rest of the chain is skipped. Does not fire when no approval is needed (permission `ALWAYS`/`NEVER`, `--yolo`, or a session rule already covering the call).
@@ -788,7 +788,7 @@ Fires per tool call whose permission verdict is ASK — after `before_tool`, **b
 
 #### Lifecycle hooks (Hydrate fork)
 
-> Added by the [Hydrate](https://gethydrate.dev) fork. These
+> Added by the [Hydrate](https://github.com/getHydrate/hydrate-public) fork. These
 > session-lifecycle events sit alongside the upstream tool/turn hooks and
 > use the **same** strict stdout contract (`#### Common ground`). They do
 > not accept `match` or `strict` (those remain tool-only). When no
