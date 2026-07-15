@@ -288,6 +288,22 @@ class VibeConfigSchema(ConfigSchema):
         ),
     )
     enable_config_orchestrator: Annotated[bool, WithReplaceMerge()] = False
+    status_line_command: Annotated[str | None, WithReplaceMerge()] = Field(
+        default=None,
+        description=(
+            "Shell command producing the external status line. It receives a "
+            "JSON session payload on stdin and its first line of stdout is "
+            "rendered below the input bar. Unset (default) disables the "
+            "status line entirely."
+        ),
+    )
+    status_line_interval: Annotated[float, WithReplaceMerge()] = Field(
+        default=5.0,
+        description=(
+            "Seconds between periodic status line refreshes. 0 disables the "
+            "timer (event-driven refreshes only)."
+        ),
+    )
 
     # Top-level scalars
     theme: Annotated[str, WithReplaceMerge(), BeforeValidator(resolve_theme_name)] = (
