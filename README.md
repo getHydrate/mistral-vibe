@@ -879,6 +879,10 @@ Fires once, on the first prompt of a session running inside a `--worktree` check
 
 ### Status line
 
+> Added by the [Hydrate](https://github.com/getHydrate/hydrate-public)
+> fork — this feature does not exist in upstream Mistral Vibe. It is off
+> unless `status_line_command` is set.
+
 Vibe can render an external command's output as a one-line status row below the input bar:
 
 ```toml
