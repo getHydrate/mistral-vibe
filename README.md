@@ -27,11 +27,13 @@ Mistral Vibe is a command-line coding assistant powered by Mistral's models. It 
 > [!NOTE]
 > This is the **[Hydrate](https://gethydrate.dev) fork** of Mistral Vibe,
 > tracking upstream (currently **v2.16.1**). It is a strict superset: it
-> adds four session-lifecycle hook events — `user_prompt_submit`,
-> `session_start`, `pre_compact`, `session_end` — on top of upstream's
-> native `post_agent_turn` / `before_tool` / `after_tool` hooks, so Hydrate
-> can deliver pre-prompt recall and lifecycle guardrails. With no
-> lifecycle hooks configured, behavior is identical to upstream. See
+> adds session-lifecycle hook events — `user_prompt_submit`,
+> `session_start`, `pre_compact`, `post_compact`, `stop_failure`,
+> `notification`, `session_end` — and a `permission_request` tool hook
+> on top of upstream's native `post_agent_turn` / `before_tool` /
+> `after_tool` hooks, so Hydrate can deliver pre-prompt recall and
+> lifecycle guardrails. With no fork hooks configured, behavior is
+> identical to upstream. See
 > [Lifecycle hooks (Hydrate fork)](#lifecycle-hooks-hydrate-fork).
 
 ### One-line install (recommended)
@@ -686,7 +688,7 @@ type = "before_tool"
 match = "bash"                       # tool-name matcher (fnmatch glob + `re:` regex escape, case-insensitive)
 command = "uv run python /path/to/guard-bash"
 timeout = 60.0                       # seconds; default 60 for all hooks
-strict = false                       # tool hooks only: turn failures into denials (before) / text-clears (after)
+strict = false                       # tool hooks only: turn failures into denials (before_tool / permission_request) / text-clears (after_tool)
 description = "Reject dangerous shell commands."
 ```
 
@@ -701,7 +703,7 @@ Every hook signals back via its **exit code** and **stdout**. The contract on st
 - **Exit `0`, empty stdout** — passthrough.
 - **Exit `0`, valid JSON object on stdout** — structured response. Universal top-level fields:
   - `system_message` (string, optional) — shown to the user in the UI.
-  - `decision` (`"allow"` | `"deny"`, optional, default `"allow"`) — the effect of `"deny"` depends on the hook type.
+  - `decision` (`"allow"` | `"deny"`, optional, default `"allow"`) — the effect of `"deny"` depends on the hook type. Exception: `permission_request` additionally accepts `"ask"` and **defaults to it** (see its section).
   - `reason` (string, optional) — accompanies `decision: "deny"`.
   - Event-specific payload under `hook_specific_output`.
 - **Exit `0`, non-empty but non-conforming stdout** (free-form text, broken JSON, JSON scalar/array, schema mismatch) — treated as a hook failure with the parse error as the message. Warning by default; escalated to deny / clear under `strict = true` on a tool hook.
@@ -737,6 +739,29 @@ Fires per tool call **if and only if the tool body actually ran**. `tool_status`
   - `decision: "deny"` + `reason` — replaces `tool_output_text` with `reason`. Pipeline continues; subsequent hooks see the replacement.
   - `hook_specific_output.additional_context` (string) — **appended** (with a `\n` separator) to `tool_output_text`. Composes with a same-hook deny: deny replaces first, then `additional_context` is appended to the replacement.
   - `system_message` — UI-only.
+
+#### `permission_request` (Hydrate fork)
+
+> Added by the [Hydrate](https://gethydrate.dev) fork. A **tool hook**
+> (accepts `match` / `strict`) like `before_tool` / `after_tool`.
+
+Fires per tool call whose permission verdict is ASK — after `before_tool`, **before** the `notification` hook and before the approval prompt. A hook can approve or decline on the user's behalf, or pass through to the normal prompt. The first hook to return an explicit decision wins (allow OR deny — `before_tool`'s first-deny-wins convention extended to both decisive outcomes); the rest of the chain is skipped. Does not fire when no approval is needed (permission `ALWAYS`/`NEVER`, `--yolo`, or a session rule already covering the call).
+
+- **Receives** (in addition to the session context): `tool_name`, `tool_call_id`, `tool_input` (serialized validated arguments, post-`before_tool`-rewrite), `required_permissions` (a list of objects — `scope`, `invocation_pattern`, `session_pattern`, `label` — describing the uncovered permissions the prompt would ask for).
+- **Can return** — `decision` for this hook type is three-valued and **defaults to `"ask"`**, so an observational hook echoing `{}` can never auto-approve:
+  - `decision: "allow"` — approve on the user's behalf. No prompt is shown and the `notification` hook does not fire; downstream is indistinguishable from an interactive "yes". No session rule is recorded — the approval covers this call only.
+  - `decision: "deny"` + `reason` — decline on the user's behalf. The tool is skipped exactly as if the user had declined, with `reason` as the model-visible feedback.
+  - `decision: "ask"` (or empty stdout / omitted `decision`) — pass through: next hook, then the normal notification + approval prompt flow.
+  - `system_message` — UI-only.
+- **Failures** (non-zero exit, timeout, non-conforming stdout) pass through by default; under `strict = true` they deny (same escalation convention as `before_tool`).
+
+> **Deliberate divergence from Claude Code**: Claude Code's
+> `PermissionRequest` hook only fires interactively. Vibe's
+> `permission_request` fires **even when no approval callback is
+> available** (headless / non-interactive runs, e.g. `-p` mode), so a
+> policy hook can auto-allow tools that Vibe would otherwise skip with
+> "Tool execution not permitted." A passthrough keeps the headless skip
+> behavior unchanged.
 
 #### Lifecycle hooks (Hydrate fork)
 
@@ -792,7 +817,7 @@ Fires when an agent turn aborts with an error (the model call failed or an unhan
 
 ##### `notification`
 
-Fires when Vibe is about to notify / prompt the user. Currently only `notification_type = "permission_prompt"`, fired immediately before the tool-approval prompt. Purely observational — it cannot delay or alter the approval flow.
+Fires when Vibe is about to notify / prompt the user. Currently only `notification_type = "permission_prompt"`, fired immediately before the tool-approval prompt (not fired when a `permission_request` hook already decided the call — no prompt is shown then). Purely observational — it cannot delay or alter the approval flow.
 
 - **Receives** (in addition to the session context): `notification_type`, `message`, `tool_name`, `tool_call_id` (the latter two are null for non-tool notifications).
 - **Can return**: nothing actionable. `system_message` is UI-only; `decision: "deny"` and `additional_context` are logged and ignored.

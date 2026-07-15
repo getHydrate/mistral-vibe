@@ -1850,6 +1850,34 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         tool_call_id: str,
         required_permissions: list[RequiredPermission],
     ) -> ToolDecision:
+        # permission_request fires first — before the notification hook
+        # and before the headless early-return — so an explicit hook
+        # decision replaces the prompt entirely. The first hook to return
+        # a decision wins (allow OR deny; before_tool's first-deny-wins
+        # convention extended to both decisive outcomes). Deliberate
+        # divergence from Claude Code (see README): the hook also fires
+        # when no approval_callback is set, so policy hooks can
+        # auto-allow tools in headless / non-interactive runs where Vibe
+        # would otherwise skip them.
+        hook_decision = await self._resolve_permission_request_hooks(
+            tool_name, args, tool_call_id, required_permissions
+        )
+        if hook_decision is not None:
+            if hook_decision.decision == "allow":
+                # Mirror a user approval (ApprovalResponse.YES) exactly so
+                # downstream is indistinguishable from an interactive yes.
+                return ToolDecision(
+                    verdict=ToolExecutionResponse.EXECUTE,
+                    approval_type=ToolPermission.ASK,
+                    feedback=None,
+                )
+            # Mirror a user decline: the reason (if any) reaches the
+            # model as the skip feedback.
+            return ToolDecision(
+                verdict=ToolExecutionResponse.SKIP,
+                approval_type=ToolPermission.ASK,
+                feedback=hook_decision.reason or None,
+            )
         if not self.approval_callback:
             return ToolDecision(
                 verdict=ToolExecutionResponse.SKIP,
