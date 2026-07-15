@@ -303,7 +303,11 @@ def main() -> None:
     # Must run before `cwd` is read and before run_cli so that session lookups
     # (-c / --resume picker) scope to the worktree directory.
     if args.worktree and not (args.setup or args.check_upgrade):
-        from vibe.core.worktree import WorktreeError, prepare_worktree_session
+        from vibe.core.worktree import (
+            WorktreeError,
+            announce_worktree_session,
+            prepare_worktree_session,
+        )
 
         rprint(f"[dim]Preparing worktree {args.worktree!r}...[/]", file=sys.stderr)
         try:
@@ -311,6 +315,9 @@ def main() -> None:
         except WorktreeError as e:
             rprint(f"[red]Error: {e}[/]")
             sys.exit(1)
+        # No AgentLoop exists yet; the announcement lets the loop fire the
+        # worktree_create hook once its hooks manager is up.
+        announce_worktree_session(worktree_session)
         target = worktree_session.path
         rprint(f"[dim]Using worktree: {target}[/]", file=sys.stderr)
         os.chdir(target)

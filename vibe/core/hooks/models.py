@@ -31,6 +31,7 @@ class HookType(StrEnum):
     SUBAGENT_START = auto()
     SUBAGENT_STOP = auto()
     PERMISSION_REQUEST = auto()
+    WORKTREE_CREATE = auto()
 
 
 # Tool hooks accept ``match`` / ``strict``; the lifecycle hooks below do not.
@@ -231,6 +232,20 @@ class SubagentStopInvocation(HookSessionContext):
     parent_transcript_path: str = ""
 
 
+class WorktreeCreateInvocation(HookSessionContext):
+    """Fired once per session running inside a ``--worktree`` checkout.
+    The worktree is prepared by the CLI entrypoint before the agent loop
+    (and its hooks manager) exists, so the event is delivered on the first
+    prompt — after the fact and therefore observational.
+    """
+
+    hook_event_name: Literal[HookType.WORKTREE_CREATE] = HookType.WORKTREE_CREATE
+    branch_name: str
+    worktree_path: str
+    # True when Vibe reused an existing worktree instead of creating one.
+    existing: bool = False
+
+
 class PermissionRequestInvocation(HookSessionContext):
     hook_event_name: Literal[HookType.PERMISSION_REQUEST] = (
         HookType.PERMISSION_REQUEST
@@ -257,6 +272,7 @@ HookInvocation = (
     | SubagentStartInvocation
     | SubagentStopInvocation
     | PermissionRequestInvocation
+    | WorktreeCreateInvocation
 )
 
 
@@ -317,6 +333,7 @@ def build_invocation(
             | HookType.SUBAGENT_START
             | HookType.SUBAGENT_STOP
             | HookType.PERMISSION_REQUEST
+            | HookType.WORKTREE_CREATE
         ):
             # Lifecycle invocations (and permission_request, which carries
             # required_permissions) have event-specific required fields

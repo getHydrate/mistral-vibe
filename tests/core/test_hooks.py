@@ -61,6 +61,7 @@ from vibe.core.hooks.models import (
     SubagentStartInvocation,
     SubagentStopInvocation,
     UserPromptSubmitInvocation,
+    WorktreeCreateInvocation,
     build_invocation,
 )
 from vibe.core.llm.exceptions import BackendError, PayloadSummary
@@ -3845,3 +3846,243 @@ class TestPermissionRequestAgentLoopIntegration:
         assert len(tool_results) == 1
         assert tool_results[0].skipped is False
         assert calls == ["bash"]
+
+
+# ---------------------------------------------------------------------------
+# worktree_create (Wave D)
+# ---------------------------------------------------------------------------
+
+
+def _make_prepared_worktree(tmp_path: Path, *, created: bool = True) -> Any:
+    from vibe.core.worktree import PreparedWorktree
+
+    return PreparedWorktree(
+        name="feature-x",
+        branch="feature-x",
+        root=tmp_path / "worktrees" / "feature-x",
+        path=tmp_path / "worktrees" / "feature-x",
+        repo_root=tmp_path / "repo",
+        base_commit="deadbeef",
+        created=created,
+        branch_created=created,
+    )
+
+
+@pytest.fixture
+def worktree_module() -> Any:
+    """The vibe.core.worktree module with the create announcement drained
+    before and after the test (module-level state must not leak across
+    tests).
+    """
+    from vibe.core import worktree
+
+    worktree.consume_worktree_create_announcement()
+    yield worktree
+    worktree.consume_worktree_create_announcement()
+
+
+class TestWorktreeCreateHookConfig:
+    def test_worktree_create_loads_from_toml(
+        self, config_dir: Path, config_hooks_enabled: VibeConfig
+    ) -> None:
+        _write_hooks_toml(
+            config_dir / "hooks.toml",
+            [{"name": "wc", "type": "worktree_create", "command": "true"}],
+        )
+        result = load_hooks_from_fs(config_hooks_enabled)
+        assert [h.type for h in result.hooks] == [HookType.WORKTREE_CREATE]
+        assert result.issues == []
+
+    def test_match_rejected_on_worktree_create(self) -> None:
+        with pytest.raises(ValueError, match="match is only valid for tool hooks"):
+            HookConfig(
+                name="x", type=HookType.WORKTREE_CREATE, command="echo ok", match="*"
+            )
+
+    def test_strict_rejected_on_worktree_create(self) -> None:
+        with pytest.raises(ValueError, match="strict is only valid for tool hooks"):
+            HookConfig(
+                name="x", type=HookType.WORKTREE_CREATE, command="echo ok", strict=True
+            )
+
+
+class TestWorktreeCreateHook:
+    def _invocation(self) -> WorktreeCreateInvocation:
+        return WorktreeCreateInvocation(
+            session_id="sess",
+            transcript_path="",
+            cwd=str(Path.cwd()),
+            branch_name="feature-x",
+            worktree_path="/tmp/worktrees/feature-x",
+            existing=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_hook_receives_payload(self, tmp_path: Path) -> None:
+        out = tmp_path / "worktree_create.json"
+        handler = HooksManager([
+            _make_hook(
+                name="wc",
+                command=_capture_cmd(out),
+                type=HookType.WORKTREE_CREATE,
+            )
+        ])
+        _ = [ev async for ev in handler.run(self._invocation())]
+        payload = json.loads(out.read_text())
+        assert payload["hook_event_name"] == "worktree_create"
+        assert payload["branch_name"] == "feature-x"
+        assert payload["worktree_path"] == "/tmp/worktrees/feature-x"
+        assert payload["existing"] is False
+
+    @pytest.mark.asyncio
+    async def test_deny_is_observational(self) -> None:
+        # The worktree already exists by the time the hook runs; deny is
+        # logged and ignored.
+        handler = HooksManager([
+            _make_hook(
+                name="wc", command=_deny_cmd("no"), type=HookType.WORKTREE_CREATE
+            )
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+        assert warnings[0].content and "ignored" in warnings[0].content
+        assert not any(isinstance(e, HookUserMessage) for e in events)
+
+
+class TestWorktreeCreateAgentLoopIntegration:
+    def _hooks(self, command: str) -> HookConfigResult:
+        return HookConfigResult(
+            hooks=[
+                _make_hook(
+                    name="wc", command=command, type=HookType.WORKTREE_CREATE
+                )
+            ],
+            issues=[],
+        )
+
+    @pytest.mark.asyncio
+    async def test_announced_worktree_fires_on_first_prompt(
+        self, tmp_path: Path, worktree_module: Any
+    ) -> None:
+        worktree_module.announce_worktree_session(_make_prepared_worktree(tmp_path))
+        out = tmp_path / "worktree_create.json"
+        agent_loop = build_test_agent_loop(
+            backend=FakeBackend(mock_llm_chunk(content="hi")),
+            hook_config_result=self._hooks(_capture_cmd(out)),
+        )
+        _ = [ev async for ev in agent_loop.act("hello")]
+
+        payload = json.loads(out.read_text())
+        assert payload["hook_event_name"] == "worktree_create"
+        assert payload["branch_name"] == "feature-x"
+        assert payload["worktree_path"] == str(
+            tmp_path / "worktrees" / "feature-x"
+        )
+        assert payload["existing"] is False
+
+    @pytest.mark.asyncio
+    async def test_reused_worktree_reports_existing_true(
+        self, tmp_path: Path, worktree_module: Any
+    ) -> None:
+        worktree_module.announce_worktree_session(
+            _make_prepared_worktree(tmp_path, created=False)
+        )
+        out = tmp_path / "worktree_create.json"
+        agent_loop = build_test_agent_loop(
+            backend=FakeBackend(mock_llm_chunk(content="hi")),
+            hook_config_result=self._hooks(_capture_cmd(out)),
+        )
+        _ = [ev async for ev in agent_loop.act("hello")]
+
+        assert json.loads(out.read_text())["existing"] is True
+
+    @pytest.mark.asyncio
+    async def test_fires_once_and_announcement_is_consumed(
+        self, tmp_path: Path, worktree_module: Any
+    ) -> None:
+        worktree_module.announce_worktree_session(_make_prepared_worktree(tmp_path))
+        log = tmp_path / "fires.log"
+        backend = FakeBackend([
+            [mock_llm_chunk(content="one")],
+            [mock_llm_chunk(content="two")],
+        ])
+        agent_loop = build_test_agent_loop(
+            backend=backend, hook_config_result=self._hooks(_append_cmd(log, "wc"))
+        )
+        _ = [ev async for ev in agent_loop.act("first")]
+        _ = [ev async for ev in agent_loop.act("second")]
+
+        # A second loop in the same process must not re-fire: the first
+        # loop consumed the announcement at construction time.
+        second_loop = build_test_agent_loop(
+            backend=FakeBackend(mock_llm_chunk(content="three")),
+            hook_config_result=self._hooks(_append_cmd(log, "wc")),
+        )
+        _ = [ev async for ev in second_loop.act("third")]
+
+        assert log.read_text().splitlines() == ["wc"]
+
+    @pytest.mark.asyncio
+    async def test_fires_before_session_start(
+        self, tmp_path: Path, worktree_module: Any
+    ) -> None:
+        worktree_module.announce_worktree_session(_make_prepared_worktree(tmp_path))
+        log = tmp_path / "order.log"
+        hooks = [
+            _make_hook(
+                name="wc",
+                command=_append_event_name_cmd(log),
+                type=HookType.WORKTREE_CREATE,
+            ),
+            _make_hook(
+                name="ss",
+                command=_append_event_name_cmd(log),
+                type=HookType.SESSION_START,
+            ),
+        ]
+        agent_loop = build_test_agent_loop(
+            backend=FakeBackend(mock_llm_chunk(content="hi")),
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        _ = [ev async for ev in agent_loop.act("hello")]
+
+        assert log.read_text().splitlines() == ["worktree_create", "session_start"]
+
+    @pytest.mark.asyncio
+    async def test_subagent_loop_does_not_consume_announcement(
+        self, tmp_path: Path, worktree_module: Any
+    ) -> None:
+        worktree_module.announce_worktree_session(_make_prepared_worktree(tmp_path))
+        log = tmp_path / "fires.log"
+
+        subagent_loop = build_test_agent_loop(
+            backend=FakeBackend(mock_llm_chunk(content="child")),
+            hook_config_result=self._hooks(_append_cmd(log, "sub")),
+            is_subagent=True,
+        )
+        _ = [ev async for ev in subagent_loop.act("child work")]
+        assert not log.exists()
+
+        main_loop = build_test_agent_loop(
+            backend=FakeBackend(mock_llm_chunk(content="main")),
+            hook_config_result=self._hooks(_append_cmd(log, "main")),
+        )
+        _ = [ev async for ev in main_loop.act("main work")]
+        assert log.read_text().splitlines() == ["main"]
+
+    @pytest.mark.asyncio
+    async def test_no_announcement_no_fire(
+        self, tmp_path: Path, worktree_module: Any
+    ) -> None:
+        out = tmp_path / "worktree_create.json"
+        agent_loop = build_test_agent_loop(
+            backend=FakeBackend(mock_llm_chunk(content="hi")),
+            hook_config_result=self._hooks(_capture_cmd(out)),
+        )
+        _ = [ev async for ev in agent_loop.act("hello")]
+        assert not out.exists()

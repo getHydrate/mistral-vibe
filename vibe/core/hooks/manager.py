@@ -26,6 +26,7 @@ from vibe.core.hooks._stop_failure import StopFailureHandler
 from vibe.core.hooks._subagent_start import SubagentStartHandler
 from vibe.core.hooks._subagent_stop import SubagentStopHandler
 from vibe.core.hooks._user_prompt_submit import UserPromptSubmitHandler
+from vibe.core.hooks._worktree_create import WorktreeCreateHandler
 from vibe.core.hooks.config import HookConfig
 from vibe.core.hooks.executor import HookExecutor
 from vibe.core.hooks.models import (
@@ -57,6 +58,7 @@ _HANDLERS: dict[HookType, HookHandler] = {
     HookType.SUBAGENT_START: SubagentStartHandler(),
     HookType.SUBAGENT_STOP: SubagentStopHandler(),
     HookType.PERMISSION_REQUEST: PermissionRequestHandler(),
+    HookType.WORKTREE_CREATE: WorktreeCreateHandler(),
 }
 
 

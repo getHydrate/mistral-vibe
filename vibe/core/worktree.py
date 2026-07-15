@@ -53,6 +53,26 @@ class WorktreeCleanupState:
         return tuple(reasons)
 
 
+# The CLI entrypoint prepares the --worktree checkout before the agent
+# loop (and its hooks manager) exists. It announces the prepared session
+# here; the first main AgentLoop consumes the announcement at
+# construction time and fires the worktree_create hook on its first
+# prompt.
+_pending_create_announcement: PreparedWorktree | None = None
+
+
+def announce_worktree_session(worktree: PreparedWorktree) -> None:
+    global _pending_create_announcement
+    _pending_create_announcement = worktree
+
+
+def consume_worktree_create_announcement() -> PreparedWorktree | None:
+    global _pending_create_announcement
+    worktree = _pending_create_announcement
+    _pending_create_announcement = None
+    return worktree
+
+
 def prepare_worktree(name: str, base: Path) -> Path:
     return prepare_worktree_session(name, base).path
 

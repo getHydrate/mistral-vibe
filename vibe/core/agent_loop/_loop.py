@@ -13,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import shutil
+import sys
 import threading
 from threading import Thread
 import time
@@ -199,6 +200,7 @@ if TYPE_CHECKING:
     from vibe.core.tools.mcp.pool import MCPConnectionPool
     from vibe.core.tools.mcp.registry import MCPRegistry
     from vibe.core.tools.mcp_sampling import MCPSamplingHandler
+    from vibe.core.worktree import PreparedWorktree
 
 
 class ToolExecutionResponse(StrEnum):
@@ -509,6 +511,20 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
         self._session_end_fired: bool = False
         self._turn_count: int = 0
         self._prompt_blocked: bool = False
+        # --worktree checkouts are prepared by the CLI entrypoint before
+        # any AgentLoop exists; the entrypoint leaves an announcement in
+        # vibe.core.worktree which the first main loop consumes here and
+        # fires as a worktree_create hook on its first prompt. The
+        # sys.modules guard keeps GitPython out of startups that never
+        # used --worktree: an announcement can only exist if the
+        # entrypoint already imported the module.
+        self._pending_worktree_create: PreparedWorktree | None = None
+        if not is_subagent and (
+            worktree_module := sys.modules.get("vibe.core.worktree")
+        ):
+            self._pending_worktree_create = (
+                worktree_module.consume_worktree_create_announcement()
+            )
 
         self.experiment_manager = ExperimentManager(
             client=RemoteEvalClient.from_settings(

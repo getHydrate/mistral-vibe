@@ -848,6 +848,15 @@ Fires once when a session ends. Purely observational — it cannot block teardow
 - **Receives** (in addition to the session context): `reason` (`"exit"`, `"signal"`, `"parent_close"`, `"error"`, or `"clear"`), `turn_count`, `error`.
 - **Can return**: nothing actionable. `system_message` is UI-only; `decision: "deny"` is logged and ignored.
 
+##### `worktree_create`
+
+Fires once, on the first prompt of a session running inside a `--worktree` checkout (creation or reuse alike). The worktree is prepared by the CLI entrypoint **before** the agent loop and its hooks manager exist, so the event is delivered after the fact and is purely observational — unlike Claude Code's `WorktreeCreate`, it cannot block or redirect the checkout.
+
+- **Receives** (in addition to the session context, whose `cwd` is already inside the worktree): `branch_name`, `worktree_path` (the worktree root), `existing` (`true` when Vibe reused an existing worktree instead of creating one).
+- **Can return**: nothing actionable. `system_message` is UI-only; `decision: "deny"` and `additional_context` are logged and ignored.
+
+> **No `worktree_remove` event.** Worktree cleanup runs in the CLI entrypoint *after* the agent session has fully torn down (`session_end` has already fired, the hooks manager is gone), is conditional on an interactive prompt when the worktree is dirty, and may legitimately end with the worktree kept. There is no live hook surface at that point, so the event is deliberately not implemented rather than fired speculatively. Approximate it by watching `session_end` (teardown) or by wrapping `vibe --worktree` in a script that inspects `$VIBE_HOME/worktrees` afterwards.
+
 ### Status line
 
 Vibe can render an external command's output as a one-line status row below the input bar:

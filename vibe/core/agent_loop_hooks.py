@@ -54,6 +54,7 @@ from vibe.core.hooks.models import (
     SubagentStopInvocation,
     ToolStatus,
     UserPromptSubmitInvocation,
+    WorktreeCreateInvocation,
 )
 from vibe.core.llm.format import ResolvedToolCall
 from vibe.core.logger import logger
@@ -74,6 +75,7 @@ if TYPE_CHECKING:
     from vibe.core.session.session_logger import SessionLogger
     from vibe.core.tools.permissions import RequiredPermission
     from vibe.core.types import AgentStats, BaseEvent, LLMMessage, MessageList
+    from vibe.core.worktree import PreparedWorktree
 
 
 # stop_failure invocations carry the stringified error; cap it so hook
@@ -108,6 +110,7 @@ class AgentLoopHooksMixin:
     stats: AgentStats
     messages: MessageList
     _pending_session_start_source: str | None
+    _pending_worktree_create: PreparedWorktree | None
     _prompt_blocked: bool
 
     def _handle_tool_response(
@@ -332,6 +335,25 @@ class AgentLoopHooksMixin:
             if isinstance(ev, HookEvent):
                 yield ev
 
+    async def _run_worktree_create_hooks(
+        self,
+        *,
+        branch_name: str,
+        worktree_path: str,
+        existing: bool,
+    ) -> AsyncGenerator[HookEvent]:
+        if not self._hooks_manager:
+            return
+        invocation = WorktreeCreateInvocation(
+            **self._hook_session_context().model_dump(),
+            branch_name=branch_name,
+            worktree_path=worktree_path,
+            existing=existing,
+        )
+        async for ev in self._hooks_manager.run(invocation):
+            if isinstance(ev, HookEvent):
+                yield ev
+
     async def _run_subagent_start_hooks(
         self,
         *,
@@ -445,7 +467,8 @@ class AgentLoopHooksMixin:
     async def _run_prompt_lifecycle_hooks(
         self, user_msg: str, message_id: str | None
     ) -> AsyncGenerator[BaseEvent]:
-        """Fire session_start (once per session) then user_prompt_submit.
+        """Fire worktree_create (once per --worktree process), session_start
+        (once per session), then user_prompt_submit.
 
         Injected context is appended to the conversation as user messages.
         On a user_prompt_submit denial, the reason is surfaced as an
@@ -453,6 +476,16 @@ class AgentLoopHooksMixin:
         abort the turn before the model runs.
         """
         from vibe.core.types import AssistantEvent, LLMMessage, Role
+
+        if self._pending_worktree_create is not None:
+            worktree = self._pending_worktree_create
+            self._pending_worktree_create = None
+            async for ev in self._run_worktree_create_hooks(
+                branch_name=worktree.branch,
+                worktree_path=str(worktree.root),
+                existing=not worktree.created,
+            ):
+                yield ev
 
         if self._pending_session_start_source is not None:
             source = self._pending_session_start_source

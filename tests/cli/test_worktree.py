@@ -298,3 +298,18 @@ def test_worktree_continue_scopes_to_worktree(tmp_path: Path) -> None:
         SessionLoader.find_latest_session(config, working_directory=repo_root)
         is not None
     )
+
+
+def test_announce_and_consume_worktree_create(git_repo: Repo, tmp_path: Path) -> None:
+    # The entrypoint announces the prepared session; the first main agent
+    # loop consumes it exactly once (see worktree_create hook).
+    from vibe.core.worktree import (
+        announce_worktree_session,
+        consume_worktree_create_announcement,
+    )
+
+    assert consume_worktree_create_announcement() is None
+    session = prepare_worktree_session("feature", tmp_path)
+    announce_worktree_session(session)
+    assert consume_worktree_create_announcement() is session
+    assert consume_worktree_create_announcement() is None
