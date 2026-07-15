@@ -22,6 +22,8 @@ from vibe.core.hooks._pre_compact import PreCompactHandler
 from vibe.core.hooks._session_end import SessionEndHandler
 from vibe.core.hooks._session_start import SessionStartHandler
 from vibe.core.hooks._stop_failure import StopFailureHandler
+from vibe.core.hooks._subagent_start import SubagentStartHandler
+from vibe.core.hooks._subagent_stop import SubagentStopHandler
 from vibe.core.hooks._user_prompt_submit import UserPromptSubmitHandler
 from vibe.core.hooks.config import HookConfig
 from vibe.core.hooks.executor import HookExecutor
@@ -51,6 +53,8 @@ _HANDLERS: dict[HookType, HookHandler] = {
     HookType.POST_COMPACT: PostCompactHandler(),
     HookType.STOP_FAILURE: StopFailureHandler(),
     HookType.NOTIFICATION: NotificationHandler(),
+    HookType.SUBAGENT_START: SubagentStartHandler(),
+    HookType.SUBAGENT_STOP: SubagentStopHandler(),
 }
 
 

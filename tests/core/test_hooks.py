@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from pathlib import Path
 import shlex
 import sys
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 import tomli_w
@@ -14,9 +16,10 @@ from tests.conftest import (
     build_test_vibe_config,
     make_test_models,
 )
-from tests.mock.utils import mock_llm_chunk
+from tests.mock.utils import collect_result, mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_tool import FakeTool, FakeToolArgs
+from vibe.core.agents.manager import AgentManager
 from vibe.core.agents.models import BuiltinAgentName
 from vibe.core.config import SessionLoggingConfig, VibeConfig
 from vibe.core.hooks._handler import HookOutputError, _parse_structured_response
@@ -52,17 +55,23 @@ from vibe.core.hooks.models import (
     SessionEndInvocation,
     SessionStartInvocation,
     StopFailureInvocation,
+    SubagentStartInvocation,
+    SubagentStopInvocation,
     UserPromptSubmitInvocation,
     build_invocation,
 )
 from vibe.core.llm.exceptions import BackendError, PayloadSummary
+from vibe.core.tools.base import BaseToolState, InvokeContext
+from vibe.core.tools.builtins.task import Task, TaskArgs, TaskToolConfig
 from vibe.core.types import (
     ApprovalResponse,
     AssistantEvent,
     ContextTooLongError,
     FunctionCall,
+    LLMMessage,
     RateLimitError,
     ResponseTooLongError,
+    Role,
     ToolCall,
     ToolResultEvent,
 )
@@ -2759,3 +2768,435 @@ class TestSessionStartResumeSource:
         cli_module._resume_previous_session(agent_loop, [], tmp_path)
 
         assert agent_loop._pending_session_start_source == "resume"
+
+
+# ---------------------------------------------------------------------------
+# Wave B: subagent_start / subagent_stop (parent-side task-tool observation)
+# ---------------------------------------------------------------------------
+
+
+def _append_event_name_cmd(log: Path) -> str:
+    """Hook command that appends the invocation's hook_event_name to *log*."""
+    body = (
+        "import sys, json; "
+        f"open({str(log)!r}, 'a').write("
+        "json.loads(sys.stdin.read())['hook_event_name'] + chr(10))"
+    )
+    return f"{sys.executable} -c {shlex.quote(body)}"
+
+
+class TestSubagentHookConfig:
+    def test_subagent_types_load_from_toml(
+        self, config_dir: Path, config_hooks_enabled: VibeConfig
+    ) -> None:
+        _write_hooks_toml(
+            config_dir / "hooks.toml",
+            [
+                {"name": "sas", "type": "subagent_start", "command": "true"},
+                {"name": "sap", "type": "subagent_stop", "command": "true"},
+            ],
+        )
+        result = load_hooks_from_fs(config_hooks_enabled)
+        assert [h.type for h in result.hooks] == [
+            HookType.SUBAGENT_START,
+            HookType.SUBAGENT_STOP,
+        ]
+        assert result.issues == []
+
+    def test_match_rejected_on_subagent_start(self) -> None:
+        with pytest.raises(ValueError, match="match is only valid for tool hooks"):
+            HookConfig(
+                name="x", type=HookType.SUBAGENT_START, command="echo ok", match="*"
+            )
+
+    def test_strict_rejected_on_subagent_stop(self) -> None:
+        with pytest.raises(ValueError, match="strict is only valid for tool hooks"):
+            HookConfig(
+                name="x", type=HookType.SUBAGENT_STOP, command="echo ok", strict=True
+            )
+
+
+class TestSubagentStartHook:
+    def _invocation(self) -> SubagentStartInvocation:
+        return SubagentStartInvocation(
+            session_id="parent-sess",
+            transcript_path="",
+            cwd=str(Path.cwd()),
+            agent_id="child-sess",
+            agent_type="explore",
+            task_description="look around",
+        )
+
+    @pytest.mark.asyncio
+    async def test_additional_context_is_injected(self) -> None:
+        handler = HooksManager([
+            _make_hook(
+                command=_context_cmd("guardrails"), type=HookType.SUBAGENT_START
+            )
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        injections = [e for e in events if isinstance(e, HookContextInjection)]
+        assert len(injections) == 1
+        assert injections[0].content == "guardrails"
+
+    @pytest.mark.asyncio
+    async def test_deny_is_ignored(self) -> None:
+        handler = HooksManager([
+            _make_hook(command=_deny_cmd("no"), type=HookType.SUBAGENT_START)
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        assert not any(isinstance(e, HookContextInjection) for e in events)
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+
+
+class TestSubagentStopHook:
+    def _invocation(self) -> SubagentStopInvocation:
+        return SubagentStopInvocation(
+            session_id="parent-sess",
+            transcript_path="/tmp/child/messages.jsonl",
+            cwd=str(Path.cwd()),
+            agent_id="child-sess",
+            agent_type="explore",
+            status="success",
+            turn_count=2,
+            parent_transcript_path="/tmp/parent/messages.jsonl",
+        )
+
+    @pytest.mark.asyncio
+    async def test_exit_0_emits_ok(self) -> None:
+        handler = HooksManager([
+            _make_hook(command="true", type=HookType.SUBAGENT_STOP)
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        ends = [e for e in events if isinstance(e, HookEndEvent)]
+        assert ends and ends[0].status == HookMessageSeverity.OK
+
+    @pytest.mark.asyncio
+    async def test_deny_is_ignored(self) -> None:
+        handler = HooksManager([
+            _make_hook(command=_deny_cmd("keep going"), type=HookType.SUBAGENT_STOP)
+        ])
+        events = [ev async for ev in handler.run(self._invocation())]
+        assert not any(isinstance(e, HookContextInjection) for e in events)
+        warnings = [
+            e
+            for e in events
+            if isinstance(e, HookEndEvent) and e.status == HookMessageSeverity.WARNING
+        ]
+        assert len(warnings) == 1
+
+
+class TestSubagentHookRunners:
+    def _loop_with(self, hooks: list[HookConfig]) -> Any:
+        return build_test_agent_loop(
+            backend=FakeBackend(),
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+
+    @pytest.mark.asyncio
+    async def test_subagent_start_payload_carries_parent_session(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "start.json"
+        agent_loop = self._loop_with([
+            _make_hook(
+                name="cap", command=_capture_cmd(out), type=HookType.SUBAGENT_START
+            )
+        ])
+        _ = [
+            ev
+            async for ev in agent_loop._run_subagent_start_hooks(
+                agent_id="child-1",
+                agent_type="explore",
+                task_description="x" * 600,
+            )
+        ]
+        payload = json.loads(out.read_text())
+        assert payload["hook_event_name"] == "subagent_start"
+        assert payload["session_id"] == agent_loop.session_id
+        assert payload["agent_id"] == "child-1"
+        assert payload["agent_type"] == "explore"
+        # The task prompt is truncated to 500 chars on the wire.
+        assert payload["task_description"] == "x" * 500
+
+    @pytest.mark.asyncio
+    async def test_subagent_stop_payload_has_child_transcript_override(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "stop.json"
+        agent_loop = self._loop_with([
+            _make_hook(
+                name="cap", command=_capture_cmd(out), type=HookType.SUBAGENT_STOP
+            )
+        ])
+        _ = [
+            ev
+            async for ev in agent_loop._run_subagent_stop_hooks(
+                agent_id="child-1",
+                agent_type="explore",
+                status="failure",
+                turn_count=3,
+                child_transcript_path="/tmp/child/messages.jsonl",
+            )
+        ]
+        payload = json.loads(out.read_text())
+        assert payload["hook_event_name"] == "subagent_stop"
+        assert payload["session_id"] == agent_loop.session_id
+        assert payload["agent_id"] == "child-1"
+        assert payload["agent_type"] == "explore"
+        assert payload["status"] == "failure"
+        assert payload["turn_count"] == 3
+        # transcript_path points at the CHILD transcript; the parent's own
+        # transcript rides along in parent_transcript_path.
+        assert payload["transcript_path"] == "/tmp/child/messages.jsonl"
+        assert payload["parent_transcript_path"] == ""
+
+
+class TestTaskToolSubagentHooks:
+    def _parent_and_ctx(
+        self, hooks: list[HookConfig]
+    ) -> tuple[Any, InvokeContext]:
+        parent = build_test_agent_loop(
+            backend=FakeBackend(),
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        config = build_test_vibe_config()
+        ctx = InvokeContext(
+            tool_call_id="call-1",
+            agent_manager=AgentManager(lambda: config),
+            session_id=parent.session_id,
+            run_subagent_start_hooks=parent._run_subagent_start_hooks,
+            run_subagent_stop_hooks=parent._run_subagent_stop_hooks,
+        )
+        return parent, ctx
+
+    def _tool(self) -> Task:
+        return Task(config_getter=lambda: TaskToolConfig(), state=BaseToolState())
+
+    def _mock_child(self, act: Any, messages: list[LLMMessage]) -> MagicMock:
+        child = MagicMock()
+        child.act = act
+        child.messages = messages
+        child.session_id = "child-sess"
+        child.set_approval_callback = MagicMock()
+        child.aclose = AsyncMock()
+        child.session_logger.enabled = False
+        return child
+
+    @pytest.mark.asyncio
+    async def test_subagent_start_fires_in_parent_before_child_runs(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "start.json"
+        parent, ctx = self._parent_and_ctx([
+            _make_hook(
+                name="cap", command=_capture_cmd(out), type=HookType.SUBAGENT_START
+            )
+        ])
+        hook_fired_before_act: list[bool] = []
+
+        async def mock_act(task: str) -> Any:
+            hook_fired_before_act.append(out.exists())
+            yield AssistantEvent(content="done")
+
+        child = self._mock_child(
+            mock_act, [LLMMessage(role=Role.assistant, content="a")]
+        )
+        with patch("vibe.core.tools.builtins.task.AgentLoop", return_value=child):
+            args = TaskArgs(task="explore the code", agent="explore")
+            result = await collect_result(self._tool().run(args, ctx))
+
+        assert result.completed is True
+        assert hook_fired_before_act == [True]
+        payload = json.loads(out.read_text())
+        assert payload["hook_event_name"] == "subagent_start"
+        assert payload["session_id"] == parent.session_id
+        assert payload["agent_id"] == "child-sess"
+        assert payload["agent_type"] == "explore"
+        assert payload["task_description"] == "explore the code"
+
+    @pytest.mark.asyncio
+    async def test_subagent_start_context_injected_into_child(self) -> None:
+        _parent, ctx = self._parent_and_ctx([
+            _make_hook(
+                name="inject",
+                command=_context_cmd("BRIEFING"),
+                type=HookType.SUBAGENT_START,
+            )
+        ])
+        messages: list[LLMMessage] = []
+        injections_visible_at_act: list[int] = []
+
+        async def mock_act(task: str) -> Any:
+            injections_visible_at_act.append(
+                sum(
+                    1
+                    for m in messages
+                    if m.injected and m.content == "BRIEFING"
+                )
+            )
+            yield AssistantEvent(content="done")
+
+        child = self._mock_child(mock_act, messages)
+        with patch("vibe.core.tools.builtins.task.AgentLoop", return_value=child):
+            args = TaskArgs(task="task", agent="explore")
+            await collect_result(self._tool().run(args, ctx))
+
+        # The injected user message was in the child conversation before
+        # the child loop ran.
+        assert injections_visible_at_act == [1]
+
+    @pytest.mark.asyncio
+    async def test_subagent_stop_fires_on_success_with_child_transcript(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "stop.json"
+        _parent, ctx = self._parent_and_ctx([
+            _make_hook(
+                name="cap", command=_capture_cmd(out), type=HookType.SUBAGENT_STOP
+            )
+        ])
+
+        async def mock_act(task: str) -> Any:
+            yield AssistantEvent(content="done")
+
+        messages = [
+            LLMMessage(role=Role.assistant, content="one"),
+            LLMMessage(role=Role.assistant, content="two"),
+        ]
+        child = self._mock_child(mock_act, messages)
+        child.session_logger.enabled = True
+        child.session_logger.session_dir = tmp_path
+        child.session_logger.messages_filepath = tmp_path / "child-messages.jsonl"
+        with patch("vibe.core.tools.builtins.task.AgentLoop", return_value=child):
+            args = TaskArgs(task="task", agent="explore")
+            await collect_result(self._tool().run(args, ctx))
+
+        payload = json.loads(out.read_text())
+        assert payload["hook_event_name"] == "subagent_stop"
+        assert payload["agent_id"] == "child-sess"
+        assert payload["status"] == "success"
+        assert payload["turn_count"] == 2
+        assert payload["transcript_path"] == str(
+            (tmp_path / "child-messages.jsonl").resolve()
+        )
+        assert payload["parent_transcript_path"] == ""
+
+    @pytest.mark.asyncio
+    async def test_subagent_stop_fires_on_child_failure(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "stop.json"
+        _parent, ctx = self._parent_and_ctx([
+            _make_hook(
+                name="cap", command=_capture_cmd(out), type=HookType.SUBAGENT_STOP
+            )
+        ])
+
+        async def mock_act(task: str) -> Any:
+            yield AssistantEvent(content="starting")
+            raise RuntimeError("boom")
+
+        child = self._mock_child(mock_act, [])
+        with patch("vibe.core.tools.builtins.task.AgentLoop", return_value=child):
+            args = TaskArgs(task="task", agent="explore")
+            result = await collect_result(self._tool().run(args, ctx))
+
+        assert result.completed is False
+        payload = json.loads(out.read_text())
+        assert payload["status"] == "failure"
+        assert payload["agent_id"] == "child-sess"
+
+    @pytest.mark.asyncio
+    async def test_subagent_stop_fires_on_cancellation(
+        self, tmp_path: Path
+    ) -> None:
+        out = tmp_path / "stop.json"
+        _parent, ctx = self._parent_and_ctx([
+            _make_hook(
+                name="cap", command=_capture_cmd(out), type=HookType.SUBAGENT_STOP
+            )
+        ])
+        started = asyncio.Event()
+
+        async def mock_act(task: str) -> Any:
+            started.set()
+            yield AssistantEvent(content="working")
+            await asyncio.sleep(3600)
+
+        child = self._mock_child(mock_act, [])
+        with patch("vibe.core.tools.builtins.task.AgentLoop", return_value=child):
+            args = TaskArgs(task="task", agent="explore")
+            run_task = asyncio.create_task(
+                collect_result(self._tool().run(args, ctx))
+            )
+            await started.wait()
+            await asyncio.sleep(0.05)
+            run_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await run_task
+
+        # The stop hooks are shielded from the cancellation; give the
+        # subprocess a moment to land.
+        for _ in range(200):
+            if out.exists():
+                break
+            await asyncio.sleep(0.025)
+        payload = json.loads(out.read_text())
+        assert payload["hook_event_name"] == "subagent_stop"
+        assert payload["status"] == "cancelled"
+        assert payload["agent_id"] == "child-sess"
+
+    @pytest.mark.asyncio
+    async def test_child_session_events_fire_once_alongside_subagent_events(
+        self, tmp_path: Path
+    ) -> None:
+        log = tmp_path / "events.log"
+        hooks = [
+            _make_hook(
+                name="ss",
+                command=_append_event_name_cmd(log),
+                type=HookType.SESSION_START,
+            ),
+            _make_hook(
+                name="se",
+                command=_append_event_name_cmd(log),
+                type=HookType.SESSION_END,
+            ),
+            _make_hook(
+                name="sas",
+                command=_append_event_name_cmd(log),
+                type=HookType.SUBAGENT_START,
+            ),
+            _make_hook(
+                name="sap",
+                command=_append_event_name_cmd(log),
+                type=HookType.SUBAGENT_STOP,
+            ),
+        ]
+        _parent, ctx = self._parent_and_ctx(hooks)
+        child = build_test_agent_loop(
+            backend=FakeBackend(mock_llm_chunk(content="child done")),
+            hook_config_result=HookConfigResult(hooks=hooks, issues=[]),
+        )
+        with patch(
+            "vibe.core.tools.builtins.task.AgentLoop",
+            new=lambda **kwargs: child,
+        ):
+            args = TaskArgs(task="task", agent="explore")
+            result = await collect_result(self._tool().run(args, ctx))
+
+        assert result.completed is True
+        # The parent fires subagent_start/subagent_stop; the child fires
+        # its own session_start/session_end exactly once — no duplication.
+        assert log.read_text().splitlines() == [
+            "subagent_start",
+            "session_start",
+            "session_end",
+            "subagent_stop",
+        ]

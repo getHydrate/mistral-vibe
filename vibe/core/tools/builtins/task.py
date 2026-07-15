@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator
 from contextlib import aclosing, suppress
 import fnmatch
@@ -9,6 +10,7 @@ from pydantic import BaseModel, Field
 from vibe.core.agent_loop import AgentLoop
 from vibe.core.agents.models import AgentType, BuiltinAgentName
 from vibe.core.config import SessionLoggingConfig, VibeConfig
+from vibe.core.hooks.models import HookContextInjection, HookEvent
 from vibe.core.tools.base import (
     BaseTool,
     BaseToolConfig,
@@ -26,11 +28,21 @@ from vibe.core.tools.ui import (
 )
 from vibe.core.types import (
     AssistantEvent,
+    LLMMessage,
     Role,
     ToolCallEvent,
     ToolResultEvent,
     ToolStreamEvent,
 )
+
+
+async def _drain_hook_events(events: AsyncGenerator[HookEvent]) -> None:
+    """Consume a hook-runner generator for its side effects. The task tool
+    has no way to surface hook UI events mid-tool-call, so they are
+    drained and discarded.
+    """
+    async for _ in events:
+        pass
 
 
 class TaskArgs(BaseModel):
@@ -116,26 +128,9 @@ class Task(
                 f"This is a security constraint to prevent recursive spawning."
             )
 
-        session_logging = SessionLoggingConfig(
-            save_dir=str(ctx.session_dir / "agents") if ctx.session_dir else "",
-            session_prefix=args.agent,
-            enabled=ctx.session_dir is not None,
-        )
-        base_config = VibeConfig.load(session_logging=session_logging)
-        subagent_loop = AgentLoop(
-            config=base_config,
-            agent_name=args.agent,
-            launch_context=ctx.launch_context,
-            is_subagent=True,
-            defer_heavy_init=True,
-            permission_store=ctx.permission_store,
-            hook_config_result=ctx.hook_config_result,
-        )
-        if ctx.session_id:
-            subagent_loop.parent_session_id = ctx.session_id
+        subagent_loop = self._build_subagent_loop(args, ctx)
 
-        if ctx and ctx.approval_callback:
-            subagent_loop.set_approval_callback(ctx.approval_callback)
+        await self._fire_subagent_start_hooks(ctx, subagent_loop, args)
 
         task_text = args.task
         if ctx.scratchpad_dir:
@@ -147,6 +142,9 @@ class Task(
 
         accumulated_response: list[str] = []
         completed = True
+        # Reported to the parent-side subagent_stop hooks from the finally
+        # below: "success", "failure", or "cancelled".
+        status = "success"
         try:
             async with aclosing(subagent_loop.act(task_text)) as events:
                 async for event in events:
@@ -171,7 +169,11 @@ class Task(
                 msg.role == Role.assistant for msg in subagent_loop.messages
             )
 
+        except (asyncio.CancelledError, GeneratorExit):
+            status = "cancelled"
+            raise
         except Exception as e:
+            status = "failure"
             completed = False
             accumulated_response.append(f"\n[Subagent error: {e}]")
             turns_used = sum(
@@ -180,9 +182,92 @@ class Task(
         finally:
             with suppress(Exception):
                 await subagent_loop.aclose()
+            await self._fire_subagent_stop_hooks(
+                ctx, subagent_loop, agent_type=args.agent, status=status
+            )
 
         yield TaskResult(
             response="".join(accumulated_response),
             turns_used=turns_used,
             completed=completed,
         )
+
+    def _build_subagent_loop(self, args: TaskArgs, ctx: InvokeContext) -> AgentLoop:
+        session_logging = SessionLoggingConfig(
+            save_dir=str(ctx.session_dir / "agents") if ctx.session_dir else "",
+            session_prefix=args.agent,
+            enabled=ctx.session_dir is not None,
+        )
+        base_config = VibeConfig.load(session_logging=session_logging)
+        subagent_loop = AgentLoop(
+            config=base_config,
+            agent_name=args.agent,
+            launch_context=ctx.launch_context,
+            is_subagent=True,
+            defer_heavy_init=True,
+            permission_store=ctx.permission_store,
+            hook_config_result=ctx.hook_config_result,
+        )
+        if ctx.session_id:
+            subagent_loop.parent_session_id = ctx.session_id
+
+        if ctx.approval_callback:
+            subagent_loop.set_approval_callback(ctx.approval_callback)
+        return subagent_loop
+
+    async def _fire_subagent_start_hooks(
+        self, ctx: InvokeContext, subagent_loop: AgentLoop, args: TaskArgs
+    ) -> None:
+        """Parent-side subagent_start observation, fired from the parent
+        loop's hooks manager (the child fires its own session events). An
+        allowing hook's additional_context is injected into the child
+        conversation before it runs.
+        """
+        if ctx.run_subagent_start_hooks is None:
+            return
+        async for hook_ev in ctx.run_subagent_start_hooks(
+            agent_id=subagent_loop.session_id,
+            agent_type=args.agent,
+            task_description=args.task,
+        ):
+            if isinstance(hook_ev, HookContextInjection):
+                subagent_loop.messages.append(
+                    LLMMessage(role=Role.user, content=hook_ev.content, injected=True)
+                )
+
+    async def _fire_subagent_stop_hooks(
+        self,
+        ctx: InvokeContext,
+        subagent_loop: AgentLoop,
+        *,
+        agent_type: str,
+        status: str,
+    ) -> None:
+        """Parent-side subagent_stop observation — fires on success,
+        failure, and cancellation alike. Shielded so a cancellation
+        arriving during teardown cannot kill the audit; hook failures
+        never mask the original outcome.
+        """
+        if ctx.run_subagent_stop_hooks is None:
+            return
+        turn_count = sum(
+            msg.role == Role.assistant for msg in subagent_loop.messages
+        )
+        child_transcript_path = ""
+        session_logger = subagent_loop.session_logger
+        if session_logger.enabled and session_logger.session_dir is not None:
+            child_transcript_path = str(session_logger.messages_filepath.resolve())
+        try:
+            await asyncio.shield(
+                _drain_hook_events(
+                    ctx.run_subagent_stop_hooks(
+                        agent_id=subagent_loop.session_id,
+                        agent_type=agent_type,
+                        status=status,
+                        turn_count=turn_count,
+                        child_transcript_path=child_transcript_path,
+                    )
+                )
+            )
+        except (Exception, asyncio.CancelledError):
+            pass

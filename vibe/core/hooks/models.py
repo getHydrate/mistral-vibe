@@ -28,6 +28,8 @@ class HookType(StrEnum):
     POST_COMPACT = auto()
     STOP_FAILURE = auto()
     NOTIFICATION = auto()
+    SUBAGENT_START = auto()
+    SUBAGENT_STOP = auto()
 
 
 # Tool hooks accept ``match`` / ``strict``; the lifecycle hooks below do not.
@@ -182,6 +184,37 @@ class NotificationInvocation(HookSessionContext):
     tool_call_id: str | None = None
 
 
+class SubagentStartInvocation(HookSessionContext):
+    """Fired in the PARENT session right before a task-tool subagent runs;
+    ``session_id`` / ``transcript_path`` are the parent's.
+    """
+
+    hook_event_name: Literal[HookType.SUBAGENT_START] = HookType.SUBAGENT_START
+    # The child loop's session_id.
+    agent_id: str
+    # The subagent profile name (e.g. "explore"); None if unknown.
+    agent_type: str | None = None
+    # The task prompt, truncated to 500 characters.
+    task_description: str | None = None
+
+
+class SubagentStopInvocation(HookSessionContext):
+    """Fired in the PARENT session when a task-tool subagent finishes.
+    ``session_id`` is the parent's, but ``transcript_path`` points at the
+    CHILD transcript; the parent's rides in ``parent_transcript_path``.
+    """
+
+    hook_event_name: Literal[HookType.SUBAGENT_STOP] = HookType.SUBAGENT_STOP
+    # The child loop's session_id.
+    agent_id: str
+    agent_type: str | None = None
+    # One of: "success", "failure", "cancelled".
+    status: str
+    # The child's completed assistant turns.
+    turn_count: int
+    parent_transcript_path: str = ""
+
+
 HookInvocation = (
     PostAgentTurnInvocation
     | BeforeToolInvocation
@@ -193,6 +226,8 @@ HookInvocation = (
     | PostCompactInvocation
     | StopFailureInvocation
     | NotificationInvocation
+    | SubagentStartInvocation
+    | SubagentStopInvocation
 )
 
 
@@ -250,6 +285,8 @@ def build_invocation(
             | HookType.POST_COMPACT
             | HookType.STOP_FAILURE
             | HookType.NOTIFICATION
+            | HookType.SUBAGENT_START
+            | HookType.SUBAGENT_STOP
         ):
             # Lifecycle invocations carry event-specific required fields
             # (prompt / source / reason / turn_count / …) and are constructed
@@ -335,9 +372,11 @@ class HookTextReplacement(BaseModel):
 
 
 class HookContextInjection(BaseModel):
-    """user_prompt_submit / session_start / pre_compact / post_compact
-    allow: ``content`` (the ``hook_specific_output.additional_context`` of
-    an allowing hook) is injected into the conversation as a user message.
+    """user_prompt_submit / session_start / pre_compact / post_compact /
+    subagent_start allow: ``content`` (the
+    ``hook_specific_output.additional_context`` of an allowing hook) is
+    injected into the conversation as a user message (for subagent_start,
+    into the child subagent's conversation).
     """
 
     content: str

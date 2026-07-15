@@ -1755,6 +1755,8 @@ class AgentLoop(AgentLoopHooksMixin):  # noqa: PLR0904
                 hook_config_result=self._hook_config_result,
                 session_id=self.session_id,
                 mcp_pool=self._mcp_pool,
+                run_subagent_start_hooks=self._run_subagent_start_hooks,
+                run_subagent_stop_hooks=self._run_subagent_stop_hooks,
             ),
             **tool_call.args_dict,
         ):

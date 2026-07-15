@@ -47,6 +47,8 @@ from vibe.core.hooks.models import (
     SessionEndInvocation,
     SessionStartInvocation,
     StopFailureInvocation,
+    SubagentStartInvocation,
+    SubagentStopInvocation,
     ToolStatus,
     UserPromptSubmitInvocation,
 )
@@ -72,6 +74,9 @@ if TYPE_CHECKING:
 # stop_failure invocations carry the stringified error; cap it so hook
 # subprocesses never receive an unbounded payload on stdin.
 _STOP_FAILURE_MESSAGE_MAX_CHARS = 2000
+
+# subagent_start invocations carry the task prompt; same rationale.
+_TASK_DESCRIPTION_MAX_CHARS = 500
 
 
 class _BeforeToolResolution(NamedTuple):
@@ -317,6 +322,61 @@ class AgentLoopHooksMixin:
             message=message,
             tool_name=tool_name,
             tool_call_id=tool_call_id,
+        )
+        async for ev in self._hooks_manager.run(invocation):
+            if isinstance(ev, HookEvent):
+                yield ev
+
+    async def _run_subagent_start_hooks(
+        self,
+        *,
+        agent_id: str,
+        agent_type: str | None = None,
+        task_description: str | None = None,
+    ) -> AsyncGenerator[HookEvent | HookContextInjection]:
+        """Parent-side subagent_start. ``HookContextInjection`` yields are
+        destined for the CHILD conversation (the task tool injects them
+        before the child runs).
+        """
+        if not self._hooks_manager:
+            return
+        if task_description is not None:
+            task_description = task_description[:_TASK_DESCRIPTION_MAX_CHARS]
+        invocation = SubagentStartInvocation(
+            **self._hook_session_context().model_dump(),
+            agent_id=agent_id,
+            agent_type=agent_type,
+            task_description=task_description,
+        )
+        async for ev in self._hooks_manager.run(invocation):
+            if isinstance(ev, (HookEvent, HookContextInjection)):
+                yield ev
+
+    async def _run_subagent_stop_hooks(
+        self,
+        *,
+        agent_id: str,
+        agent_type: str | None = None,
+        status: str,
+        turn_count: int,
+        child_transcript_path: str = "",
+    ) -> AsyncGenerator[HookEvent]:
+        """Parent-side subagent_stop. ``transcript_path`` is overridden to
+        the CHILD transcript; the parent's own transcript rides along as
+        ``parent_transcript_path``.
+        """
+        if not self._hooks_manager:
+            return
+        base = self._hook_session_context().model_dump()
+        parent_transcript_path = base.pop("transcript_path")
+        invocation = SubagentStopInvocation(
+            **base,
+            transcript_path=child_transcript_path,
+            parent_transcript_path=parent_transcript_path,
+            agent_id=agent_id,
+            agent_type=agent_type,
+            status=status,
+            turn_count=turn_count,
         )
         async for ev in self._hooks_manager.run(invocation):
             if isinstance(ev, HookEvent):

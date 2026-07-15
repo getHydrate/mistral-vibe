@@ -14,6 +14,7 @@ from typing import (
     TYPE_CHECKING,
     Any,
     ClassVar,
+    Protocol,
     Union,
     cast,
     get_args,
@@ -31,7 +32,7 @@ from vibe.core.utils.io import read_safe
 if TYPE_CHECKING:
     from vibe.core.agents.manager import AgentManager
     from vibe.core.config import AnyVibeConfig
-    from vibe.core.hooks.models import HookConfigResult
+    from vibe.core.hooks.models import HookConfigResult, HookContextInjection, HookEvent
     from vibe.core.skills.manager import SkillManager
     from vibe.core.telemetry.types import LaunchContext
     from vibe.core.tools.mcp.pool import MCPConnectionPool
@@ -45,6 +46,37 @@ if TYPE_CHECKING:
     )
 
 ARGS_COUNT = 4
+
+
+class SubagentStartHookRunner(Protocol):
+    """Parent-loop callback firing ``subagent_start`` hooks
+    (``AgentLoopHooksMixin._run_subagent_start_hooks``). Yielded
+    ``HookContextInjection`` items are meant for the child conversation.
+    """
+
+    def __call__(
+        self,
+        *,
+        agent_id: str,
+        agent_type: str | None = None,
+        task_description: str | None = None,
+    ) -> AsyncGenerator[HookEvent | HookContextInjection]: ...
+
+
+class SubagentStopHookRunner(Protocol):
+    """Parent-loop callback firing ``subagent_stop`` hooks
+    (``AgentLoopHooksMixin._run_subagent_stop_hooks``).
+    """
+
+    def __call__(
+        self,
+        *,
+        agent_id: str,
+        agent_type: str | None = None,
+        status: str,
+        turn_count: int,
+        child_transcript_path: str = "",
+    ) -> AsyncGenerator[HookEvent]: ...
 
 
 @dataclass
@@ -68,6 +100,10 @@ class InvokeContext:
     hook_config_result: HookConfigResult | None = field(default=None)
     session_id: str | None = field(default=None)
     mcp_pool: MCPConnectionPool | None = field(default=None)
+    # Parent-loop hook runners so the task tool can fire subagent_start /
+    # subagent_stop in the PARENT session around a child subagent run.
+    run_subagent_start_hooks: SubagentStartHookRunner | None = field(default=None)
+    run_subagent_stop_hooks: SubagentStopHookRunner | None = field(default=None)
 
 
 class ToolError(Exception):

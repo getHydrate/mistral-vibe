@@ -27,11 +27,13 @@ Mistral Vibe is a command-line coding assistant powered by Mistral's models. It 
 > [!NOTE]
 > This is the **[Hydrate](https://gethydrate.dev) fork** of Mistral Vibe,
 > tracking upstream (currently **v2.16.1**). It is a strict superset: it
-> adds four session-lifecycle hook events — `user_prompt_submit`,
-> `session_start`, `pre_compact`, `session_end` — on top of upstream's
-> native `post_agent_turn` / `before_tool` / `after_tool` hooks, so Hydrate
-> can deliver pre-prompt recall and lifecycle guardrails. With no
-> lifecycle hooks configured, behavior is identical to upstream. See
+> adds nine session-lifecycle hook events — `user_prompt_submit`,
+> `session_start`, `pre_compact`, `post_compact`, `stop_failure`,
+> `notification`, `subagent_start`, `subagent_stop`, `session_end` — on
+> top of upstream's native `post_agent_turn` / `before_tool` /
+> `after_tool` hooks, so Hydrate can deliver pre-prompt recall and
+> lifecycle guardrails. With no lifecycle hooks configured, behavior is
+> identical to upstream. See
 > [Lifecycle hooks (Hydrate fork)](#lifecycle-hooks-hydrate-fork).
 
 ### One-line install (recommended)
@@ -795,6 +797,22 @@ Fires when an agent turn aborts with an error (the model call failed or an unhan
 Fires when Vibe is about to notify / prompt the user. Currently only `notification_type = "permission_prompt"`, fired immediately before the tool-approval prompt. Purely observational — it cannot delay or alter the approval flow.
 
 - **Receives** (in addition to the session context): `notification_type`, `message`, `tool_name`, `tool_call_id` (the latter two are null for non-tool notifications).
+- **Can return**: nothing actionable. `system_message` is UI-only; `decision: "deny"` and `additional_context` are logged and ignored.
+
+##### `subagent_start`
+
+Fires in the **parent** session immediately before a task-tool subagent runs. The child loop fires its own `session_start` / `session_end`; `subagent_start` / `subagent_stop` are the parent-side observation of the same run.
+
+- **Receives** (in addition to the session context, which carries the PARENT `session_id` and transcript): `agent_id` (the child loop's session id), `agent_type` (the subagent profile name, e.g. `"explore"`), `task_description` (the task prompt, truncated to 500 chars).
+- **Can return**:
+  - `hook_specific_output.additional_context` (string) — injected into the **child** conversation as a user message before the subagent runs.
+  - `system_message` — UI-only. (`decision: "deny"` is logged and ignored.)
+
+##### `subagent_stop`
+
+Fires in the **parent** session when a task-tool subagent finishes — on success, failure, and cancellation alike. Purely observational — the child is already closed.
+
+- **Receives** (in addition to the session context, which carries the PARENT `session_id`): `agent_id`, `agent_type`, `status` (`"success"`, `"failure"`, or `"cancelled"`), `turn_count` (the child's completed assistant turns), `transcript_path` (**overridden to the child's transcript**), `parent_transcript_path` (the parent's own transcript).
 - **Can return**: nothing actionable. `system_message` is UI-only; `decision: "deny"` and `additional_context` are logged and ignored.
 
 ##### `session_end`
