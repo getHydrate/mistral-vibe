@@ -164,6 +164,7 @@ def _make_tool_hook(
     *,
     type: HookType,
     match: str | None = None,
+    match_status: str | None = None,
     timeout: float | None = None,
     strict: bool = False,
 ) -> HookConfig:
@@ -172,6 +173,7 @@ def _make_tool_hook(
         type=type,
         command=command,
         match=match,
+        match_status=match_status,  # type: ignore[arg-type]
         timeout=timeout,
         strict=strict,
     )
@@ -1176,6 +1178,116 @@ class TestAfterToolHook:
             initial_text="sensitive data",
         )
         assert final_text == ""
+
+
+class TestAfterToolStatusMatching:
+    """`match_status` filters after_tool hooks by `tool_status` (unset =
+    all statuses), covering Claude Code's PostToolUseFailure without a
+    separate event.
+    """
+
+    async def _statuses_fired(
+        self,
+        ctx: HookSessionContext,
+        hook: HookConfig,
+        statuses: tuple[str, ...] = ("success", "failure", "cancelled"),
+        tool_name: str = "bash",
+    ) -> list[str]:
+        handler = HooksManager([hook])
+        fired: list[str] = []
+        for status in statuses:
+            events = [
+                ev
+                async for ev in _run(
+                    handler,
+                    HookType.AFTER_TOOL,
+                    ctx,
+                    tool_name=tool_name,
+                    tool_call_id="tc1",
+                    tool_input={},
+                    tool_status=status,
+                    tool_output=None,
+                    tool_error=None,
+                    duration_ms=1.0,
+                )
+            ]
+            if any(isinstance(e, HookStartEvent) for e in events):
+                fired.append(status)
+        return fired
+
+    @pytest.mark.asyncio
+    async def test_match_status_failure_fires_only_on_failure(
+        self, ctx: HookSessionContext
+    ) -> None:
+        hook = _make_tool_hook(
+            "on-fail", "echo ok", type=HookType.AFTER_TOOL, match_status="failure"
+        )
+        assert await self._statuses_fired(ctx, hook) == ["failure"]
+
+    @pytest.mark.asyncio
+    async def test_match_status_unset_fires_on_all_statuses(
+        self, ctx: HookSessionContext
+    ) -> None:
+        hook = _make_tool_hook("always", "echo ok", type=HookType.AFTER_TOOL)
+        assert await self._statuses_fired(ctx, hook) == [
+            "success",
+            "failure",
+            "cancelled",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_match_status_combines_with_name_match(
+        self, ctx: HookSessionContext
+    ) -> None:
+        hook = _make_tool_hook(
+            "bash-fail",
+            "echo ok",
+            type=HookType.AFTER_TOOL,
+            match="bash",
+            match_status="failure",
+        )
+        # Right name, right status.
+        assert await self._statuses_fired(ctx, hook, tool_name="bash") == ["failure"]
+        # Wrong name never fires, regardless of status.
+        assert await self._statuses_fired(ctx, hook, tool_name="grep") == []
+
+    def test_match_status_parses_from_config(self) -> None:
+        hook = HookConfig(
+            name="on-fail",
+            type=HookType.AFTER_TOOL,
+            command="echo ok",
+            match_status="failure",
+        )
+        assert hook.match_status == "failure"
+
+    def test_match_status_rejects_unknown_value(self) -> None:
+        with pytest.raises(ValueError):
+            HookConfig(
+                name="bad",
+                type=HookType.AFTER_TOOL,
+                command="echo ok",
+                match_status="exploded",  # type: ignore[arg-type]
+            )
+
+    @pytest.mark.parametrize(
+        "hook_type",
+        [
+            HookType.POST_AGENT_TURN,
+            HookType.BEFORE_TOOL,
+            HookType.PERMISSION_REQUEST,
+            HookType.SESSION_START,
+        ],
+    )
+    def test_match_status_forbidden_on_other_types(self, hook_type: HookType) -> None:
+        with pytest.raises(
+            ValueError, match="match_status is only valid for after_tool"
+        ):
+            HookConfig(
+                name="bad",
+                type=hook_type,
+                command="echo ok",
+                match_status="failure",
+            )
 
 
 class TestStrictValidation:

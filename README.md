@@ -735,6 +735,8 @@ Fires per tool call, **before** the user permission prompt. First deny short-cir
 
 Fires per tool call **if and only if the tool body actually ran**. `tool_status` is `success`, `failure`, or `cancelled` (cancellation during the tool body — cancellation is shielded so audit hooks still run). Does not fire when the tool never executed: `before_tool` denial, user denial at the approval prompt, permission `NEVER`, or cancellation before the body started.
 
+In addition to the tool-name `match`, an `after_tool` TOML entry accepts an optional `match_status = "success" | "failure" | "cancelled"` — the hook then fires only for that `tool_status` (unset fires on all). The two matchers combine: `match = "bash"` + `match_status = "failure"` runs only on failing bash calls. `match_status = "failure"` covers Claude Code's `PostToolUseFailure` without a separate event.
+
 - **Receives** (in addition to the session context): `tool_name`, `tool_call_id`, `tool_input` (post-rewrite), `tool_status`, `tool_output` (structured result dict; null on failure), `tool_output_text` (the running text the LLM will see, mutable by prior hooks), `tool_error`, `duration_ms`.
 - **Can return**:
   - `decision: "deny"` + `reason` — replaces `tool_output_text` with `reason`. Pipeline continues; subsequent hooks see the replacement.

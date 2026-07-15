@@ -53,6 +53,8 @@ class HookConfig(BaseModel):
     type: HookType
     command: str
     match: str | None = None
+    # after_tool only: fire solely for this tool_status (unset = all).
+    match_status: ToolStatus | None = None
     timeout: float | None = None
     strict: bool = False
     description: str | None = None
@@ -82,6 +84,11 @@ class HookConfig(BaseModel):
             raise ValueError(
                 "strict is only valid for tool hooks"
                 " (before_tool / after_tool / permission_request)"
+            )
+        if self.match_status is not None and self.type is not HookType.AFTER_TOOL:
+            raise ValueError(
+                "match_status is only valid for after_tool hooks"
+                " (only they observe a tool_status)"
             )
         if self.timeout is None:
             self.timeout = _DEFAULT_HOOK_TIMEOUT

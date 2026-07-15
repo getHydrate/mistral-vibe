@@ -39,7 +39,10 @@ class AfterToolHandler(HookHandler):
     """
 
     def matches(self, hook: HookConfig, invocation: HookInvocation) -> bool:
-        return name_matches(_as_after(invocation).tool_name, [hook.match or "*"])
+        inv = _as_after(invocation)
+        if not name_matches(inv.tool_name, [hook.match or "*"]):
+            return False
+        return hook.match_status is None or inv.tool_status == hook.match_status
 
     def external_attributes(self, invocation: HookInvocation) -> HookExternalAttrs:
         inv = _as_after(invocation)
