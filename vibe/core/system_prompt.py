@@ -9,7 +9,7 @@ from string import Template
 import subprocess
 from typing import TYPE_CHECKING
 
-from vibe.core.config import VibeConfig
+from vibe.core.config import AnyVibeConfig, VibeConfig
 from vibe.core.config.harness_files import get_harness_files_manager
 from vibe.core.experiments import ExperimentName
 from vibe.core.logger import logger
@@ -56,6 +56,8 @@ class ProjectContextProvider:
             cwd=self.root_path,
             stdin=subprocess.DEVNULL if is_windows() else None,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=timeout,
         )
 
@@ -139,8 +141,8 @@ class ProjectContextProvider:
         except Exception as e:
             return f"Error getting git status: {e}"
 
-    def get_full_context(self, *, include_git_status: bool = True) -> str:
-        git_status = self.get_git_status() if include_git_status else ""
+    def get_full_context(self) -> str:
+        git_status = self.get_git_status()
 
         template = UtilityPrompt.PROJECT_CONTEXT.read()
         return Template(template).safe_substitute(
@@ -210,6 +212,12 @@ def _get_available_skills_section(skill_manager: SkillManager) -> str:
         "You have access to the following skills. When a task matches a skill's description,",
         "use the `skill` tool if available to load the full skill instructions, if it is not available, read the files manually if they exist.",
         "",
+        "When a user message is exactly `/skill-name` (optionally followed by extra",
+        "instructions), the user has explicitly invoked that skill. Its instructions are",
+        "loaded for you automatically: you will see a `skill` tool call and result",
+        "immediately after that message. Treat the loaded content as the active",
+        "instructions and act on it — you do not need to call the `skill` tool yourself.",
+        "",
         "<available_skills>",
     ]
 
@@ -255,7 +263,7 @@ def _get_scratchpad_section(scratchpad_dir: Path | None) -> str | None:
 
 
 def _resolve_system_prompt(
-    config: VibeConfig, experiment_manager: ExperimentManager | None
+    config: AnyVibeConfig, experiment_manager: ExperimentManager | None
 ) -> str:
     default_prompt_id = VibeConfig.model_fields["system_prompt_id"].default
     if config.system_prompt_id != default_prompt_id:
@@ -305,13 +313,12 @@ def _get_headless_section() -> str:
     )
 
 
-def get_universal_system_prompt(  # noqa: PLR0912
+def get_universal_system_prompt(
     tool_manager: ToolManager,
-    config: VibeConfig,
+    config: AnyVibeConfig,
     skill_manager: SkillManager,
     agent_manager: AgentManager,
     *,
-    include_git_status: bool = True,
     scratchpad_dir: Path | None = None,
     headless: bool = False,
     experiment_manager: ExperimentManager | None = None,
@@ -329,12 +336,6 @@ def get_universal_system_prompt(  # noqa: PLR0912
 
     if config.include_prompt_detail:
         sections.append(_get_os_system_prompt())
-        tool_prompts = []
-        for tool_class in tool_manager.available_tools.values():
-            if prompt := tool_class.get_tool_prompt():
-                tool_prompts.append(prompt)
-        if tool_prompts:
-            sections.append("\n---\n".join(tool_prompts))
 
         skills_section = _get_available_skills_section(skill_manager)
         if skills_section:
@@ -356,7 +357,7 @@ def get_universal_system_prompt(  # noqa: PLR0912
         else:
             context = ProjectContextProvider(
                 config=config.project_context, root_path=Path.cwd()
-            ).get_full_context(include_git_status=include_git_status)
+            ).get_full_context()
 
         sections.append(context)
 

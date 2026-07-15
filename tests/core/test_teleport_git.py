@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from git import Repo
 import pytest
 
 from vibe.core.teleport.errors import (
@@ -12,14 +13,16 @@ from vibe.core.teleport.errors import (
 from vibe.core.teleport.git import GitRepoInfo, GitRepository
 
 
-def make_mock_remote(url: str) -> MagicMock:
+def make_mock_remote(url: str, name: str = "origin") -> MagicMock:
     remote = MagicMock()
+    remote.name = name
     remote.urls = [url]
     return remote
 
 
 def make_mock_repo(
     urls: list[str] | None = None,
+    remote_names: list[str] | None = None,
     commit: str | None = "abc123",
     branch: str | None = "main",
     is_detached: bool = False,
@@ -27,7 +30,13 @@ def make_mock_repo(
 ) -> MagicMock:
     mock = MagicMock()
     if urls:
-        mock.remotes = [make_mock_remote(url) for url in urls]
+        names = remote_names or [
+            "origin" if index == 0 else f"remote-{index}"
+            for index, _ in enumerate(urls)
+        ]
+        mock.remotes = [
+            make_mock_remote(url, names[index]) for index, url in enumerate(urls)
+        ]
     else:
         mock.remotes = []
     mock.head.commit.hexsha = commit
@@ -37,8 +46,19 @@ def make_mock_repo(
     mock.git.branch.return_value = ""
     mock.git.rev_list.return_value = "0"
     mock.git.rev_parse.return_value = "abc123"
+    mock.index.path = str(Path("/tmp/mock-index"))
     mock.remote.return_value = make_mock_remote(urls[0] if urls else "")
     return mock
+
+
+def make_real_repo(workdir: Path) -> Repo:
+    repo = Repo.init(workdir, initial_branch="main")
+    repo.config_writer().set_value("user", "name", "Tester").release()
+    repo.config_writer().set_value("user", "email", "t@example.com").release()
+    (workdir / "tracked.txt").write_text("base\n")
+    repo.index.add(["tracked.txt"])
+    repo.index.commit("initial")
+    return repo
 
 
 class TestGitRepositoryParseGithubUrl:
@@ -172,6 +192,7 @@ class TestGitRepositoryGetInfo:
         with patch.object(repo, "_repo_or_raise", return_value=mock):
             info = await repo.get_info()
             assert info == GitRepoInfo(
+                remote_name="origin",
                 remote_url="https://github.com/owner/repo.git",
                 owner="owner",
                 repo="repo",
@@ -179,6 +200,35 @@ class TestGitRepositoryGetInfo:
                 commit="abc123def456",
                 diff="diff content",
             )
+
+    @pytest.mark.asyncio
+    async def test_returns_remote_default_branch_on_success(
+        self, repo: GitRepository
+    ) -> None:
+        mock = make_mock_repo(urls=["git@github.com:owner/repo.git"], branch="feature")
+        with (
+            patch.object(repo, "_repo_or_raise", return_value=mock),
+            patch.object(
+                repo, "_get_remote_default_branch", AsyncMock(return_value="origin/dev")
+            ),
+        ):
+            info = await repo.get_info()
+
+        assert info.branch == "feature"
+        assert info.default_branch == "dev"
+
+    @pytest.mark.asyncio
+    async def test_returns_matched_github_remote_name(
+        self, repo: GitRepository
+    ) -> None:
+        mock = make_mock_repo(
+            urls=["git@gitlab.com:owner/repo.git", "git@github.com:owner/repo.git"],
+            remote_names=["origin", "hub"],
+        )
+        with patch.object(repo, "_repo_or_raise", return_value=mock):
+            info = await repo.get_info()
+            assert info.remote_name == "hub"
+            assert info.remote_url == "https://github.com/owner/repo.git"
 
     @pytest.mark.asyncio
     async def test_handles_detached_head(self, repo: GitRepository) -> None:
@@ -190,6 +240,22 @@ class TestGitRepositoryGetInfo:
         with patch.object(repo, "_repo_or_raise", return_value=mock):
             info = await repo.get_info()
             assert info.branch is None
+
+
+class TestGitRepositoryGetDiff:
+    @pytest.mark.asyncio
+    async def test_includes_untracked_files_without_mutating_index(
+        self, tmp_path: Path
+    ) -> None:
+        source_repo = make_real_repo(tmp_path)
+        (tmp_path / "new.txt").write_text("hello\n")
+        status_before = source_repo.git.status("--short")
+
+        async with GitRepository(tmp_path) as git_repo:
+            diff = await git_repo._get_diff(source_repo)
+
+        assert "diff --git a/new.txt b/new.txt" in diff
+        assert source_repo.git.status("--short") == status_before
 
 
 class TestGitRepositoryIsCommitPushed:

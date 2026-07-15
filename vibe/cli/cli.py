@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from collections.abc import Callable
 from pathlib import Path
 import sys
+from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 from rich import print as rprint
@@ -12,46 +14,52 @@ import tomli_w
 
 from vibe import __version__
 from vibe.cli.terminal_detect import detect_terminal
-from vibe.cli.textual_ui.app import StartupOptions, run_textual_ui
 from vibe.cli.update_notifier import (
     FileSystemUpdateCacheRepository,
+    PyPIUpdateGateway,
     UpdateCacheRepository,
+    UpdateError,
+    UpdateGateway,
     get_pending_update_from_cache,
+    get_update_if_available,
     mark_update_as_dismissed,
 )
 from vibe.core.agent_loop import AgentLoop, TeleportError
-from vibe.core.agents.models import BuiltinAgentName
+from vibe.core.cache_store import FileSystemVibeCodeCacheStore
 from vibe.core.config import MissingAPIKeyError, VibeConfig, load_dotenv_values
 from vibe.core.config.harness_files import get_harness_files_manager
 from vibe.core.hooks.config import HookConfigResult, load_hooks_from_fs
 from vibe.core.logger import logger
-from vibe.core.paths import HISTORY_FILE
-from vibe.core.programmatic import run_programmatic
+from vibe.core.paths import HISTORY_FILE, WORKTREES_DIR
+from vibe.core.sentry import init_sentry
 from vibe.core.session import last_session_pointer
 from vibe.core.session.session_loader import SessionLoader
-from vibe.core.telemetry.build_metadata import build_entrypoint_metadata
-from vibe.core.telemetry.types import EntrypointMetadata
+from vibe.core.telemetry.build_metadata import build_launch_context
+from vibe.core.telemetry.types import LaunchContext
 from vibe.core.tracing import setup_tracing
 from vibe.core.trusted_folders import find_trustable_files, trusted_folders_manager
 from vibe.core.types import LLMMessage, OutputFormat, Role
 from vibe.core.utils import ConversationLimitException
-from vibe.setup.onboarding import run_onboarding
-from vibe.setup.update_prompt import UpdatePromptResult, ask_update_prompt
+
+# The TUI app, onboarding, update prompt, and programmatic runner are each
+# imported at their call site: every launch needs at most one of them, and
+# they are too heavy to load speculatively at startup.
+
+if TYPE_CHECKING:
+    from vibe.setup.update_prompt import UpdatePromptMode
 
 
-def _build_cli_entrypoint_metadata() -> EntrypointMetadata:
-    return build_entrypoint_metadata(
+def _build_cli_launch_context() -> LaunchContext:
+    return build_launch_context(
         agent_entrypoint="cli",
         agent_version=__version__,
         client_name="vibe_cli",
         client_version=__version__,
+        terminal_emulator=detect_terminal(),
     )
 
 
 def get_initial_agent_name(args: argparse.Namespace, config: VibeConfig) -> str:
-    if args.auto_approve:
-        return BuiltinAgentName.AUTO_APPROVE
-
     return args.agent or config.default_agent
 
 
@@ -89,7 +97,10 @@ def load_config_or_exit(*, interactive: bool) -> VibeConfig:
                 file=sys.stderr,
             )
             sys.exit(1)
-        run_onboarding(entrypoint_metadata=_build_cli_entrypoint_metadata())
+
+        from vibe.setup.onboarding import run_onboarding
+
+        run_onboarding(launch_context=_build_cli_launch_context())
         return VibeConfig.load()
     except ValidationError as e:
         rprint(f"[yellow]{_format_config_validation_error(e)}[/]")
@@ -169,6 +180,11 @@ def load_session(
                 f"[red]No previous sessions found in "
                 f"{config.session_logging.save_dir} for {cwd=}[/]"
             )
+            if cwd.is_relative_to(WORKTREES_DIR.path.resolve()):
+                rprint(
+                    "[yellow]This worktree has no sessions yet. Start a new one, "
+                    "or use --resume <ID> to continue an existing session here.[/]"
+                )
             sys.exit(1)
     elif args.resume is True:
         return None
@@ -228,6 +244,8 @@ def _run_programmatic_mode(
         sys.exit(1)
     output_format = OutputFormat(args.output if hasattr(args, "output") else "text")
 
+    from vibe.core.programmatic import run_programmatic
+
     try:
         final_response = run_programmatic(
             config=config,
@@ -241,6 +259,7 @@ def _run_programmatic_mode(
             teleport=args.teleport and config.vibe_code_enabled,
             headless=True,
             hook_config_result=hook_config_result,
+            terminal_emulator=detect_terminal(),
         )
         if final_response:
             print(final_response)
@@ -256,31 +275,68 @@ def _run_programmatic_mode(
         sys.exit(1)
 
 
-def _maybe_run_startup_update_prompt(
-    config: VibeConfig, repository: UpdateCacheRepository
+def _run_interactive_mode(
+    args: argparse.Namespace,
+    config: VibeConfig,
+    initial_agent_name: str,
+    hook_config_result: HookConfigResult,
+    loaded_session: tuple[list[LLMMessage], Path] | None,
+    stdin_prompt: str | None,
+    update_cache_repository: UpdateCacheRepository,
 ) -> None:
-    if not config.enable_update_checks:
-        return
+    from vibe.cli.textual_ui.app import StartupOptions, run_textual_ui
 
     try:
-        latest_version = asyncio.run(
-            get_pending_update_from_cache(repository, __version__)
+        agent_loop = AgentLoop(
+            config,
+            agent_name=initial_agent_name,
+            enable_streaming=True,
+            launch_context=_build_cli_launch_context(),
+            defer_heavy_init=True,
+            hook_config_result=hook_config_result,
+            cache_store=FileSystemVibeCodeCacheStore(),
+            force_bypass_tool_permissions=args.auto_approve,
         )
-    except OSError as exc:
-        logger.debug("Failed to read pending update from cache", exc_info=exc)
-        return
+    except ValueError as e:
+        rprint(f"[red]Error:[/] {e}")
+        sys.exit(1)
 
-    if latest_version is None:
-        return
+    if loaded_session:
+        _resume_previous_session(agent_loop, *loaded_session)
 
-    result = ask_update_prompt(__version__, latest_version, theme=config.theme)
+    run_textual_ui(
+        agent_loop=agent_loop,
+        update_cache_repository=update_cache_repository,
+        startup=StartupOptions(
+            initial_prompt=args.initial_prompt or stdin_prompt,
+            teleport_on_start=args.teleport,
+            show_resume_picker=args.resume is True,
+            is_resuming_session=loaded_session is not None,
+        ),
+    )
+
+
+def _show_update_prompt(
+    repository: UpdateCacheRepository,
+    latest_version: str,
+    *,
+    theme: str | None,
+    dismiss_on_continue: bool,
+    prompt_mode: UpdatePromptMode,
+) -> None:
+    from vibe.setup.update_prompt import UpdatePromptResult, ask_update_prompt
+
+    result = ask_update_prompt(
+        __version__, latest_version, theme=theme, prompt_mode=prompt_mode
+    )
 
     match result:
         case UpdatePromptResult.CONTINUE:
-            try:
-                asyncio.run(mark_update_as_dismissed(repository, latest_version))
-            except OSError as exc:
-                logger.debug("Failed to persist dismissed update", exc_info=exc)
+            if dismiss_on_continue:
+                try:
+                    asyncio.run(mark_update_as_dismissed(repository, latest_version))
+                except OSError as exc:
+                    logger.debug("Failed to persist dismissed update", exc_info=exc)
             return
         case UpdatePromptResult.QUIT:
             sys.exit(0)
@@ -301,59 +357,136 @@ def _maybe_run_startup_update_prompt(
             sys.exit(1)
 
 
-def run_cli(args: argparse.Namespace) -> None:
+def _maybe_run_startup_update_prompt(
+    config: VibeConfig, repository: UpdateCacheRepository
+) -> None:
+    if not config.enable_update_checks:
+        return
+
+    try:
+        latest_version = asyncio.run(
+            get_pending_update_from_cache(repository, __version__)
+        )
+    except OSError as exc:
+        logger.debug("Failed to read pending update from cache", exc_info=exc)
+        return
+
+    if latest_version is None:
+        return
+
+    from vibe.setup.update_prompt import UpdatePromptMode
+
+    _show_update_prompt(
+        repository,
+        latest_version,
+        theme=config.theme,
+        dismiss_on_continue=True,
+        prompt_mode=UpdatePromptMode.STARTUP,
+    )
+
+
+def _run_check_upgrade(
+    repository: UpdateCacheRepository,
+    *,
+    update_notifier: UpdateGateway | None = None,
+    theme: str | None = None,
+) -> None:
+    from vibe.setup.update_prompt import UpdatePromptMode
+
+    notifier = update_notifier or PyPIUpdateGateway(project_name="mistral-vibe")
+    try:
+        update = asyncio.run(
+            get_update_if_available(
+                update_notifier=notifier,
+                current_version=__version__,
+                update_cache_repository=repository,
+                force_check=True,
+            )
+        )
+    except UpdateError as exc:
+        rprint(f"[red]✗ Update check failed:[/] {exc.message}")
+        sys.exit(1)
+    except OSError as exc:
+        logger.debug("Failed to persist forced update check", exc_info=exc)
+        rprint("[red]✗ Update check failed while writing the update cache.[/]")
+        sys.exit(1)
+
+    if update is None:
+        rprint(f"[green]Vibe is already up to date ({__version__}).[/]")
+        return
+
+    _show_update_prompt(
+        repository,
+        update.latest_version,
+        theme=theme,
+        dismiss_on_continue=False,
+        prompt_mode=UpdatePromptMode.CHECK_UPGRADE,
+    )
+
+
+def run_cli(
+    args: argparse.Namespace,
+    *,
+    resolve_trusted_folder: Callable[[], None] | None = None,
+) -> None:
+    sentry_enabled = False
+
     load_dotenv_values()
     bootstrap_config_files()
 
     if args.setup:
-        run_onboarding(entrypoint_metadata=_build_cli_entrypoint_metadata())
+        from vibe.setup.onboarding import run_onboarding
+
+        run_onboarding(launch_context=_build_cli_launch_context())
         sys.exit(0)
 
     try:
+        update_cache_repository = FileSystemUpdateCacheRepository()
+        if getattr(args, "check_upgrade", False):
+            from vibe.setup.update_prompt import load_update_prompt_theme
+
+            _run_check_upgrade(
+                update_cache_repository, theme=load_update_prompt_theme()
+            )
+            sys.exit(0)
+
         is_interactive = args.prompt is None
         config = load_config_or_exit(interactive=is_interactive)
-        update_cache_repository = FileSystemUpdateCacheRepository()
 
         if is_interactive:
             _maybe_run_startup_update_prompt(config, update_cache_repository)
+            if resolve_trusted_folder is not None:
+                resolve_trusted_folder()
+                config = load_config_or_exit(interactive=True)
 
+        sentry_enabled = init_sentry(
+            config,
+            headless=not is_interactive,
+            launch_context=_build_cli_launch_context(),
+        )
         initial_agent_name = get_initial_agent_name(args, config)
+        if args.auto_approve:
+            config.bypass_tool_permissions = True
         hook_config_result = load_hooks_from_fs(config)
         setup_tracing(config)
 
         if args.enabled_tools:
             config.enabled_tools = args.enabled_tools
+        if args.disabled_tools:
+            config.disabled_tools = [*config.disabled_tools, *args.disabled_tools]
 
         loaded_session = load_session(args, config)
 
         stdin_prompt = get_prompt_from_stdin()
         if is_interactive:
-            try:
-                agent_loop = AgentLoop(
-                    config,
-                    agent_name=initial_agent_name,
-                    enable_streaming=True,
-                    entrypoint_metadata=_build_cli_entrypoint_metadata(),
-                    terminal_emulator=detect_terminal(),
-                    defer_heavy_init=True,
-                    hook_config_result=hook_config_result,
-                )
-            except ValueError as e:
-                rprint(f"[red]Error:[/] {e}")
-                sys.exit(1)
-
-            if loaded_session:
-                _resume_previous_session(agent_loop, *loaded_session)
-
-            run_textual_ui(
-                agent_loop=agent_loop,
+            _run_interactive_mode(
+                args=args,
+                config=config,
+                initial_agent_name=initial_agent_name,
+                hook_config_result=hook_config_result,
+                loaded_session=loaded_session,
+                stdin_prompt=stdin_prompt,
                 update_cache_repository=update_cache_repository,
-                startup=StartupOptions(
-                    initial_prompt=args.initial_prompt or stdin_prompt,
-                    teleport_on_start=args.teleport,
-                    show_resume_picker=args.resume is True,
-                    is_resuming_session=loaded_session is not None,
-                ),
             )
         else:
             _run_programmatic_mode(
@@ -368,3 +501,9 @@ def run_cli(args: argparse.Namespace) -> None:
     except (KeyboardInterrupt, EOFError):
         rprint("\n[dim]Bye![/]")
         sys.exit(0)
+    finally:
+        if sentry_enabled:
+            import sentry_sdk
+
+            if sentry_sdk.is_initialized():
+                sentry_sdk.flush(timeout=5)

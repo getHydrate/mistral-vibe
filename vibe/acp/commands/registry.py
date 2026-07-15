@@ -7,16 +7,12 @@ type OnCommandsChanged = Callable[[], Awaitable[None]]
 
 
 @dataclass(frozen=True)
-class AcpCommandAvailabilityContext:
-    """Context used to decide whether a command should be advertised."""
-
+class AcpCommandContext:
     vibe_code_enabled: bool = False
-
-    def is_teleport_available(self) -> bool:
-        return self.vibe_code_enabled
+    experimental_vibe_code_project_picker_enabled: bool = False
 
 
-type CommandAvailability = Callable[[AcpCommandAvailabilityContext], bool]
+type CommandAvailability = Callable[[AcpCommandContext], bool]
 
 
 @dataclass(frozen=True)
@@ -34,24 +30,32 @@ class AcpCommand:
 class AcpCommandRegistry:
     """Registry of ACP commands. Notifies listeners when commands change."""
 
-    availability_context: AcpCommandAvailabilityContext = field(
-        default_factory=AcpCommandAvailabilityContext
-    )
+    vibe_code_enabled: bool = False
+    experimental_vibe_code_project_picker_enabled: bool = False
     _commands: dict[str, AcpCommand] = field(default_factory=dict)
     _on_changed: OnCommandsChanged | None = None
+    _context: AcpCommandContext = field(init=False, default_factory=AcpCommandContext)
 
     def __post_init__(self) -> None:
-        if not self._commands:
-            self._commands = {
-                name: command
-                for name, command in _build_commands().items()
-                if self._is_available(command)
-            }
+        self.refresh(
+            AcpCommandContext(
+                vibe_code_enabled=self.vibe_code_enabled,
+                experimental_vibe_code_project_picker_enabled=self.experimental_vibe_code_project_picker_enabled,
+            )
+        )
+
+    def refresh(self, context: AcpCommandContext) -> None:
+        self._context = context
+        self._commands = {
+            name: command
+            for name, command in _build_commands().items()
+            if self._is_available(command)
+        }
 
     def _is_available(self, command: AcpCommand) -> bool:
         if command.is_available is None:
             return True
-        return command.is_available(self.availability_context)
+        return command.is_available(self._context)
 
     def set_on_changed(self, callback: OnCommandsChanged) -> None:
         self._on_changed = callback
@@ -91,11 +95,17 @@ def _build_commands() -> dict[str, AcpCommand]:
             description="Show path to current session log directory",
             handler="_handle_log",
         ),
+        "mcp": AcpCommand(
+            name="mcp",
+            description="Show MCP OAuth status, login guidance, or log out an OAuth MCP server",
+            handler="_handle_mcp",
+            input_hint="status | login <alias> | logout <alias>",
+        ),
         "teleport": AcpCommand(
             name="teleport",
             description="Teleport session to Vibe Code Web",
             handler="_handle_teleport",
-            is_available=AcpCommandAvailabilityContext.is_teleport_available,
+            is_available=lambda ctx: ctx.vibe_code_enabled,
         ),
         "proxy-setup": AcpCommand(
             name="proxy-setup",

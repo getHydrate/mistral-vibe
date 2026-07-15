@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import platform
+import re
 import time
 from typing import Any, ClassVar, Literal
 
@@ -7,9 +9,11 @@ from textual import events
 from textual.binding import Binding
 from textual.message import Message
 from textual.widgets import TextArea
+from textual.widgets.text_area import Location, Selection
 
 from vibe.cli.autocompletion.base import CompletionResult
 from vibe.cli.commands import CommandRegistry
+from vibe.cli.constants import CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM
 from vibe.cli.textual_ui.external_editor import ExternalEditor
 from vibe.cli.textual_ui.widgets.chat_input.completion_manager import (
     MultiCompletionManager,
@@ -27,8 +31,14 @@ from vibe.cli.voice_manager.voice_manager_port import (
 
 InputMode = Literal["!", "/", ">", "&"]
 
+_WORD = re.compile(r"\w+")
+_DOUBLE_CLICK = 2
+_TRIPLE_CLICK = 3
+
 
 class ChatTextArea(TextArea):
+    ALLOW_SELECT: ClassVar[bool] = False
+
     BINDINGS: ClassVar[list[Binding]] = [
         Binding(
             "shift+enter,ctrl+j",
@@ -40,6 +50,23 @@ class ChatTextArea(TextArea):
         Binding("shift+backspace", "delete_left", "Delete character left", show=False),
         Binding("shift+delete", "delete_right", "Delete character right", show=False),
         Binding("ctrl+g", "open_external_editor", "External Editor", show=False),
+        # Ctrl+V triggers an explicit clipboard-image paste on platforms where
+        # we support it. On other platforms the binding is not registered, so
+        # Textual's default text-paste action handles the key instead and the
+        # user never discovers a feature that wouldn't work for them.
+        *(
+            [
+                Binding(
+                    "ctrl+v",
+                    "paste_image_from_clipboard",
+                    "Paste image from clipboard",
+                    show=False,
+                    priority=True,
+                )
+            ]
+            if platform.system() == CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM
+            else []
+        ),
     ]
 
     DEFAULT_MODE: ClassVar[Literal[">"]] = ">"
@@ -65,6 +92,21 @@ class ChatTextArea(TextArea):
             self.mode = mode
             super().__init__()
 
+    class ClipboardImagePasted(Message):
+        """Posted when the OS clipboard should be probed for an image.
+
+        `notify_when_empty` is True for explicit user actions (ctrl+v key
+        binding, /paste-image command) so the user gets clear feedback if
+        nothing pasteable is on the clipboard. It is False for the implicit
+        empty-bracketed-paste trigger, which should stay silent because a
+        no-op is the expected outcome of pressing Cmd+V with an empty
+        clipboard.
+        """
+
+        def __init__(self, *, notify_when_empty: bool = False) -> None:
+            self.notify_when_empty = notify_when_empty
+            super().__init__()
+
     def __init__(
         self,
         command_registry: CommandRegistry,
@@ -76,6 +118,7 @@ class ChatTextArea(TextArea):
         self._input_mode: InputMode = self.DEFAULT_MODE
         self._last_text = ""
         self._navigating_history = False
+        self._applying_completion = False
         self._original_text: str = ""
         self._cursor_pos_after_load: tuple[int, int] | None = None
         self._cursor_moved_since_load: bool = False
@@ -85,6 +128,10 @@ class ChatTextArea(TextArea):
         self._last_keystroke_time: float = 0.0
 
     def on_blur(self, event: events.Blur) -> None:
+        # set_reactive avoids the selection watcher, which would call
+        # app.clear_selection() and wipe an in-progress selection elsewhere.
+        self.set_reactive(TextArea.selection, Selection.cursor(self.cursor_location))
+        self.refresh()
         if self._app_has_focus:
             self.call_after_refresh(self.focus)
 
@@ -96,6 +143,18 @@ class ChatTextArea(TextArea):
 
     def on_click(self, event: events.Click) -> None:
         self._mark_cursor_moved_if_needed()
+        if event.chain == _DOUBLE_CLICK:
+            self._select_word_at(self.get_target_document_location(event))
+        elif event.chain == _TRIPLE_CLICK:
+            self.select_line(self.get_target_document_location(event)[0])
+
+    def _select_word_at(self, location: Location) -> None:
+        row, column = location
+        for match in _WORD.finditer(self.document[row]):
+            start, end = match.span()
+            if start <= column < end:
+                self.selection = Selection((row, start), (row, end))
+                return
 
     async def _on_paste(self, event: events.Paste) -> None:
         # Best-effort: terminals that emit bracketed paste sequences will
@@ -106,10 +165,19 @@ class ChatTextArea(TextArea):
         # MRO still runs inside this dispatch cycle and performs the
         # single insertion using the mutated text.
         event.text = maybe_prepend_at_for_image_path(event.text)
+        # Empty paste = either truly empty clipboard, or clipboard holds
+        # image bytes the terminal cannot deliver as text. The app handler
+        # peeks the OS clipboard in a worker and, if it finds image bytes,
+        # writes them to attachments and inserts an @<path> token.
+        if not event.text.strip():
+            self.post_message(self.ClipboardImagePasted())
         event.stop()
 
     def action_insert_newline(self) -> None:
         self.insert("\n")
+
+    def action_paste_image_from_clipboard(self) -> None:
+        self.post_message(self.ClipboardImagePasted(notify_when_empty=True))
 
     def action_open_external_editor(self) -> None:
         editor = ExternalEditor()
@@ -144,8 +212,14 @@ class ChatTextArea(TextArea):
         self._last_text = self.text
         was_navigating_history = self._navigating_history
         self._navigating_history = False
+        was_applying_completion = self._applying_completion
+        self._applying_completion = False
 
-        if self._completion_manager and not was_navigating_history:
+        if (
+            self._completion_manager
+            and not was_navigating_history
+            and not was_applying_completion
+        ):
             self._completion_manager.on_text_changed(
                 self.get_full_text(), self._get_full_cursor_offset()
             )
@@ -317,6 +391,14 @@ class ChatTextArea(TextArea):
 
         await super()._on_key(event)
         self._mark_cursor_moved_if_needed()
+
+    @property
+    def applying_completion(self) -> bool:
+        return self._applying_completion
+
+    @applying_completion.setter
+    def applying_completion(self, value: bool) -> None:
+        self._applying_completion = value
 
     def set_completion_manager(self, manager: MultiCompletionManager | None) -> None:
         self._completion_manager = manager

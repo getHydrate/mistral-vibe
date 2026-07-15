@@ -14,6 +14,7 @@ from vibe.core.utils.concurrency import (
 )
 from vibe.core.utils.display import compact_complete_display
 from vibe.core.utils.http import (
+    VibeAsyncHTTPClient,
     build_ssl_context,
     configure_ssl_context,
     get_server_url_from_api_base,
@@ -25,6 +26,7 @@ from vibe.core.utils.paths import is_dangerous_directory
 from vibe.core.utils.platform import (
     get_platform_display_name,
     get_platform_id,
+    get_platform_version,
     is_windows,
 )
 from vibe.core.utils.retry import async_generator_retry, async_retry
@@ -54,6 +56,7 @@ __all__ = [
     "MergeConflictError",
     "MergeStrategy",
     "TaggedText",
+    "VibeAsyncHTTPClient",
     "async_generator_retry",
     "async_retry",
     "build_ssl_context",
@@ -61,6 +64,7 @@ __all__ = [
     "configure_ssl_context",
     "get_platform_display_name",
     "get_platform_id",
+    "get_platform_version",
     "get_server_url_from_api_base",
     "get_user_agent",
     "get_user_cancellation_message",

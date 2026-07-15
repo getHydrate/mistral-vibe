@@ -9,19 +9,21 @@ from pathlib import Path
 import re
 import sys
 import threading
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, TypeGuard
 
 from vibe.core.config.harness_files import get_harness_files_manager
 from vibe.core.logger import logger
 from vibe.core.paths import DEFAULT_TOOL_DIR
 from vibe.core.tools.base import BaseTool, BaseToolConfig, ToolPermission
-from vibe.core.tools.connectors import ConnectorRegistry
-from vibe.core.tools.mcp import MCPRegistry
-from vibe.core.tools.mcp.tools import MCPTool
+from vibe.core.tools.remote import MCPTool
+from vibe.core.types import AvailableFunction
 from vibe.core.utils import name_matches, run_sync
+from vibe.core.utils.io import read_safe
 
 if TYPE_CHECKING:
-    from vibe.core.config import VibeConfig
+    from vibe.core.config import AnyVibeConfig
+    from vibe.core.tools.connectors.connector_registry import ConnectorRegistry
+    from vibe.core.tools.mcp.registry import MCPRegistry
 
 
 def _try_canonical_module_name(path: Path) -> str | None:
@@ -71,7 +73,7 @@ class ToolManager:
 
     def __init__(
         self,
-        config_getter: Callable[[], VibeConfig],
+        config_getter: Callable[[], AnyVibeConfig],
         mcp_registry: MCPRegistry | None = None,
         connector_registry: ConnectorRegistry | None = None,
         *,
@@ -80,25 +82,46 @@ class ToolManager:
     ) -> None:
         self._config_getter = config_getter
         self._permission_getter = permission_getter
-        self._mcp_registry = mcp_registry or MCPRegistry()
+        self._mcp_registry = mcp_registry
         self._connector_registry = connector_registry
         self._instances: dict[str, BaseTool] = {}
         self._search_paths: list[Path] = self._compute_search_paths(self._config)
         self._lock = threading.Lock()
         self._mcp_integrated = False
 
-        self._all_tools: dict[str, type[BaseTool]] = {
-            cls.get_name(): cls for cls in self._iter_tool_classes(self._search_paths)
-        }
+        self._tool_variants_by_name: dict[str, list[type[BaseTool]]] = {}
+        # Historical one-class-per-name registry. When multiple classes publish the
+        # same name, this is the fallback used if no variant is active.
+        self._all_tools: dict[str, type[BaseTool]] = {}
+        for tool_class in self._iter_tool_classes(self._search_paths):
+            self._register_discovered_tool_variant(tool_class)
+        self._tool_descriptions: dict[str, str] = dict(
+            self._iter_tool_descriptions(self._search_paths)
+        )
         if not defer_mcp:
             self.integrate_all()
 
+    def set_mcp_registry(self, mcp_registry: MCPRegistry | None) -> None:
+        self._mcp_registry = mcp_registry
+
+    def set_connector_registry(
+        self, connector_registry: ConnectorRegistry | None
+    ) -> None:
+        self._connector_registry = connector_registry
+
+    def _get_mcp_registry(self) -> MCPRegistry:
+        if self._mcp_registry is None:
+            from vibe.core.tools.mcp.registry import MCPRegistry
+
+            self._mcp_registry = MCPRegistry()
+        return self._mcp_registry
+
     @property
-    def _config(self) -> VibeConfig:
+    def _config(self) -> AnyVibeConfig:
         return self._config_getter()
 
     @staticmethod
-    def _compute_search_paths(config: VibeConfig) -> list[Path]:
+    def _compute_search_paths(config: AnyVibeConfig) -> list[Path]:
         paths: list[Path] = [DEFAULT_TOOL_DIR.path]
 
         paths.extend(config.tool_paths)
@@ -120,7 +143,10 @@ class ToolManager:
     def _iter_tool_classes(search_paths: list[Path]) -> Iterator[type[BaseTool]]:
         """Iterate over all search_paths to find tool classes.
 
-        Note: if a search path is not a directory, it is treated as a single tool file.
+        A search path is either a directory of tool files (``<dir>/*.py``, e.g.
+        ``.vibe/tools/``) or a single ``.py`` file. Tool files sit directly in
+        the directory — the same flat layout as the builtins and as the sibling
+        ``prompts/*.md`` descriptions (see ``_iter_tool_descriptions``).
         """
         for base in search_paths:
             if not base.is_dir() and base.name.endswith(".py"):
@@ -128,7 +154,7 @@ class ToolManager:
                     for tool in tools:
                         yield tool
 
-            for path in base.rglob("*.py"):
+            for path in base.glob("*.py"):
                 if tools := ToolManager._load_tools_from_file(path):
                     for tool in tools:
                         yield tool
@@ -168,6 +194,40 @@ class ToolManager:
         return tools
 
     @staticmethod
+    def _iter_tool_descriptions(search_paths: list[Path]) -> Iterator[tuple[str, str]]:
+        """Yield ``(tool_name, description)`` from ``prompts/<name>.md`` files in
+        the tool search paths.
+
+        Every tool directory pairs implementations with their descriptions the
+        same way the builtins do — ``<tools-dir>/*.py`` alongside
+        ``<tools-dir>/prompts/*.md`` (the very layout ``get_tool_prompt`` reads).
+        So ``.vibe/tools/prompts/weather.md`` describes a custom ``weather`` tool
+        and ``.vibe/tools/prompts/bash.md`` re-describes the builtin ``bash``.
+
+        Keyed by file stem (the tool name); later search paths win, matching
+        ``.py`` override precedence. A ``.py`` search-path entry is matched
+        against the ``prompts/`` dir beside it.
+        """
+        for base in search_paths:
+            if base.is_dir():
+                prompts_dir = base / "prompts"
+            elif base.name.endswith(".py"):
+                prompts_dir = base.parent / "prompts"
+            else:
+                continue
+            if not prompts_dir.is_dir():
+                continue
+            for md_path in sorted(prompts_dir.glob("*.md")):
+                try:
+                    text = read_safe(md_path).text
+                except OSError:
+                    continue
+                # Yield the raw text (matching get_full_description), but skip
+                # blank files so they fall back instead of blanking a tool.
+                if text.strip():
+                    yield md_path.stem, text
+
+    @staticmethod
     def discover_tool_defaults(
         search_paths: list[Path] | None = None,
     ) -> dict[str, dict[str, Any]]:
@@ -187,26 +247,39 @@ class ToolManager:
                 continue
         return defaults
 
+    def _register_discovered_tool_variant(self, tool_class: type[BaseTool]) -> None:
+        name = tool_class.get_name()
+        self._tool_variants_by_name.setdefault(name, []).append(tool_class)
+        self._all_tools[name] = tool_class
+
     @property
     def registered_tools(self) -> dict[str, type[BaseTool]]:
         with self._lock:
-            return dict(self._all_tools)
+            selected_tools: dict[str, type[BaseTool]] = {}
+            for name, fallback_tool_class in self._all_tools.items():
+                selected_tools[name] = self._select_registered_variant(
+                    name, fallback_tool_class
+                )
+            return selected_tools
 
     @property
     def available_tools(self) -> dict[str, type[BaseTool]]:
         with self._lock:
-            runtime_available = {
-                name: cls
-                for name, cls in self._all_tools.items()
-                if self._is_tool_available(cls)
-            }
+            runtime_available: dict[str, type[BaseTool]] = {}
+            for name, fallback_tool_class in self._all_tools.items():
+                selected_tool_class = self._select_available_variant(
+                    name, fallback_tool_class
+                )
+                if selected_tool_class is None:
+                    continue
+                runtime_available[name] = selected_tool_class
 
         # Per-source filtering first (MCP server/connector disabled flags).
         result = self._apply_per_source_filtering(runtime_available)
 
-        # Global overrides take precedence.
+        # Global allowlist narrows the candidate set; denylist is always final.
         if self._config.enabled_tools:
-            return {
+            result = {
                 name: cls
                 for name, cls in result.items()
                 if name_matches(name, self._config.enabled_tools)
@@ -225,6 +298,50 @@ class ToolManager:
         if inspect.signature(cls.is_available).parameters:
             return cls.is_available(self._config)
         return cls.is_available()
+
+    def _tool_variants_for_name(
+        self, name: str, fallback: type[BaseTool]
+    ) -> list[type[BaseTool]]:
+        return self._tool_variants_by_name.get(name) or [fallback]
+
+    def _select_available_variant(
+        self, name: str, fallback: type[BaseTool]
+    ) -> type[BaseTool] | None:
+        selected_tool_class: type[BaseTool] | None = None
+        selected_rank: tuple[int, int] | None = None
+
+        for discovery_index, tool_class in enumerate(
+            self._tool_variants_for_name(name, fallback)
+        ):
+            if not self._is_tool_available(tool_class):
+                continue
+
+            rank = (self._tool_selection_priority(tool_class), discovery_index)
+            if selected_rank is not None and rank <= selected_rank:
+                continue
+
+            selected_tool_class = tool_class
+            selected_rank = rank
+
+        return selected_tool_class
+
+    @staticmethod
+    def _tool_selection_priority(tool_class: type[BaseTool]) -> int:
+        return tool_class.selection_priority
+
+    def _select_registered_variant(
+        self, name: str, fallback: type[BaseTool]
+    ) -> type[BaseTool]:
+        selected_tool_class = self._select_available_variant(name, fallback)
+        if selected_tool_class is not None:
+            return selected_tool_class
+        return fallback
+
+    def _tool_class_for_config(self, tool_name: str) -> type[BaseTool] | None:
+        fallback_tool_class = self._all_tools.get(tool_name)
+        if fallback_tool_class is None:
+            return None
+        return self._select_registered_variant(tool_name, fallback_tool_class)
 
     def _apply_per_source_filtering(
         self, tools: dict[str, type[BaseTool]]
@@ -273,7 +390,7 @@ class ToolManager:
         disabled_sources: set[tuple[str, bool]],
         per_source_disabled: dict[tuple[str, bool], set[str]],
     ) -> bool:
-        if not issubclass(tool_cls, MCPTool):
+        if not ToolManager._is_remote_tool_class(tool_cls):
             return False
         server_name = tool_cls.get_server_name()
         if server_name is None:
@@ -282,6 +399,10 @@ class ToolManager:
         if key in disabled_sources:
             return True
         return tool_cls.get_remote_name() in per_source_disabled.get(key, set())
+
+    @staticmethod
+    def _is_remote_tool_class(tool_cls: type[BaseTool]) -> TypeGuard[type[MCPTool]]:
+        return issubclass(tool_cls, MCPTool)
 
     def integrate_mcp(self, *, raise_on_failure: bool = False) -> None:
         """Discover and register MCP tools (sync wrapper).
@@ -296,10 +417,12 @@ class ToolManager:
         if self._mcp_integrated:
             return
         if not self._config.mcp_servers:
+            if self._mcp_registry is not None:
+                self._mcp_registry.sync_active_servers([])
             return
 
         try:
-            mcp_tools = await self._mcp_registry.get_tools_async(
+            mcp_tools = await self._get_mcp_registry().get_tools_async(
                 self._config.mcp_servers
             )
         except Exception as exc:
@@ -320,7 +443,7 @@ class ToolManager:
         stale_keys = [
             name
             for name, cls in self._all_tools.items()
-            if issubclass(cls, MCPTool) and cls.is_connector()
+            if self._is_remote_tool_class(cls) and cls.is_connector()
         ]
         for key in stale_keys:
             self._all_tools.pop(key, None)
@@ -331,17 +454,17 @@ class ToolManager:
         stale_keys = [
             name
             for name, cls in self._all_tools.items()
-            if issubclass(cls, MCPTool) and not cls.is_connector()
+            if self._is_remote_tool_class(cls) and not cls.is_connector()
         ]
         for key in stale_keys:
             self._all_tools.pop(key, None)
             self._instances.pop(key, None)
 
-    def integrate_connectors(self) -> None:
+    def integrate_connectors(self, *, force_refresh: bool = False) -> None:
         """Discover and register connector tools (sync wrapper)."""
-        run_sync(self.integrate_connectors_async())
+        run_sync(self.integrate_connectors_async(force_refresh=force_refresh))
 
-    async def integrate_connectors_async(self) -> None:
+    async def integrate_connectors_async(self, *, force_refresh: bool = False) -> None:
         """Discover and register connector tools — canonical implementation.
 
         Thread-safe: can be called from the deferred-init background thread.
@@ -350,7 +473,9 @@ class ToolManager:
             return
 
         try:
-            connector_tools = await self._connector_registry.get_tools_async()
+            connector_tools = await self._connector_registry.get_tools_async(
+                force_refresh=force_refresh
+            )
         except Exception as exc:
             logger.warning(f"Connector integration failed: {exc}")
             with self._lock:
@@ -365,28 +490,37 @@ class ToolManager:
     async def refresh_remote_tools_async(self) -> None:
         """Force MCP and connector re-discovery for the current config."""
         with self._lock:
-            self._mcp_registry.clear()
+            if self._mcp_registry is not None:
+                self._mcp_registry.clear()
             self._purge_mcp_state()
             self._mcp_integrated = False
             self._purge_connector_state()
             if self._connector_registry is not None:
                 self._connector_registry.clear()
 
-        await self._integrate_all_async()
+        await self._integrate_all_async(force_refresh=True)
 
     def refresh_remote_tools(self) -> None:
         """Sync wrapper for :meth:`refresh_remote_tools_async`."""
         run_sync(self.refresh_remote_tools_async())
 
-    def integrate_all(self, *, raise_on_mcp_failure: bool = False) -> None:
+    def integrate_all(
+        self, *, raise_on_mcp_failure: bool = False, force_refresh: bool = False
+    ) -> None:
         """Discover MCP and connector tools in parallel.
 
         Runs both async discovery paths concurrently via ``asyncio.gather``
         inside a single ``run_sync`` call.
         """
-        run_sync(self._integrate_all_async(raise_on_mcp_failure=raise_on_mcp_failure))
+        run_sync(
+            self._integrate_all_async(
+                raise_on_mcp_failure=raise_on_mcp_failure, force_refresh=force_refresh
+            )
+        )
 
-    async def _integrate_all_async(self, *, raise_on_mcp_failure: bool = False) -> None:
+    async def _integrate_all_async(
+        self, *, raise_on_mcp_failure: bool = False, force_refresh: bool = False
+    ) -> None:
         """Run MCP and connector discovery concurrently.
 
         Uses ``return_exceptions=True`` so that a failing MCP server does
@@ -394,7 +528,7 @@ class ToolManager:
         """
         mcp_result, connector_result = await asyncio.gather(
             self._integrate_mcp_async(raise_on_failure=raise_on_mcp_failure),
-            self.integrate_connectors_async(),
+            self.integrate_connectors_async(force_refresh=force_refresh),
             return_exceptions=True,
         )
 
@@ -407,9 +541,30 @@ class ToolManager:
         if isinstance(connector_result, BaseException):
             logger.warning(f"Connector integration failed: {connector_result}")
 
+    def available_tool_specs(self) -> list[AvailableFunction]:
+        """Model-facing definitions for every available tool: name, resolved
+        description, and parameters.
+
+        The description comes from a ``<tools-dir>/prompts/<name>.md`` file when
+        present (builtin defaults, custom-tool descriptions, and user/project
+        overrides all live there), falling back to the tool's own description
+        (e.g. MCP/connector tools set it inline). Both the LLM tool formatter and
+        the session logger consume this so a tool always looks the same to the
+        model and in the logs.
+        """
+        return [
+            AvailableFunction(
+                name=name,
+                description=self._tool_descriptions.get(name)
+                or cls.get_full_description(),
+                parameters=cls.get_parameters(),
+            )
+            for name, cls in self.available_tools.items()
+        ]
+
     def get_tool_config(self, tool_name: str) -> BaseToolConfig:
         with self._lock:
-            tool_class = self._all_tools.get(tool_name)
+            tool_class = self._tool_class_for_config(tool_name)
 
         if tool_class:
             config_class = tool_class._get_tool_config_class()
@@ -436,9 +591,6 @@ class ToolManager:
         Raises:
             NoSuchToolError: If the requested tool is not available.
         """
-        if tool_name in self._instances:
-            return self._instances[tool_name]
-
         available = self.available_tools
         if tool_name not in available:
             raise NoSuchToolError(
@@ -446,10 +598,12 @@ class ToolManager:
                 f"Available: {list(available.keys())}"
             )
         tool_class = available[tool_name]
-        self._instances[tool_name] = tool_class.from_config(
-            lambda: self.get_tool_config(tool_name)
-        )
-        return self._instances[tool_name]
+        cached = self._instances.get(tool_name)
+        if cached is not None and type(cached) is tool_class:
+            return cached
+        instance = tool_class.from_config(lambda: self.get_tool_config(tool_name))
+        self._instances[tool_name] = instance
+        return instance
 
     def reset_all(self) -> None:
         self._instances.clear()

@@ -11,6 +11,7 @@ from textual.binding import Binding, BindingType
 from textual.containers import CenterMiddle, Horizontal
 from textual.message import Message
 
+from vibe.cli.textual_ui.shortcut_hints import shortcut, shortcut_hint
 from vibe.cli.textual_ui.widgets.banner.petit_chat import PetitChat
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from vibe.cli.update_notifier.update import do_update
@@ -24,14 +25,19 @@ class UpdatePromptResult(StrEnum):
     QUIT = auto()
 
 
+class UpdatePromptMode(StrEnum):
+    STARTUP = auto()
+    CHECK_UPGRADE = auto()
+
+
 class UpdateChoice(StrEnum):
     UPDATE = auto()
     CONTINUE = auto()
 
 
-_CHOICE_LABELS: dict[UpdateChoice, str] = {
-    UpdateChoice.UPDATE: "Update now",
-    UpdateChoice.CONTINUE: "Continue with current version",
+_CONTINUE_LABELS: dict[UpdatePromptMode, str] = {
+    UpdatePromptMode.STARTUP: "Continue with current version",
+    UpdatePromptMode.CHECK_UPGRADE: "Cancel upgrade",
 }
 
 
@@ -56,11 +62,19 @@ class UpdatePromptDialog(CenterMiddle):
             self.succeeded = succeeded
 
     def __init__(
-        self, current_version: str, latest_version: str, **kwargs: Any
+        self,
+        current_version: str,
+        latest_version: str,
+        prompt_mode: UpdatePromptMode = UpdatePromptMode.STARTUP,
+        **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.current_version = current_version
         self.latest_version = latest_version
+        self._choice_labels: dict[UpdateChoice, str] = {
+            UpdateChoice.UPDATE: "Update now",
+            UpdateChoice.CONTINUE: _CONTINUE_LABELS[prompt_mode],
+        }
         self.selected: UpdateChoice = UpdateChoice.UPDATE
         self._option_widgets: dict[UpdateChoice, NoMarkupStatic] = {}
         self._is_updating = False
@@ -78,13 +92,14 @@ class UpdatePromptDialog(CenterMiddle):
             with Horizontal(id="update-options-container"):
                 for choice in UpdateChoice:
                     widget = NoMarkupStatic(
-                        f"  {_CHOICE_LABELS[choice]}", classes="update-option"
+                        f"  {self._choice_labels[choice]}", classes="update-option"
                     )
                     self._option_widgets[choice] = widget
                     yield widget
 
             yield NoMarkupStatic(
-                "← → navigate  Enter select", classes="update-dialog-help"
+                shortcut_hint(f"{shortcut('←→')} navigate  {shortcut('Enter')} select"),
+                classes="update-dialog-help",
             )
 
             yield PetitChat(id="update-dialog-spinner")
@@ -102,7 +117,7 @@ class UpdatePromptDialog(CenterMiddle):
         for choice in UpdateChoice:
             widget = self._option_widgets[choice]
             cursor = "› " if choice == self.selected else "  "
-            widget.update(f"{cursor}{_CHOICE_LABELS[choice]}")
+            widget.update(f"{cursor}{self._choice_labels[choice]}")
             widget.remove_class("update-option--active")
             widget.remove_class("update-option--inactive")
             widget.add_class(
@@ -167,12 +182,14 @@ class UpdatePromptApp(App[UpdatePromptResult]):
         current_version: str,
         latest_version: str,
         theme: str | None = None,
+        prompt_mode: UpdatePromptMode = UpdatePromptMode.STARTUP,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
         self.current_version = current_version
         self.latest_version = latest_version
         self._theme_name = theme
+        self._prompt_mode = prompt_mode
         self._dialog: UpdatePromptDialog | None = None
         self._update_task: asyncio.Task[None] | None = None
 
@@ -181,7 +198,9 @@ class UpdatePromptApp(App[UpdatePromptResult]):
             self.theme = self._theme_name
 
     def compose(self) -> ComposeResult:
-        self._dialog = UpdatePromptDialog(self.current_version, self.latest_version)
+        self._dialog = UpdatePromptDialog(
+            self.current_version, self.latest_version, prompt_mode=self._prompt_mode
+        )
         yield self._dialog
 
     async def action_quit_prompt(self) -> None:
@@ -215,7 +234,12 @@ class UpdatePromptApp(App[UpdatePromptResult]):
 
 
 def ask_update_prompt(
-    current_version: str, latest_version: str, theme: str | None = None
+    current_version: str,
+    latest_version: str,
+    theme: str | None = None,
+    prompt_mode: UpdatePromptMode = UpdatePromptMode.STARTUP,
 ) -> UpdatePromptResult:
-    app = UpdatePromptApp(current_version, latest_version, theme=theme)
+    app = UpdatePromptApp(
+        current_version, latest_version, theme=theme, prompt_mode=prompt_mode
+    )
     return app.run(inline=True) or UpdatePromptResult.CONTINUE

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, ClassVar, Literal, cast
+from typing import Any, ClassVar, Literal
 
 from rich.text import Text
 from textual.app import ComposeResult
@@ -12,12 +12,10 @@ from textual.message import Message
 from textual.widgets import OptionList
 from textual.widgets.option_list import Option
 
+from vibe.cli.textual_ui.shortcut_hints import SHORTCUT_STYLE, shortcut, shortcut_hint
+from vibe.cli.textual_ui.widgets.navigable_option_list import NavigableOptionList
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
-from vibe.core.session.resume_sessions import (
-    ResumeSessionInfo,
-    ResumeSessionSource,
-    short_session_id,
-)
+from vibe.core.session.resume_sessions import ResumeSessionInfo, short_session_id
 
 _SECONDS_PER_MINUTE = 60
 _SECONDS_PER_HOUR = 3600
@@ -57,25 +55,18 @@ def _format_relative_time(iso_time: str | None) -> str:
     return "unknown"
 
 
-def _build_header_text(cwd: str | None, has_remote: bool) -> Text:
+def _build_header_text(cwd: str | None) -> Text:
     text = Text(no_wrap=True)
     text.append("local ", style="cyan")
     text.append(cwd or "this folder", style="dim")
-    if has_remote:
-        text.append("  ·  ", style="dim")
-        text.append("remote ", style="cyan")
-        text.append("all folders", style="dim")
     return text
 
 
 def _build_option_text(session: ResumeSessionInfo, message: str) -> Text:
     text = Text(no_wrap=True)
     time_str = _format_relative_time(session.end_time)
-    session_id = short_session_id(session.session_id, source=session.source)
-    source = session.source
+    session_id = short_session_id(session.session_id)
     text.append(f"{time_str:10}", style="dim")
-    text.append("  ")
-    text.append(f"{source:6}", style="cyan")
     text.append("  ")
     text.append(f"{session_id}  ", style="dim")
     text.append(message)
@@ -89,19 +80,15 @@ class SessionPickerApp(Container):
 
     BINDINGS: ClassVar[list[BindingType]] = [
         Binding("escape", "cancel", "Cancel", show=False),
-        Binding("d,D", "request_delete", "Delete", show=False),
+        Binding("d", "request_delete", "Delete", show=False),
     ]
 
     class SessionSelected(Message):
         option_id: str
-        source: ResumeSessionSource
         session_id: str
 
-        def __init__(
-            self, option_id: str, source: ResumeSessionSource, session_id: str
-        ) -> None:
+        def __init__(self, option_id: str, session_id: str) -> None:
             self.option_id = option_id
-            self.source = source
             self.session_id = session_id
             super().__init__()
 
@@ -110,14 +97,10 @@ class SessionPickerApp(Container):
 
     class SessionDeleteRequested(Message):
         option_id: str
-        source: ResumeSessionSource
         session_id: str
 
-        def __init__(
-            self, option_id: str, source: ResumeSessionSource, session_id: str
-        ) -> None:
+        def __init__(self, option_id: str, session_id: str) -> None:
             self.option_id = option_id
-            self.source = source
             self.session_id = session_id
             super().__init__()
 
@@ -182,7 +165,9 @@ class SessionPickerApp(Container):
 
     def _delete_confirmation_option_text(self, session: ResumeSessionInfo) -> Text:
         text = _build_option_text(session, "")
-        text.append("Press D again to delete")
+        text.append("Press ")
+        text.append("d", style=SHORTCUT_STYLE)
+        text.append(" again to delete")
         return text
 
     def _delete_feedback_option_text(self, session: ResumeSessionInfo) -> Text:
@@ -195,9 +180,6 @@ class SessionPickerApp(Container):
     def _delete_feedback_message(self, session: ResumeSessionInfo) -> str:
         if session.session_id == self._current_session_id:
             return "Can't delete current session"
-
-        if not session.can_delete:
-            return "Can't delete remote session"
 
         return "Can't delete session"
 
@@ -282,9 +264,8 @@ class SessionPickerApp(Container):
                 return
 
     def _refresh_header(self) -> None:
-        has_remote = any(session.source == "remote" for session in self._sessions)
         header = self.query_one(".sessionpicker-header", NoMarkupStatic)
-        header.update(_build_header_text(self._cwd, has_remote))
+        header.update(_build_header_text(self._cwd))
 
     def clear_pending_delete(self, option_id: str) -> bool:
         if not self._delete_state_matches(option_id, "pending"):
@@ -298,15 +279,16 @@ class SessionPickerApp(Container):
             Option(self._normal_option_text(session), id=session.option_id)
             for session in self._sessions
         ]
-        has_remote = any(session.source == "remote" for session in self._sessions)
         with Vertical(id="sessionpicker-content"):
             yield NoMarkupStatic(
-                _build_header_text(self._cwd, has_remote),
-                classes="sessionpicker-header",
+                _build_header_text(self._cwd), classes="sessionpicker-header"
             )
-            yield OptionList(*options, id="sessionpicker-options")
+            yield NavigableOptionList(*options, id="sessionpicker-options")
             yield NoMarkupStatic(
-                "↑↓ Navigate  Enter Select  D Delete  Esc Cancel",
+                shortcut_hint(
+                    f"{shortcut('↑↓/jk')} Navigate  {shortcut('Enter')} Select  "
+                    f"{shortcut('d')} Delete  {shortcut('Esc')} Cancel"
+                ),
                 classes="sessionpicker-help",
             )
 
@@ -332,13 +314,8 @@ class SessionPickerApp(Container):
             if self._delete_state_matches(option_id, "confirmation"):
                 return
 
-            source, _, session_id = option_id.partition(":")
             self.post_message(
-                self.SessionSelected(
-                    option_id=option_id,
-                    source=cast(ResumeSessionSource, source),
-                    session_id=session_id,
-                )
+                self.SessionSelected(option_id=option_id, session_id=option_id)
             )
 
     def action_cancel(self) -> None:
@@ -359,7 +336,7 @@ class SessionPickerApp(Container):
         if session is None:
             return
 
-        if session.session_id == self._current_session_id or not session.can_delete:
+        if session.session_id == self._current_session_id:
             self._show_delete_state(
                 session, "feedback", self._delete_feedback_option_text(session)
             )
@@ -371,9 +348,7 @@ class SessionPickerApp(Container):
             )
             self.post_message(
                 self.SessionDeleteRequested(
-                    option_id=session.option_id,
-                    source=session.source,
-                    session_id=session.session_id,
+                    option_id=session.option_id, session_id=session.session_id
                 )
             )
             return

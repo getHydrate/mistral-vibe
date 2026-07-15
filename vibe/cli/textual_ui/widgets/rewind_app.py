@@ -11,7 +11,9 @@ from textual.message import Message
 from textual.widgets import Static
 
 from vibe.cli.commands import ALT_KEY
+from vibe.cli.textual_ui.shortcut_hints import shortcut, shortcut_hint
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
+from vibe.cli.textual_ui.widgets.vim_navigation import VimNavigationMixin
 
 
 class _RewindAction(StrEnum):
@@ -19,7 +21,7 @@ class _RewindAction(StrEnum):
     EDIT_ONLY = auto()
 
 
-class RewindApp(Container):
+class RewindApp(VimNavigationMixin, Container):
     """Bottom panel widget for rewind mode actions."""
 
     can_focus = True
@@ -85,7 +87,11 @@ class RewindApp(Container):
                 yield widget
             yield NoMarkupStatic("")
             yield NoMarkupStatic(
-                f"{ALT_KEY}+↑↓ or Ctrl+P/N browse messages  ↑↓ pick option  Enter confirm  ESC cancel",
+                shortcut_hint(
+                    f"{shortcut(f'{ALT_KEY}+↑↓')} or {shortcut('Ctrl+P/N')} "
+                    f"browse messages  {shortcut('↑↓/jk')} pick option  "
+                    f"{shortcut('Enter')} confirm  {shortcut('Esc')} cancel"
+                ),
                 classes="rewind-help",
             )
 
@@ -142,6 +148,9 @@ class RewindApp(Container):
                 self.post_message(self.RewindWithRestore())
             case _RewindAction.EDIT_ONLY:
                 self.post_message(self.RewindWithoutRestore())
+
+    def on_key(self, event: events.Key) -> None:
+        self._handle_vim_navigation_key(event)
 
     def on_blur(self, event: events.Blur) -> None:
         self.call_after_refresh(self.focus)

@@ -7,7 +7,10 @@ from pathlib import Path
 import tomllib
 from typing import cast
 
+import keyring
+from keyring.errors import KeyringError
 import pytest
+from textual.content import Content
 from textual.events import Resize
 from textual.geometry import Size
 from textual.pilot import Pilot
@@ -20,6 +23,7 @@ from tests.browser_sign_in.stubs import (
     build_sign_in_process,
 )
 from tests.conftest import build_test_vibe_config
+from vibe.cli.textual_ui.shortcut_hints import SHORTCUT_STYLE
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from vibe.core.config import ModelConfig, ProviderConfig, VibeConfig
 from vibe.core.config._settings import (
@@ -31,8 +35,9 @@ from vibe.core.config.harness_files import (
     reset_harness_files_manager,
 )
 from vibe.core.paths import GLOBAL_ENV_FILE, VIBE_HOME
-from vibe.core.telemetry.build_metadata import build_entrypoint_metadata
+from vibe.core.telemetry.build_metadata import build_launch_context
 from vibe.core.telemetry.send import TelemetryClient
+from vibe.core.telemetry.types import TerminalEmulator
 from vibe.core.types import Backend
 from vibe.setup.auth import (
     BrowserSignInError,
@@ -57,6 +62,17 @@ from vibe.setup.onboarding.screens.theme_selection import THEMES, ThemeSelection
 CONSOLE_URL = "https://console.mistral.ai"
 BROWSER_AUTH_API_URL = "https://console.mistral.ai/api"
 TEST_NOW = datetime(2026, 3, 16, tzinfo=UTC)
+
+
+@pytest.fixture(autouse=True)
+def disable_keyring(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Force the .env fallback so persist tests never touch the real OS keyring."""
+
+    def _unavailable(service: str, username: str, password: str) -> None:
+        raise KeyringError("keyring disabled in tests")
+
+    monkeypatch.setattr(keyring, "set_password", _unavailable)
+    monkeypatch.setattr(keyring, "delete_password", lambda service, username: None)
 
 
 def _expected_browser_sign_in_url(process_id: str = "process-1") -> str:
@@ -177,6 +193,12 @@ def _browser_sign_in_step_text(card: Widget) -> str:
 
 def _browser_sign_in_hint(screen: Screen) -> str:
     return str(screen.query_one("#browser-sign-in-hint", NoMarkupStatic).render())
+
+
+def _assert_browser_sign_in_shortcuts_styled(screen: Screen) -> None:
+    text = screen.query_one("#browser-sign-in-hint", NoMarkupStatic).render()
+    assert isinstance(text, Content)
+    assert any(span.style == SHORTCUT_STYLE for span in text.spans)
 
 
 def _browser_sign_in_url_text(screen: Screen) -> str:
@@ -432,11 +454,15 @@ async def test_ui_shows_browser_sign_in_url_copy_prompt_without_raw_url() -> Non
             lambda: "copy this URL" in _browser_sign_in_url_text(app.screen), pilot
         )
         url_text = _browser_sign_in_url_text(app.screen)
-        assert "If your browser did not open, copy this URL (press C)" in url_text
+        assert "If your browser did not open, copy this URL (press c)" in url_text
+        url_render = app.screen.query_one("#browser-sign-in-url", Static).render()
+        assert isinstance(url_render, Content)
+        assert any(span.style == SHORTCUT_STYLE for span in url_render.spans)
         assert "process-1" not in url_text
         assert _browser_sign_in_hint(app.screen) == (
-            "Press M to enter API key manually - Esc to cancel"
+            "Press m to enter API key manually - Esc to cancel"
         )
+        _assert_browser_sign_in_shortcuts_styled(app.screen)
 
 
 @pytest.mark.asyncio
@@ -590,10 +616,11 @@ async def test_ui_keeps_last_sign_in_url_copy_prompt_after_open_browser_failure(
             pilot,
         )
         assert _browser_sign_in_hint(app.screen) == (
-            "Press R to retry - Press M to enter API key manually - Esc to cancel"
+            "Press r to retry - Press m to enter API key manually - Esc to cancel"
         )
+        _assert_browser_sign_in_shortcuts_styled(app.screen)
         url_text = _browser_sign_in_url_text(app.screen)
-        assert "If your browser did not open, copy this URL (press C)" in url_text
+        assert "If your browser did not open, copy this URL (press c)" in url_text
         assert "process-1" not in url_text
 
 
@@ -673,8 +700,9 @@ async def test_ui_retry_hides_old_sign_in_url_and_uses_fresh_attempt_url() -> No
         assert "process-2" not in _browser_sign_in_url_text(app.screen)
         assert "process-1" not in _browser_sign_in_url_text(app.screen)
         assert _browser_sign_in_hint(app.screen) == (
-            "Press M to enter API key manually - Esc to cancel"
+            "Press m to enter API key manually - Esc to cancel"
         )
+        _assert_browser_sign_in_shortcuts_styled(app.screen)
         await pilot.press("c")
 
     assert copied_urls == [_expected_browser_sign_in_url(process_id="process-2")]
@@ -735,7 +763,7 @@ async def test_ui_preserves_completed_browser_sign_in_during_success_delay() -> 
         assert app.screen.state.variant == "success"
         hint = str(app.screen.query_one("#browser-sign-in-hint").render())
         assert "Finishing setup..." in hint
-        assert "Press M to enter API key manually - Esc to cancel" not in hint
+        assert "Press m to enter API key manually - Esc to cancel" not in hint
         assert app.return_value is None
         assert "sk-browser-onboarding-test-key" in _saved_env_contents()
         await pilot.press("m", "escape")
@@ -848,9 +876,10 @@ async def test_ui_shows_retryable_error_when_browser_sign_in_fails_unexpectedly(
         assert app.screen.state.variant == "error"
         assert _active_browser_sign_in_step_card(app.screen).has_class("active")
         assert (
-            "Press R to retry - Press M to enter API key manually - Esc to cancel"
+            "Press r to retry - Press m to enter API key manually - Esc to cancel"
             in str(app.screen.query_one("#browser-sign-in-hint").render())
         )
+        _assert_browser_sign_in_shortcuts_styled(app.screen)
         assert app.return_value is None
 
 
@@ -909,11 +938,12 @@ async def test_ui_waits_for_browser_sign_in_cleanup_before_retrying() -> None:
         )
         await _wait_for(
             lambda: (
-                "Press M to enter API key manually - Esc to cancel"
+                "Press m to enter API key manually - Esc to cancel"
                 in str(hint_widget.render())
             ),
             pilot,
         )
+        _assert_browser_sign_in_shortcuts_styled(app.screen)
 
         await pilot.press("r")
         await _wait_for(
@@ -927,7 +957,7 @@ async def test_ui_waits_for_browser_sign_in_cleanup_before_retrying() -> None:
         )
         await _wait_for(
             lambda: (
-                "Press M to enter API key manually - Esc to cancel"
+                "Press m to enter API key manually - Esc to cancel"
                 in str(hint_widget.render())
             ),
             pilot,
@@ -1244,7 +1274,7 @@ def test_persist_api_key_returns_env_var_error_for_empty_env_var_name() -> None:
     assert result == "env_var_error:<empty>"
 
 
-def test_persist_api_key_sends_onboarding_telemetry_with_entrypoint_metadata(
+def test_persist_api_key_sends_onboarding_telemetry_with_launch_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     recorded_metadata: dict[str, str] = {}
@@ -1264,11 +1294,12 @@ def test_persist_api_key_sends_onboarding_telemetry_with_entrypoint_metadata(
     result = persist_api_key(
         provider,
         "secret",
-        entrypoint_metadata=build_entrypoint_metadata(
+        launch_context=build_launch_context(
             agent_entrypoint="cli",
             agent_version="1.0.0",
             client_name="vibe_cli",
             client_version="1.0.0",
+            terminal_emulator=TerminalEmulator.APPLE_TERMINAL,
         ),
     )
 
@@ -1277,4 +1308,5 @@ def test_persist_api_key_sends_onboarding_telemetry_with_entrypoint_metadata(
     assert recorded_metadata["agent_version"] == "1.0.0"
     assert recorded_metadata["client_name"] == "vibe_cli"
     assert recorded_metadata["client_version"] == "1.0.0"
+    assert recorded_metadata["terminal_emulator"] == "apple_terminal"
     assert "session_id" not in recorded_metadata

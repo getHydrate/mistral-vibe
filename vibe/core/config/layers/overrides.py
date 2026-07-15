@@ -5,8 +5,7 @@ from typing import Any
 
 from vibe.core.config.fingerprint import create_dict_fingerprint
 from vibe.core.config.layer import ConfigLayer, RawConfig
-from vibe.core.config.patch import ConfigPatch
-from vibe.core.config.types import ConflictStrategy, LayerConfigSnapshot
+from vibe.core.config.types import LayerConfigSnapshot
 
 
 class OverridesLayer(ConfigLayer[RawConfig]):
@@ -16,7 +15,9 @@ class OverridesLayer(ConfigLayer[RawConfig]):
     Used by CLI and ACP entry points to inject runtime overrides.
     """
 
-    def __init__(self, *, data: dict[str, Any], name: str = "overrides") -> None:
+    NAME = "overrides"
+
+    def __init__(self, *, data: dict[str, Any], name: str = NAME) -> None:
         super().__init__(name=name)
         self._data = data
 
@@ -28,10 +29,7 @@ class OverridesLayer(ConfigLayer[RawConfig]):
         fingerprint = create_dict_fingerprint(data)
         return LayerConfigSnapshot(data=data, fingerprint=fingerprint)
 
-    async def apply(
-        self,
-        patch: ConfigPatch,
-        *,
-        on_conflict: ConflictStrategy = ConflictStrategy.CANCEL,
-    ) -> None:
-        raise NotImplementedError("OverridesLayer.apply() is not implemented (M2)")
+    async def _save_to_store(self, _next_config: RawConfig) -> str:
+        raise NotImplementedError(
+            "OverridesLayer patch persistence is not implemented yet"
+        )

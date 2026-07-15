@@ -8,6 +8,7 @@ from vibe.core.paths._local_config_files import (
 )
 from vibe.core.paths._vibe_home import (
     CACHE_FILE,
+    CONNECTOR_BOOTSTRAP_CACHE_FILE,
     DEFAULT_TOOL_DIR,
     GLOBAL_ENV_FILE,
     HISTORY_FILE,
@@ -17,6 +18,7 @@ from vibe.core.paths._vibe_home import (
     SESSION_LOG_DIR,
     TRUSTED_FOLDERS_FILE,
     VIBE_HOME,
+    WORKTREES_DIR,
     GlobalPath,
 )
 from vibe.core.paths.conventions import AGENTS_MD_FILENAME
@@ -25,6 +27,7 @@ __all__ = [
     "AGENTS_HOME",
     "AGENTS_MD_FILENAME",
     "CACHE_FILE",
+    "CONNECTOR_BOOTSTRAP_CACHE_FILE",
     "DEFAULT_TOOL_DIR",
     "GLOBAL_ENV_FILE",
     "HISTORY_FILE",
@@ -34,6 +37,7 @@ __all__ = [
     "SESSION_LOG_DIR",
     "TRUSTED_FOLDERS_FILE",
     "VIBE_HOME",
+    "WORKTREES_DIR",
     "GlobalPath",
     "LocalConfigDirs",
     "dedup_paths",

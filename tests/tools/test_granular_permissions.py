@@ -13,8 +13,13 @@ from vibe.core.tools.builtins.bash import (
 )
 from vibe.core.tools.builtins.edit import Edit, EditArgs, EditConfig
 from vibe.core.tools.builtins.grep import Grep, GrepArgs, GrepToolConfig
-from vibe.core.tools.builtins.read import Read, ReadArgs, ReadConfig, ReadState
-from vibe.core.tools.builtins.webfetch import WebFetch, WebFetchArgs, WebFetchConfig
+from vibe.core.tools.builtins.read_file import (
+    ReadFile,
+    ReadFileArgs,
+    ReadFileConfig,
+    ReadFileState,
+)
+from vibe.core.tools.builtins.web_fetch import WebFetch, WebFetchArgs, WebFetchConfig
 from vibe.core.tools.builtins.write_file import (
     WriteFile,
     WriteFileArgs,
@@ -62,6 +67,23 @@ class TestBashGranularPermissions:
         result = bash.resolve_permission(BashArgs(command="python script.py"))
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.ASK
+
+    @pytest.mark.parametrize(
+        "command",
+        [
+            "python3 << 'EOF'\nprint(42)\nEOF",
+            "python3 - << 'EOF'\nprint(42)\nEOF",
+            "python3 <<'PYEOF'\nimport sys\nprint('hello')\nPYEOF",
+            "python3 < input.txt",
+        ],
+    )
+    def test_standalone_denylisted_with_redirect_not_denied(self, command):
+        bash = self._bash()
+        result = bash.resolve_permission(BashArgs(command=command))
+        assert isinstance(result, PermissionContext)
+        assert result.permission is not ToolPermission.NEVER, (
+            f"Command with redirect should not be denied: {command!r}"
+        )
 
     def test_unknown_command_returns_permission_context(self):
         bash = self._bash()
@@ -260,17 +282,17 @@ class TestReadGranularPermissions:
         self.workdir = tmp_path
 
     def _read(self, **kwargs):
-        config = ReadConfig(**kwargs)
-        return Read(config_getter=lambda: config, state=ReadState())
+        config = ReadFileConfig(**kwargs)
+        return ReadFile(config_getter=lambda: config, state=ReadFileState())
 
     def test_in_workdir_normal_file_returns_none(self):
         (self.workdir / "test.py").touch()
         tool = self._read()
-        assert tool.resolve_permission(ReadArgs(file_path="test.py")) is None
+        assert tool.resolve_permission(ReadFileArgs(file_path="test.py")) is None
 
     def test_outside_workdir_returns_permission_context(self):
         tool = self._read()
-        result = tool.resolve_permission(ReadArgs(file_path="/tmp/file.txt"))
+        result = tool.resolve_permission(ReadFileArgs(file_path="/tmp/file.txt"))
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.ASK
         outside = [
@@ -283,7 +305,7 @@ class TestReadGranularPermissions:
     def test_sensitive_env_file_returns_permission_context(self):
         (self.workdir / ".env").touch()
         tool = self._read()
-        result = tool.resolve_permission(ReadArgs(file_path=".env"))
+        result = tool.resolve_permission(ReadFileArgs(file_path=".env"))
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.ASK
         sensitive = [
@@ -297,7 +319,7 @@ class TestReadGranularPermissions:
     def test_sensitive_env_local_file(self):
         (self.workdir / ".env.local").touch()
         tool = self._read()
-        result = tool.resolve_permission(ReadArgs(file_path=".env.local"))
+        result = tool.resolve_permission(ReadFileArgs(file_path=".env.local"))
         assert isinstance(result, PermissionContext)
         sensitive = [
             rp
@@ -308,7 +330,7 @@ class TestReadGranularPermissions:
 
     def test_sensitive_outside_both_permissions(self):
         tool = self._read()
-        result = tool.resolve_permission(ReadArgs(file_path="/tmp/.env"))
+        result = tool.resolve_permission(ReadFileArgs(file_path="/tmp/.env"))
         assert isinstance(result, PermissionContext)
         scopes = {rp.scope for rp in result.required_permissions}
         assert PermissionScope.FILE_PATTERN in scopes
@@ -316,14 +338,14 @@ class TestReadGranularPermissions:
 
     def test_denylisted_returns_never(self):
         tool = self._read(denylist=["*/secret*"])
-        result = tool.resolve_permission(ReadArgs(file_path="secret.key"))
+        result = tool.resolve_permission(ReadFileArgs(file_path="secret.key"))
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.NEVER
 
     def test_allowlisted_returns_always(self):
         tool = self._read(allowlist=["*/README*"])
         result = tool.resolve_permission(
-            ReadArgs(file_path=str(self.workdir / "README.md"))
+            ReadFileArgs(file_path=str(self.workdir / "README.md"))
         )
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.ALWAYS
@@ -331,7 +353,7 @@ class TestReadGranularPermissions:
     def test_custom_sensitive_patterns(self):
         (self.workdir / "credentials.json").touch()
         tool = self._read(sensitive_patterns=["*/credentials*"])
-        result = tool.resolve_permission(ReadArgs(file_path="credentials.json"))
+        result = tool.resolve_permission(ReadFileArgs(file_path="credentials.json"))
         assert isinstance(result, PermissionContext)
 
 
@@ -348,13 +370,14 @@ class TestWriteFileGranularPermissions:
     def test_in_workdir_returns_none(self):
         tool = self._write_file()
         assert (
-            tool.resolve_permission(WriteFileArgs(path="test.py", content="x")) is None
+            tool.resolve_permission(WriteFileArgs(file_path="test.py", content="x"))
+            is None
         )
 
     def test_outside_workdir_returns_permission_context(self):
         tool = self._write_file()
         result = tool.resolve_permission(
-            WriteFileArgs(path="/tmp/file.txt", content="x")
+            WriteFileArgs(file_path="/tmp/file.txt", content="x")
         )
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.ASK
@@ -362,7 +385,7 @@ class TestWriteFileGranularPermissions:
     def test_sensitive_env_file_asks(self):
         (self.workdir / ".env").touch()
         tool = self._write_file()
-        result = tool.resolve_permission(WriteFileArgs(path=".env", content="x"))
+        result = tool.resolve_permission(WriteFileArgs(file_path=".env", content="x"))
         assert isinstance(result, PermissionContext)
         assert result.permission is ToolPermission.ASK
 

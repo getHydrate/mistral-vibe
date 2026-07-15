@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from pathlib import Path
+import tomllib
 
 import pytest
 
+from vibe.core.config.fingerprint import create_file_fingerprint
 from vibe.core.config.layer import UntrustedLayerError
 from vibe.core.config.layers.project import ProjectConfigLayer
-from vibe.core.config.patch import ConfigPatch
-from vibe.core.config.types import MISSING_CONFIG_FILE_FINGERPRINT
+from vibe.core.config.patch import AddOperationPatch, ConfigPatch, ReplaceOperationPatch
+from vibe.core.config.types import MISSING_BACKING_STORE_DATA_FINGERPRINT
 from vibe.core.paths._vibe_home import GlobalPath
 from vibe.core.trusted_folders import trusted_folders_manager
 
@@ -29,7 +31,7 @@ async def test_reads_toml_when_trusted(tmp_working_directory: Path) -> None:
     config_path.unlink()
     data = await layer.load(force=True)
     assert data.model_extra == {}
-    assert layer.fingerprint == MISSING_CONFIG_FILE_FINGERPRINT
+    assert layer.fingerprint == MISSING_BACKING_STORE_DATA_FINGERPRINT
 
 
 @pytest.mark.asyncio
@@ -64,20 +66,13 @@ async def test_missing_file_returns_empty(tmp_working_directory: Path) -> None:
     layer = ProjectConfigLayer(path=tmp_working_directory)
     data = await layer.load()
     assert data.model_extra == {}
-    assert layer.fingerprint == MISSING_CONFIG_FILE_FINGERPRINT
+    assert layer.fingerprint == MISSING_BACKING_STORE_DATA_FINGERPRINT
 
 
 @pytest.mark.asyncio
 async def test_default_name(tmp_working_directory: Path) -> None:
     layer = ProjectConfigLayer(path=tmp_working_directory)
     assert layer.name == "project-toml"
-
-
-@pytest.mark.asyncio
-async def test_apply_raises_not_implemented(tmp_working_directory: Path) -> None:
-    layer = ProjectConfigLayer(path=tmp_working_directory)
-    with pytest.raises(NotImplementedError, match="M2"):
-        await layer.apply(ConfigPatch(fingerprint="fp-1"))
 
 
 @pytest.mark.asyncio
@@ -197,6 +192,24 @@ async def test_find_file_result_is_cached(tmp_working_directory: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_is_file_discovered_reflects_cached_discovery_state(
+    tmp_working_directory: Path,
+) -> None:
+    trusted_folders_manager.add_trusted(tmp_working_directory)
+    config_path = tmp_working_directory / ".vibe" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text('active_model = "project-model"\n')
+
+    layer = ProjectConfigLayer(path=tmp_working_directory)
+
+    assert layer.is_file_discovered is False
+
+    await layer.load()
+
+    assert layer.is_file_discovered is True
+
+
+@pytest.mark.asyncio
 async def test_config_file_added_after_first_search_is_not_detected(
     tmp_working_directory: Path,
 ) -> None:
@@ -290,3 +303,53 @@ async def test_walk_stops_at_vibe_home_parent(
     layer = ProjectConfigLayer(path=subdir)
     data = await layer.load()
     assert data.model_extra == {}
+
+
+@pytest.mark.asyncio
+async def test_apply_persists_to_discovered_file(tmp_working_directory: Path) -> None:
+    trusted_folders_manager.add_trusted(tmp_working_directory)
+    config_path = tmp_working_directory / ".vibe" / "config.toml"
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    config_path.write_text('active_model = "old"\n')
+
+    layer = ProjectConfigLayer(path=tmp_working_directory)
+    await layer.load()
+    fingerprint = layer.fingerprint
+    assert isinstance(fingerprint, str)
+
+    await layer.apply(
+        ConfigPatch(
+            ReplaceOperationPatch(path="/active_model", value="new"),
+            AddOperationPatch(path="/default_agent", value="plan"),
+            fingerprint=fingerprint,
+        )
+    )
+
+    with config_path.open("rb") as file:
+        assert tomllib.load(file) == {"active_model": "new", "default_agent": "plan"}
+        assert layer.fingerprint == create_file_fingerprint(file)
+
+
+@pytest.mark.asyncio
+async def test_apply_creates_file_when_none_discovered(
+    tmp_working_directory: Path,
+) -> None:
+    # No .vibe/config.toml exists; the layer is still trusted (nothing to distrust).
+    layer = ProjectConfigLayer(path=tmp_working_directory)
+    await layer.load()
+    assert layer.fingerprint == MISSING_BACKING_STORE_DATA_FINGERPRINT
+
+    await layer.apply(
+        ConfigPatch(
+            AddOperationPatch(path="/active_model", value="created"),
+            fingerprint=MISSING_BACKING_STORE_DATA_FINGERPRINT,
+        )
+    )
+
+    created_path = tmp_working_directory / ".vibe" / "config.toml"
+    with created_path.open("rb") as file:
+        assert tomllib.load(file) == {"active_model": "created"}
+        assert layer.fingerprint == create_file_fingerprint(file)
+
+    assert layer.is_file_discovered
+    assert layer.config_file_path == created_path

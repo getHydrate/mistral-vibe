@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import ClassVar, final
+from typing import final
 
 from pydantic import BaseModel, Field, PrivateAttr
 
@@ -26,7 +26,7 @@ from vibe.core.utils.io import (
     file_write_lock,
     read_safe_async,
 )
-from vibe.core.utils.text import snippet_start_line
+from vibe.core.utils.text import line_contexts
 
 
 class EditArgs(BaseModel):
@@ -47,11 +47,20 @@ class EditResult(BaseModel):
     old_string: str
     new_string: str
     # UI hint for the diff renderer; not part of the serialized result contract.
-    _ui_start_line: int | None = PrivateAttr(default=None)
+    # One entry per replaced occurrence (replace_all yields several), each as
+    # (start_line, old_lines, new_lines) where old/new are the changed snippet
+    # expanded to whole lines so the diff shows full lines per occurrence.
+    _ui_occurrences: list[tuple[int, str, str]] = PrivateAttr(default_factory=list)
 
     @property
-    def ui_start_line(self) -> int | None:
-        return self._ui_start_line
+    def ui_start_lines(self) -> list[int]:
+        return [start for start, _, _ in self._ui_occurrences]
+
+    @property
+    def ui_occurrences(self) -> list[tuple[int | None, str, str]]:
+        if self._ui_occurrences:
+            return list(self._ui_occurrences)
+        return [(None, self.old_string, self.new_string)]
 
 
 class EditConfig(BaseToolConfig):
@@ -66,12 +75,6 @@ class Edit(
     BaseTool[EditArgs, EditResult, EditConfig, BaseToolState],
     ToolUIData[EditArgs, EditResult],
 ):
-    description: ClassVar[str] = (
-        "Perform exact string replacements in files. "
-        "Supports single or bulk (replace_all) substitutions "
-        "with atomic, concurrent-safe writes."
-    )
-
     def resolve_permission(self, args: EditArgs) -> PermissionContext | None:
         return resolve_file_tool_permission(
             args.file_path,
@@ -145,7 +148,9 @@ class Edit(
                         f"instance.\nString: {args.old_string}"
                     )
 
-                start_line = snippet_start_line(original, args.old_string)
+                contexts = line_contexts(original, args.old_string)
+                if not args.replace_all:
+                    contexts = contexts[:1]
 
                 modified = self._apply_edit(
                     original, args.old_string, args.new_string, args.replace_all
@@ -178,7 +183,14 @@ class Edit(
             old_string=args.old_string,
             new_string=args.new_string,
         )
-        result._ui_start_line = start_line
+        result._ui_occurrences = [
+            (
+                start,
+                prefix + args.old_string + suffix,
+                prefix + args.new_string + suffix,
+            )
+            for start, prefix, suffix in contexts
+        ]
         yield result
 
     @final

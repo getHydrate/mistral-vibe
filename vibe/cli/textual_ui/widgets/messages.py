@@ -4,11 +4,9 @@ import asyncio
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, cast
 
-from rich.markup import escape
-
 from vibe.core.hooks.models import HookMessageSeverity
 from vibe.core.logger import logger
-from vibe.core.types import ImageAttachment
+from vibe.core.types import FileImageSource, ImageAttachment, InlineImageSource
 from vibe.core.utils.io import read_safe_async
 
 if TYPE_CHECKING:
@@ -22,10 +20,11 @@ from textual.content import Content
 from textual.css.query import NoMatches
 from textual.reactive import reactive
 from textual.widget import Widget
-from textual.widgets import Markdown, Static
+from textual.widgets import Link, Markdown, Static
 from textual.widgets._markdown import MarkdownStream
 from watchfiles import awatch
 
+from vibe.cli.textual_ui.shortcut_hints import shortcut, shortcut_hint
 from vibe.cli.textual_ui.widgets.collapsible import (
     ClickWithoutDragMixin,
     CollapsibleSection,
@@ -77,6 +76,48 @@ class ExpandingSeparator(NonSelectableStatic):
         self.refresh()
 
 
+def _attachment_label(attachment: ImageAttachment) -> str:
+    alias_path = Path(attachment.alias).expanduser()
+    if not alias_path.is_absolute():
+        return attachment.alias
+    return _format_display_path(alias_path)
+
+
+def _format_display_path(path: Path) -> str:
+    home = Path.home()
+    try:
+        relative = path.relative_to(home)
+    except ValueError:
+        return str(path)
+    if str(relative) == ".":
+        return "~"
+    return f"~/{relative}"
+
+
+class UserMessageAttachment(Horizontal):
+    def __init__(self, attachment: ImageAttachment) -> None:
+        super().__init__(classes="user-message-attachment-line")
+        self._attachment = attachment
+
+    def compose(self) -> ComposeResult:
+        yield NoMarkupStatic(
+            "└ attached image: ", classes="user-message-attachment-label"
+        )
+        match self._attachment.source:
+            case FileImageSource(path=path):
+                yield Link(
+                    _attachment_label(self._attachment),
+                    url=path.as_uri(),
+                    classes="user-message-attachment-link",
+                )
+            case InlineImageSource():
+                # Inline images have no file on disk, so there's nothing to link.
+                yield NoMarkupStatic(
+                    _attachment_label(self._attachment),
+                    classes="user-message-attachment-link",
+                )
+
+
 class UserMessage(Static):
     PROMPT_CHAR: ClassVar[str] = ">"
     SHOW_SEPARATOR: ClassVar[bool] = True
@@ -110,27 +151,21 @@ class UserMessage(Static):
                 )
                 yield NoMarkupStatic(self._content, classes="user-message-content")
             if self._images:
-                yield Static(
-                    self._format_attachments_footer(self._images),
-                    classes="user-message-attachments",
-                    markup=True,
-                )
+                with Vertical(classes="user-message-attachments"):
+                    for image in self._images:
+                        yield UserMessageAttachment(image)
             if self.SHOW_SEPARATOR:
                 yield ExpandingSeparator(classes="user-message-separator")
             if self._pending:
                 self.add_class("pending")
 
     @staticmethod
-    def _format_attachments_footer(images: list[ImageAttachment]) -> str:
-        label = "attached image" if len(images) == 1 else "attached images"
-        # Use Textual [link="..."] markup with the URL quoted: Textual's
-        # markup parser stops at `:` inside an unquoted tag value, so a raw
-        # `file://...` URL would raise MarkupError. Textual auto-wires the
-        # click to webbrowser.open(url), opening the OS default viewer.
-        links = ", ".join(
-            f'[link="{att.path.as_uri()}"]{escape(att.alias)}[/link]' for att in images
-        )
-        return f"└ {label}: {links}"
+    def _attachment_label(attachment: ImageAttachment) -> str:
+        return _attachment_label(attachment)
+
+    @staticmethod
+    def _format_display_path(path: Path) -> str:
+        return _format_display_path(path)
 
     async def set_pending(self, pending: bool) -> None:
         if pending == self._pending:
@@ -153,7 +188,7 @@ class UserMessage(Static):
 
 class QueueHeaderMessage(Static):
     DEFAULT_LABEL = "» Queued"
-    PAUSED_LABEL = "» Queued — press Enter to send, type to add"
+    PAUSED_LABEL = f"» Queued — press {shortcut('Enter')} to send, type to add"
 
     def __init__(self, *, paused: bool = False) -> None:
         super().__init__()
@@ -164,7 +199,7 @@ class QueueHeaderMessage(Static):
     def compose(self) -> ComposeResult:
         with Vertical(classes="queue-header-container"):
             self._label_widget = NoMarkupStatic(
-                self._current_label(), classes="queue-header-content"
+                shortcut_hint(self._current_label()), classes="queue-header-content"
             )
             yield self._label_widget
             yield ExpandingSeparator(classes="queue-header-separator")
@@ -174,7 +209,7 @@ class QueueHeaderMessage(Static):
             return
         self._paused = paused
         if self._label_widget is not None:
-            self._label_widget.update(self._current_label())
+            self._label_widget.update(shortcut_hint(self._current_label()))
 
     def _current_label(self) -> str:
         return self.PAUSED_LABEL if self._paused else self.DEFAULT_LABEL
@@ -585,7 +620,7 @@ class BashOutputMessage(ClickWithoutDragMixin, SpinnerMixin, Static):
 
 class ErrorMessage(Static):
     def __init__(
-        self, error: str, collapsed: bool = False, show_border: bool = True
+        self, error: str | Content, collapsed: bool = False, show_border: bool = True
     ) -> None:
         super().__init__()
         self.add_class("error-message")
@@ -598,7 +633,12 @@ class ErrorMessage(Static):
         with Horizontal(classes="error-container"):
             if self._show_border:
                 yield ExpandingBorder(classes="error-border")
-            text = f"Error: {self._error}" if self._show_border else self._error
+            error = (
+                self._error
+                if isinstance(self._error, Content)
+                else Content(self._error)
+            )
+            text = Content("Error: ") + error if self._show_border else error
             self._content_widget = NoMarkupStatic(text, classes="error-content")
             yield self._content_widget
 

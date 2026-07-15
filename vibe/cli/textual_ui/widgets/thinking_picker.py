@@ -10,6 +10,8 @@ from textual.message import Message
 from textual.widgets import OptionList
 from textual.widgets.option_list import Option
 
+from vibe.cli.textual_ui.shortcut_hints import shortcut, shortcut_hint
+from vibe.cli.textual_ui.widgets.navigable_option_list import NavigableOptionList
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from vibe.core.config._settings import ThinkingLevel
 
@@ -56,9 +58,13 @@ class ThinkingPickerApp(Container):
             yield NoMarkupStatic(
                 "Select Thinking Level", classes="thinkingpicker-title"
             )
-            yield OptionList(*options, id="thinkingpicker-options")
+            yield NavigableOptionList(*options, id="thinkingpicker-options")
             yield NoMarkupStatic(
-                "↑↓ Navigate  Enter Select  Esc Cancel", classes="thinkingpicker-help"
+                shortcut_hint(
+                    f"{shortcut('↑↓/jk')} Navigate  {shortcut('Enter')} Select  "
+                    f"{shortcut('Esc')} Cancel"
+                ),
+                classes="thinkingpicker-help",
             )
 
     def on_mount(self) -> None:

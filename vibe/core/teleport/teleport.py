@@ -10,7 +10,7 @@ from uuid import uuid4
 import httpx
 import zstandard
 
-from vibe.core.config import VibeConfig
+from vibe.core.config import AnyVibeConfig
 from vibe.core.session.session_logger import SessionLogger
 from vibe.core.teleport.errors import ServiceTeleportError
 from vibe.core.teleport.git import GitRepoInfo, GitRepository
@@ -33,7 +33,7 @@ from vibe.core.teleport.types import (
     TeleportStartingWorkflowEvent,
     TeleportYieldEvent,
 )
-from vibe.core.utils.http import build_ssl_context
+from vibe.core.utils.http import VibeAsyncHTTPClient, build_ssl_context
 
 
 class TeleportService:
@@ -44,8 +44,8 @@ class TeleportService:
         vibe_code_api_key: str,
         workdir: Path | None = None,
         *,
-        vibe_config: VibeConfig | None = None,
-        client: httpx.AsyncClient | None = None,
+        vibe_config: AnyVibeConfig | None = None,
+        client: VibeAsyncHTTPClient | None = None,
         timeout: float = 60.0,
     ) -> None:
         self._session_logger = session_logger
@@ -60,7 +60,7 @@ class TeleportService:
 
     async def __aenter__(self) -> TeleportService:
         if self._client is None:
-            self._client = httpx.AsyncClient(
+            self._client = VibeAsyncHTTPClient(
                 timeout=httpx.Timeout(self._timeout), verify=build_ssl_context()
             )
         self._nuage_client_instance = NuageClient(
@@ -83,9 +83,9 @@ class TeleportService:
             self._client = None
 
     @property
-    def _http_client(self) -> httpx.AsyncClient:
+    def _http_client(self) -> VibeAsyncHTTPClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(
+            self._client = VibeAsyncHTTPClient(
                 timeout=httpx.Timeout(self._timeout), verify=build_ssl_context()
             )
             self._owns_client = True
@@ -118,14 +118,15 @@ class TeleportService:
         if git_info.branch is None:
             raise ServiceTeleportError("Teleport requires a checked-out branch.")
 
+        remote = git_info.remote_name
         yield TeleportCheckingGitEvent()
-        await self._git.fetch()
+        await self._git.fetch(remote)
         commit_pushed, branch_pushed = await asyncio.gather(
-            self._git.is_commit_pushed(git_info.commit, fetch=False),
-            self._git.is_branch_pushed(fetch=False),
+            self._git.is_commit_pushed(git_info.commit, remote=remote, fetch=False),
+            self._git.is_branch_pushed(remote=remote, fetch=False),
         )
         if not commit_pushed or not branch_pushed:
-            unpushed_count = await self._git.get_unpushed_commit_count()
+            unpushed_count = await self._git.get_unpushed_commit_count(remote)
             response = yield TeleportPushRequiredEvent(
                 unpushed_count=max(1, unpushed_count),
                 branch_not_pushed=not branch_pushed,
@@ -137,7 +138,7 @@ class TeleportService:
                 raise ServiceTeleportError("Teleport cancelled: changes not pushed.")
 
             yield TeleportPushingEvent()
-            await self._push_or_fail()
+            await self._push_or_fail(remote)
 
         yield TeleportStartingWorkflowEvent()
 
@@ -146,9 +147,9 @@ class TeleportService:
         )
         yield TeleportCompleteEvent(url=result.url)
 
-    async def _push_or_fail(self) -> None:
-        if not await self._git.push_current_branch():
-            raise ServiceTeleportError("Failed to push current branch to remote.")
+    async def _push_or_fail(self, remote: str) -> None:
+        if not await self._git.push_current_branch(remote):
+            raise ServiceTeleportError(f"Failed to push current branch to {remote}.")
 
     def _validate_config(self) -> None:
         if not self._vibe_code_api_key:

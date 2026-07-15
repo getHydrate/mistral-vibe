@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import Callable
-import os
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal
 from urllib.parse import urljoin
@@ -10,23 +9,21 @@ from urllib.parse import urljoin
 import httpx
 
 from vibe import __version__
-from vibe.core.config import ProviderConfig, VibeConfig
+from vibe.core.config import AnyVibeConfig, ProviderConfig, resolve_api_key
 from vibe.core.llm.format import ResolvedToolCall
 from vibe.core.logger import logger
 from vibe.core.telemetry.build_metadata import build_base_metadata
 from vibe.core.telemetry.types import (
-    AgentEntrypoint,
     AttachmentKind,
-    EntrypointMetadata,
+    LaunchContext,
     TelemetryCallType,
     TeleportCompletedPayload,
     TeleportFailedPayload,
     TeleportFailureDetails,
     TeleportFailureStage,
-    TerminalEmulator,
 )
 from vibe.core.utils import get_server_url_from_api_base, get_user_agent
-from vibe.core.utils.http import build_ssl_context
+from vibe.core.utils.http import VibeAsyncHTTPClient, build_ssl_context
 
 if TYPE_CHECKING:
     from vibe.core.agent_loop import ToolDecision
@@ -36,7 +33,7 @@ _DATALAKE_EVENTS_PATH = "/v1/datalake/events"
 
 
 def get_mistral_provider_and_api_key(
-    config: VibeConfig,
+    config: AnyVibeConfig,
 ) -> tuple[ProviderConfig, str] | None:
     """Resolve a Mistral provider and its API key, or None.
 
@@ -53,7 +50,7 @@ def get_mistral_provider_and_api_key(
     if provider is None:
         return None
     env_var = provider.api_key_env_var
-    api_key = os.getenv(env_var) if env_var else None
+    api_key = resolve_api_key(env_var)
     if api_key is None:
         return None
     return provider, api_key
@@ -69,19 +66,18 @@ def _extract_file_extension(path: object) -> str | None:
 class TelemetryClient:
     def __init__(
         self,
-        config_getter: Callable[[], VibeConfig],
+        config_getter: Callable[[], AnyVibeConfig],
         session_id_getter: Callable[[], str | None] | None = None,
         parent_session_id_getter: Callable[[], str | None] | None = None,
-        entrypoint_metadata_getter: Callable[[], EntrypointMetadata | None]
-        | None = None,
+        launch_context: LaunchContext | None = None,
         experiments_getter: Callable[[], dict[str, str]] | None = None,
     ) -> None:
         self._config_getter = config_getter
         self._session_id_getter = session_id_getter
         self._parent_session_id_getter = parent_session_id_getter
-        self._entrypoint_metadata_getter = entrypoint_metadata_getter
+        self._launch_context = launch_context
         self._experiments_getter = experiments_getter
-        self._client: httpx.AsyncClient | None = None
+        self._client: VibeAsyncHTTPClient | None = None
         self._pending_tasks: set[asyncio.Task[Any]] = set()
         self.last_correlation_id: str | None = None
 
@@ -106,9 +102,9 @@ class TelemetryClient:
         return self._is_enabled() and self._get_mistral_api_key() is not None
 
     @property
-    def client(self) -> httpx.AsyncClient:
+    def client(self) -> VibeAsyncHTTPClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(
+            self._client = VibeAsyncHTTPClient(
                 timeout=httpx.Timeout(5.0),
                 limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
                 verify=build_ssl_context(),
@@ -132,15 +128,17 @@ class TelemetryClient:
             self._experiments_getter() if self._experiments_getter is not None else None
         )
         return build_base_metadata(
-            entrypoint_metadata=(
-                self._entrypoint_metadata_getter()
-                if self._entrypoint_metadata_getter is not None
-                else None
-            ),
+            launch_context=self._launch_context,
             session_id=self.session_id,
             parent_session_id=self.parent_session_id,
             experiments=experiments,
         )
+
+    def _is_experimental_bash_tool_enabled(self) -> bool:
+        try:
+            return self._config_getter().experimental_bash_tool
+        except Exception:
+            return False
 
     def send_telemetry_event(
         self,
@@ -208,14 +206,14 @@ class TelemetryClient:
                 case "write_file":
                     nb_files_created = 1
                     file_extension = _extract_file_extension(
-                        tool_call.args_dict.get("path")
+                        tool_call.args_dict.get("file_path")
                     )
                 case "edit":
                     nb_files_modified = 1
                     file_extension = _extract_file_extension(
                         tool_call.args_dict.get("file_path")
                     )
-                case "read":
+                case "read_file":
                     file_extension = _extract_file_extension(
                         tool_call.args_dict.get("file_path")
                     )
@@ -280,6 +278,19 @@ class TelemetryClient:
             payload["parent_session_id"] = parent_session_id
         self.send_telemetry_event("vibe.auto_compact_triggered", payload)
 
+    def send_compaction_failed(
+        self,
+        *,
+        reason: Literal["tool_call", "empty_summary"],
+        session_id: str | None = None,
+        parent_session_id: str | None = None,
+    ) -> None:
+        payload: dict[str, Any] = {"reason": reason}
+        if session_id is not None:
+            payload["session_id"] = session_id
+            payload["parent_session_id"] = parent_session_id
+        self.send_telemetry_event("vibe.compaction_failed", payload)
+
     def send_slash_command_used(
         self, command: str, command_type: Literal["builtin", "skill"]
     ) -> None:
@@ -287,26 +298,24 @@ class TelemetryClient:
         self.send_telemetry_event("vibe.slash_command_used", payload)
 
     def send_new_session(
-        self,
-        has_agents_md: bool,
-        nb_skills: int,
-        nb_mcp_servers: int,
-        nb_models: int,
-        entrypoint: AgentEntrypoint,
-        client_name: str | None,
-        client_version: str | None,
-        terminal_emulator: TerminalEmulator | None = None,
+        self, has_agents_md: bool, nb_skills: int, nb_mcp_servers: int, nb_models: int
     ) -> None:
+        lc = self._launch_context
         payload = {
             "has_agents_md": has_agents_md,
             "nb_skills": nb_skills,
             "nb_mcp_servers": nb_mcp_servers,
             "nb_models": nb_models,
-            "entrypoint": entrypoint,
+            "entrypoint": lc.agent_entrypoint if lc else "unknown",
             "version": __version__,
-            "client_name": client_name,
-            "client_version": client_version,
-            "terminal_emulator": terminal_emulator,
+            "client_name": lc.client_name if lc else None,
+            "client_version": lc.client_version if lc else None,
+            "terminal_emulator": (
+                lc.terminal_emulator.value
+                if lc and lc.terminal_emulator is not None
+                else None
+            ),
+            "experimental_bash_tool": self._is_experimental_bash_tool_enabled(),
         }
         self.send_telemetry_event("vibe.new_session", payload)
 
@@ -370,11 +379,6 @@ class TelemetryClient:
             "vibe.user_rating_feedback",
             {"rating": rating, "version": __version__, "model": model},
             correlation_id=self.last_correlation_id,
-        )
-
-    def send_remote_resume_requested(self, *, session_id: str) -> None:
-        self.send_telemetry_event(
-            "vibe.remote_resume_requested", {"session_id": session_id}
         )
 
     def send_teleport_completed(

@@ -2,14 +2,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from vibe.core.tools.connectors.connector_registry import ConnectorRegistry
-
 if TYPE_CHECKING:
-    from vibe.core.config import VibeConfig
+    from vibe.core.config import AnyVibeConfig
+    from vibe.core.tools.connectors.connector_registry import ConnectorRegistry
 
 
 def compute_connector_counts(
-    config: VibeConfig, connector_registry: ConnectorRegistry | None
+    config: AnyVibeConfig, connector_registry: ConnectorRegistry | None
 ) -> tuple[int, int]:
     if connector_registry is None:
         return (0, 0)

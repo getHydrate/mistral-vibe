@@ -2,29 +2,21 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
+import platform
 import sys
 
-from vibe.cli.plan_offer.decide_plan_offer import PlanInfo
+from vibe.cli.constants import CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM
 
 ALT_KEY = "⌥" if sys.platform == "darwin" else "Alt"
 
 
 @dataclass(frozen=True)
-class CommandAvailabilityContext:
+class CommandContext:
     vibe_code_enabled: bool = False
-    is_active_model_mistral: bool = False
-    plan_info: PlanInfo | None = None
-
-    def is_teleport_available(self) -> bool:
-        return (
-            self.vibe_code_enabled
-            and self.is_active_model_mistral
-            and self.plan_info is not None
-            and self.plan_info.is_teleport_eligible()
-        )
+    experimental_vibe_code_project_picker_enabled: bool = False
 
 
-CommandAvailability = Callable[[CommandAvailabilityContext], bool]
+CommandAvailability = Callable[[CommandContext], bool]
 
 
 @dataclass
@@ -40,14 +32,18 @@ class CommandRegistry:
     def __init__(
         self,
         excluded_commands: list[str] | None = None,
-        availability_context: CommandAvailabilityContext | None = None,
+        vibe_code_enabled: bool = False,
+        experimental_vibe_code_project_picker_enabled: bool = False,
     ) -> None:
         if excluded_commands is None:
             excluded_commands = []
         self._disabled_commands = set(excluded_commands)
-        self._availability_context = CommandAvailabilityContext()
         self._commands: dict[str, Command] = {}
-        self.refresh(availability_context)
+        self.refresh(
+            CommandContext(
+                vibe_code_enabled, experimental_vibe_code_project_picker_enabled
+            )
+        )
 
     def _build_commands(self) -> dict[str, Command]:
         return {
@@ -86,6 +82,14 @@ class CommandRegistry:
                 description="Copy the last agent message to the clipboard",
                 handler="_copy_last_agent_message",
             ),
+            "paste-image": Command(
+                aliases=frozenset(["/paste-image"]),
+                description="Paste an image from the OS clipboard into the prompt",
+                handler="_paste_clipboard_image_command",
+                is_available=lambda _ctx: (
+                    platform.system() == CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM
+                ),
+            ),
             "log": Command(
                 aliases=frozenset(["/log"]),
                 description="Show path to current interaction log file",
@@ -116,7 +120,16 @@ class CommandRegistry:
                 aliases=frozenset(["/teleport"]),
                 description="Teleport session to Vibe Code Web",
                 handler="_teleport_command",
-                is_available=CommandAvailabilityContext.is_teleport_available,
+                is_available=lambda ctx: ctx.vibe_code_enabled,
+            ),
+            "remote-project": Command(
+                aliases=frozenset(["/remote-project"]),
+                description="Preview the Vibe Code Web project picker",
+                handler="_vibe_code_project_command",
+                is_available=lambda ctx: (
+                    ctx.vibe_code_enabled
+                    and ctx.experimental_vibe_code_project_picker_enabled
+                ),
             ),
             "proxy-setup": Command(
                 aliases=frozenset(["/proxy-setup"]),
@@ -137,7 +150,9 @@ class CommandRegistry:
                 aliases=frozenset(["/mcp", "/connectors"]),
                 description=(
                     "Display available MCP servers and connectors. "
-                    "Pass a name to list its tools"
+                    "Pass a name to list tools; subcommands: add <url> "
+                    "[--transport http|streamable-http], status, login <alias>, "
+                    "logout <alias>"
                 ),
                 handler="_show_mcp",
             ),
@@ -185,12 +200,8 @@ class CommandRegistry:
     def commands(self) -> dict[str, Command]:
         return self._commands
 
-    def refresh(
-        self, availability_context: CommandAvailabilityContext | None = None
-    ) -> None:
-        self._availability_context = (
-            availability_context or CommandAvailabilityContext()
-        )
+    def refresh(self, context: CommandContext | None = None) -> None:
+        self._context = context or CommandContext()
         self._commands = {
             name: command
             for name, command in self._build_commands().items()
@@ -201,7 +212,7 @@ class CommandRegistry:
     def _is_command_available(self, command: Command) -> bool:
         if command.is_available is None:
             return True
-        return command.is_available(self._availability_context)
+        return command.is_available(self._context)
 
     def _alias_map(self) -> dict[str, str]:
         return {
@@ -260,7 +271,13 @@ class CommandRegistry:
             "",
         ]
 
-        for cmd in self.commands.values():
-            aliases = ", ".join(f"`{alias}`" for alias in sorted(cmd.aliases))
+        for name, cmd in sorted(self.commands.items()):
+            canonical_alias = f"/{name}"
+            aliases = ", ".join(
+                f"`{alias}`"
+                for alias in sorted(
+                    cmd.aliases, key=lambda alias: (alias != canonical_alias, alias)
+                )
+            )
             lines.append(f"- {aliases}: {cmd.description}")
         return "\n".join(lines)

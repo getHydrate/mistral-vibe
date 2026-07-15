@@ -10,10 +10,11 @@ from textual.validation import Length
 from textual.widgets import Input, Link
 
 from vibe.cli.clipboard import copy_selection_to_clipboard
+from vibe.cli.textual_ui.shortcut_hints import shortcut, shortcut_hint
 from vibe.cli.textual_ui.widgets.banner.petit_chat import PetitChat
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from vibe.core.config import DEFAULT_VIBE_BASE_URL, ProviderConfig
-from vibe.core.telemetry.types import EntrypointMetadata
+from vibe.core.telemetry.types import LaunchContext
 from vibe.setup.auth.api_key_persistence import (
     persist_api_key,
     resolve_api_key_provider,
@@ -40,12 +41,12 @@ class ApiKeyScreen(OnboardingScreen):
         provider: ProviderConfig | None = None,
         *,
         vibe_base_url: str = DEFAULT_VIBE_BASE_URL,
-        entrypoint_metadata: EntrypointMetadata | None = None,
+        launch_context: LaunchContext | None = None,
     ) -> None:
         super().__init__()
         self.provider = resolve_api_key_provider(provider)
         self._vibe_base_url = vibe_base_url
-        self._entrypoint_metadata = entrypoint_metadata
+        self._launch_context = launch_context
 
     def _compose_provider_link(self) -> ComposeResult:
         if self.provider.name != MISTRAL_PROVIDER_NAME:
@@ -110,7 +111,7 @@ class ApiKeyScreen(OnboardingScreen):
         feedback.remove_class("error", "success")
 
         if event.validation_result.is_valid:
-            feedback.update("Press Enter to submit ↵")
+            feedback.update(shortcut_hint(f"Press {shortcut('Enter')} to submit ↵"))
             feedback.add_class("success")
             input_box.add_class("valid")
             return
@@ -126,9 +127,7 @@ class ApiKeyScreen(OnboardingScreen):
 
     def _save_and_finish(self, api_key: str) -> None:
         self.app.exit(
-            persist_api_key(
-                self.provider, api_key, entrypoint_metadata=self._entrypoint_metadata
-            )
+            persist_api_key(self.provider, api_key, launch_context=self._launch_context)
         )
 
     def on_mouse_up(self, event: MouseUp) -> None:

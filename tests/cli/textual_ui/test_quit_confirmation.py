@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import asyncio
+from collections.abc import Callable
+import signal
 import time
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+from textual.app import WINDOWS
 
-from tests.conftest import build_test_vibe_app
-from vibe.cli.textual_ui.app import VibeApp
+from tests.conftest import build_test_vibe_app, build_test_vibe_config
+from vibe.cli.textual_ui.app import VibeApp, _run_app_with_cleanup
 from vibe.cli.textual_ui.quit_manager import QUIT_CONFIRM_DELAY, QuitManager
 
 
@@ -182,3 +186,114 @@ class TestActionDeleteRightOrQuit:
         mock_confirm.assert_called_once_with(
             "Ctrl+D", "1 queued message will be discarded"
         )
+
+    def test_quits_immediately_when_confirmation_disabled(self) -> None:
+        app = build_test_vibe_app(
+            config=build_test_vibe_config(ask_confirmation_on_exit=False)
+        )
+        with (
+            patch.object(app, "_get_chat_input", return_value=None),
+            patch.object(app, "_force_quit") as mock_quit,
+            patch.object(app._quit_manager, "request_confirmation") as mock_confirm,
+        ):
+            app.action_delete_right_or_quit()
+        mock_quit.assert_called_once()
+        mock_confirm.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cleanup_cancels_in_flight_tasks(app: VibeApp) -> None:
+    async def _pending() -> None:
+        await asyncio.Event().wait()
+
+    agent_task = asyncio.create_task(_pending())
+    bash_task = asyncio.create_task(_pending())
+    app._agent_task = agent_task
+    app._bash_task = bash_task
+
+    await asyncio.wait_for(app.shutdown_cleanup(), timeout=1.0)
+
+    assert agent_task.cancelled()
+    assert bash_task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_disables_future_queue_drains(app: VibeApp) -> None:
+    app._input_queue.append_prompt("queued")
+
+    await app._begin_shutdown()
+
+    with patch("vibe.cli.textual_ui.message_queue.asyncio.create_task") as create_task:
+        app._queue.start_drain_if_needed()
+
+    create_task.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_begin_shutdown_stops_scheduled_loop_runner(app: VibeApp) -> None:
+    with (
+        patch.object(app._queue, "shutdown", new_callable=AsyncMock) as queue_shutdown,
+        patch.object(app._loop_runner, "stop", new_callable=AsyncMock) as loop_stop,
+    ):
+        await app._begin_shutdown()
+
+    queue_shutdown.assert_awaited_once()
+    loop_stop.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_cleanup_flushes_telemetry(app: VibeApp) -> None:
+    with patch.object(
+        app.agent_loop.telemetry_client, "aclose", new_callable=AsyncMock
+    ) as telemetry_aclose:
+        await app.shutdown_cleanup()
+
+    telemetry_aclose.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_run_app_with_cleanup_runs_cleanup_when_run_async_raises(
+    app: VibeApp,
+) -> None:
+    with (
+        patch.object(
+            app, "run_async", new_callable=AsyncMock, side_effect=RuntimeError("boom")
+        ),
+        patch.object(app, "shutdown_cleanup", new_callable=AsyncMock) as cleanup,
+    ):
+        with pytest.raises(RuntimeError, match="boom"):
+            await _run_app_with_cleanup(app)
+
+    cleanup.assert_awaited_once()
+
+
+def test_force_quit_delegates_to_private(app: VibeApp) -> None:
+    with patch.object(app, "_force_quit") as private:
+        app._force_quit()
+
+    private.assert_called_once_with()
+
+
+@pytest.mark.skipif(WINDOWS, reason="SIGTERM handlers are not installed on Windows")
+@pytest.mark.asyncio
+async def test_run_app_with_cleanup_sigterm_triggers_force_quit(app: VibeApp) -> None:
+    captured: list[Callable[[], None]] = []
+    loop = asyncio.get_running_loop()
+
+    def capture_add(sig: int, callback: Callable[[], None], *args: object) -> None:
+        captured.append(callback)
+
+    async def fake_run_async() -> None:
+        captured[0]()
+
+    with (
+        patch.object(loop, "add_signal_handler", side_effect=capture_add),
+        patch.object(loop, "remove_signal_handler") as remove_handler,
+        patch.object(app, "run_async", side_effect=fake_run_async),
+        patch.object(app, "shutdown_cleanup", new_callable=AsyncMock),
+        patch.object(app, "_force_quit") as force_quit,
+    ):
+        await _run_app_with_cleanup(app)
+
+    force_quit.assert_called_once_with()
+    remove_handler.assert_any_call(signal.SIGTERM)

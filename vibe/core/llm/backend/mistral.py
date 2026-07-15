@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Sequence
 import json
-import os
 import types
 from typing import TYPE_CHECKING, Literal, NamedTuple, cast
 
@@ -32,7 +31,9 @@ from mistralai.client.models import (
     UserMessage,
 )
 from mistralai.client.utils.retries import BackoffStrategy, RetryConfig
+from mistralai.extra.observability.telemetry import configure_telemetry
 
+from vibe.core.config import resolve_api_key
 from vibe.core.llm.backend._image import to_data_uri as _to_data_uri
 from vibe.core.llm.exceptions import BackendErrorBuilder
 from vibe.core.types import (
@@ -47,7 +48,7 @@ from vibe.core.types import (
     ToolCall,
 )
 from vibe.core.utils import get_server_url_from_api_base
-from vibe.core.utils.http import build_ssl_context
+from vibe.core.utils.http import VibeAsyncHTTPClient, build_ssl_context
 
 if TYPE_CHECKING:
     from vibe.core.config import ModelConfig, ProviderConfig
@@ -196,16 +197,19 @@ _THINKING_TO_REASONING_EFFORT: dict[str, ReasoningEffortValue] = {
 
 
 class MistralBackend:
-    def __init__(self, provider: ProviderConfig, timeout: float = 720.0) -> None:
+    def __init__(
+        self,
+        provider: ProviderConfig,
+        timeout: float = 720.0,
+        retry_max_elapsed_time: float = 300.0,
+        enable_otel: bool = False,
+    ) -> None:
         self._client: Mistral | None = None
-        self._http_client: httpx.AsyncClient | None = None
+        self._http_client: VibeAsyncHTTPClient | None = None
         self._provider = provider
+        self._enable_otel = enable_otel
         self._mapper = MistralMapper()
-        self._api_key = (
-            os.getenv(self._provider.api_key_env_var)
-            if self._provider.api_key_env_var
-            else None
-        )
+        self._api_key = resolve_api_key(self._provider.api_key_env_var)
 
         reasoning_field = getattr(provider, "reasoning_field_name", "reasoning_content")
         if reasoning_field != "reasoning_content":
@@ -223,16 +227,18 @@ class MistralBackend:
             )
         self._server_url = server_url
         self._timeout = timeout
+        self._retry_max_elapsed_time = retry_max_elapsed_time
         self._retry_config = self._build_retry_config()
 
     def _build_retry_config(self) -> RetryConfig:
+        max_elapsed_time_ms = int(self._retry_max_elapsed_time * 1000)
         return RetryConfig(
             strategy="backoff",
             backoff=BackoffStrategy(
                 initial_interval=500,
                 max_interval=30000,
                 exponent=1.5,
-                max_elapsed_time=300000,
+                max_elapsed_time=max_elapsed_time_ms,
             ),
             retry_connection_errors=True,
         )
@@ -265,16 +271,19 @@ class MistralBackend:
         await self.__aexit__(None, None, None)
 
     def _create_mistral_client(self) -> Mistral:
-        self._http_client = httpx.AsyncClient(
+        self._http_client = VibeAsyncHTTPClient(
             verify=build_ssl_context(), follow_redirects=True
         )
-        return Mistral(
+        client = Mistral(
             api_key=self._api_key,
             server_url=self._server_url,
             timeout_ms=int(self._timeout * 1000),
             retry_config=self._retry_config,
             async_client=self._http_client,
         )
+        if self._enable_otel:
+            configure_telemetry(client, provider="global")
+        return client
 
     def _get_client(self) -> Mistral:
         if self._client is None:
@@ -345,6 +354,7 @@ class MistralBackend:
                 provider=self._provider.name,
                 endpoint=self._server_url,
                 error=e,
+                response=e.raw_response,
                 model=model.name,
                 messages=messages,
                 temperature=temperature,
@@ -434,6 +444,7 @@ class MistralBackend:
                 provider=self._provider.name,
                 endpoint=self._server_url,
                 error=e,
+                response=e.raw_response,
                 model=model.name,
                 messages=messages,
                 temperature=temperature,

@@ -3,6 +3,7 @@ from __future__ import annotations
 from textual import events
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical
+from textual.content import Content
 from textual.widgets import Static
 
 from vibe.cli.textual_ui.widgets.collapsible import (
@@ -10,13 +11,18 @@ from vibe.cli.textual_ui.widgets.collapsible import (
     CollapsibleSection,
     lines_label,
 )
+from vibe.cli.textual_ui.widgets.links import LinkStatic, linkify_urls_in_text
 from vibe.cli.textual_ui.widgets.messages import ExpandingBorder
 from vibe.cli.textual_ui.widgets.no_markup_static import (
     NoMarkupStatic,
     NonSelectableStatic,
 )
-from vibe.cli.textual_ui.widgets.status_message import StatusMessage
-from vibe.cli.textual_ui.widgets.tool_widgets import ToolResultWidget, get_result_widget
+from vibe.cli.textual_ui.widgets.status_message import IndicatorState, StatusMessage
+from vibe.cli.textual_ui.widgets.tool_widgets import (
+    LINKIFY_RESULT_TOOLS,
+    ToolResultWidget,
+    get_result_widget,
+)
 from vibe.core.tools.ui import ToolCallDisplay, ToolUIDataAdapter
 from vibe.core.types import ToolCallEvent, ToolResultEvent
 
@@ -47,7 +53,7 @@ class ToolCallMessage(StatusMessage):
                     self._spinner.current_frame(), classes="status-indicator-icon"
                 )
                 yield self._indicator_widget
-                self._text_widget = NoMarkupStatic("", classes="status-indicator-text")
+                self._text_widget = LinkStatic("", classes="status-indicator-text")
                 yield self._text_widget
                 self._suffix_widget = NoMarkupStatic(
                     "", classes="status-indicator-suffix"
@@ -98,12 +104,15 @@ class ToolCallMessage(StatusMessage):
         """Stop the spinner while keeping stream row stable to avoid layout jumps."""
         super().stop_spinning(success)
 
-    def set_result_text(self, text: str, suffix: str = "") -> None:
-        self._set_text(text, suffix)
+    def set_result_text(
+        self, text: str, suffix: str = "", *, linkify: bool = False
+    ) -> None:
+        self._set_text(text, suffix, linkify=linkify)
 
-    def _set_text(self, text: str, suffix: str) -> None:
+    def _set_text(self, text: str, suffix: str, *, linkify: bool = False) -> None:
         if self._text_widget:
-            self._text_widget.update(text)
+            content = linkify_urls_in_text(text) if linkify else text
+            self._text_widget.update(content)
         self._update_suffix(suffix)
 
     def _update_suffix(self, suffix: str) -> None:
@@ -114,6 +123,15 @@ class ToolCallMessage(StatusMessage):
     def update_display(self) -> None:
         super().update_display()
         self._update_suffix(self.get_content_suffix())
+
+    def show_muted(self) -> None:
+        # Neutral grey square with the call summary -- used for an error whose
+        # verdict is still unknown, a user-declined call, and a cancelled call.
+        self.settle(IndicatorState.MUTED)
+
+    def escalate_error(self) -> None:
+        # No recovery followed: promote the held square to a hard red cross.
+        self.settle(IndicatorState.ERROR)
 
 
 class ToolResultMessage(ClickWithoutDragMixin, Static):
@@ -134,6 +152,7 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
         self._content = content
         self._content_container: Vertical | None = None
         self._result_widget: ToolResultWidget | None = None
+        self._is_error = False
 
         super().__init__()
         self.add_class("tool-result")
@@ -151,11 +170,34 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
 
     async def on_mount(self) -> None:
         if self._call_widget:
-            success = self._determine_success()
-            self._call_widget.stop_spinning(success=success)
+            if self._event is not None and self._event.error:
+                # Start muted; the verdict (recoverable vs terminal) lands later.
+                self._call_widget.show_muted()
+            elif self._event is not None and self._event.skipped:
+                # A declined/denied call is the user's choice, not a failure.
+                self._call_widget.show_muted()
+                result_text, result_suffix = self._get_result_text()
+                self._call_widget.set_result_text(result_text, result_suffix)
+            else:
+                success = self._determine_success()
+                self._call_widget.stop_spinning(success=success)
+                result_text, result_suffix = self._get_result_text()
+                linkify = self._tool_name in LINKIFY_RESULT_TOOLS
+                self._call_widget.set_result_text(
+                    result_text, result_suffix, linkify=linkify
+                )
+        await self._render_result()
+
+    def escalate_error(self) -> None:
+        # Turn ended without a follow-up tool call: switch to the red-cross icon
+        # and error header. The folded body keeps the same style as a recoverable
+        # error -- only the leading "Error" word stays colored.
+        if not self._is_error:
+            return
+        if self._call_widget is not None:
+            self._call_widget.escalate_error()
             result_text, result_suffix = self._get_result_text()
             self._call_widget.set_result_text(result_text, result_suffix)
-        await self._render_result()
 
     def _determine_success(self) -> bool:
         if self._event is None:
@@ -206,13 +248,15 @@ class ToolResultMessage(ClickWithoutDragMixin, Static):
             return
 
         if self._event.error:
-            self.add_class("error-text")
-            error_text = f"Error: {self._event.error}"
-            line_count = len(error_text.strip("\n").split("\n"))
+            self._is_error = True
+            # Only the inline "Error" span is ever colored; escalation changes the
+            # call icon to a red cross but leaves this folded body untouched.
+            line_count = len(self._event.error.strip("\n").split("\n"))
+            detail = Static(
+                Content.from_markup("[$error]Error[/]: ") + Content(self._event.error)
+            )
             await self._content_container.mount(
-                CollapsibleSection(
-                    NoMarkupStatic(error_text), collapsed_label=lines_label(line_count)
-                )
+                CollapsibleSection(detail, collapsed_label=lines_label(line_count))
             )
             self.display = True
             return

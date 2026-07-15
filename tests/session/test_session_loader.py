@@ -217,6 +217,26 @@ class TestSessionLoaderFindLatestSession:
         )
         assert result == expected
 
+    def test_find_latest_session_matches_unnormalized_stored_cwd(
+        self, session_config: SessionLoggingConfig, create_test_session, tmp_path: Path
+    ) -> None:
+        project = tmp_path / "project"
+        project.mkdir()
+        unnormalized = project.parent / "sub" / ".." / "project"
+
+        expected = create_test_session(
+            Path(session_config.save_dir),
+            "unnormalized-session",
+            working_directory=unnormalized,
+        )
+
+        assert str(unnormalized) != str(project.resolve())
+
+        result = SessionLoader.find_latest_session(
+            session_config, working_directory=project.resolve()
+        )
+        assert result == expected
+
     def test_find_latest_session_nonexistent_save_dir(self) -> None:
         """Test finding latest session when save directory doesn't exist."""
         # Modify config to point to non-existent directory
@@ -578,6 +598,22 @@ class TestSessionLoaderLoadSession:
 
         with pytest.raises(ValueError, match="Session messages file is empty"):
             SessionLoader.load_session(session_folder)
+
+    def test_load_session_empty_messages_valid_when_metadata_records_zero(
+        self, session_config: SessionLoggingConfig
+    ) -> None:
+        session_dir = Path(session_config.save_dir)
+        session_folder = session_dir / "test_20230101_120000_test123"
+        session_folder.mkdir()
+
+        (session_folder / "messages.jsonl").write_text("")
+        (session_folder / "meta.json").write_text(
+            json.dumps({"session_id": "test-session", "total_messages": 0})
+        )
+
+        messages, metadata = SessionLoader.load_session(session_folder)
+        assert messages == []
+        assert metadata["total_messages"] == 0
 
     def test_load_session_invalid_json_messages(
         self, session_config: SessionLoggingConfig

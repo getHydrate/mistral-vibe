@@ -38,6 +38,7 @@
 .terminal-r4 { fill: #c5c8c6;font-weight: bold }
 .terminal-r5 { fill: #868887 }
 .terminal-r6 { fill: #ffa500;font-weight: bold }
+.terminal-r7 { fill: #608ab1;font-weight: bold }
     </style>
 
     <defs>
@@ -190,13 +191,13 @@
 </text><text class="terminal-r1" x="1464" y="654.4" textLength="12.2" clip-path="url(#terminal-line-26)">
 </text><text class="terminal-r1" x="24.4" y="678.8" textLength="268.4" clip-path="url(#terminal-line-27)">Hello!&#160;I&#160;can&#160;help&#160;you.</text><text class="terminal-r1" x="1464" y="678.8" textLength="12.2" clip-path="url(#terminal-line-27)">
 </text><text class="terminal-r1" x="1464" y="703.2" textLength="12.2" clip-path="url(#terminal-line-28)">
-</text><text class="terminal-r6" x="0" y="727.6" textLength="12.2" clip-path="url(#terminal-line-29)">█</text><text class="terminal-r1" x="12.2" y="727.6" textLength="158.6" clip-path="url(#terminal-line-29)">&#160;summarizing&#160;</text><text class="terminal-r5" x="170.8" y="727.6" textLength="219.6" clip-path="url(#terminal-line-29)">Esc/Ctrl+C&#160;to&#160;stop</text><text class="terminal-r1" x="1464" y="727.6" textLength="12.2" clip-path="url(#terminal-line-29)">
+</text><text class="terminal-r6" x="0" y="727.6" textLength="12.2" clip-path="url(#terminal-line-29)">█</text><text class="terminal-r1" x="12.2" y="727.6" textLength="158.6" clip-path="url(#terminal-line-29)">&#160;summarizing&#160;</text><text class="terminal-r7" x="170.8" y="727.6" textLength="122" clip-path="url(#terminal-line-29)">Esc/Ctrl+C</text><text class="terminal-r5" x="292.8" y="727.6" textLength="97.6" clip-path="url(#terminal-line-29)">&#160;to&#160;stop</text><text class="terminal-r1" x="1464" y="727.6" textLength="12.2" clip-path="url(#terminal-line-29)">
 </text><text class="terminal-r1" x="0" y="752" textLength="1464" clip-path="url(#terminal-line-30)">──────────────────────────────────────────────────────────────────────────────────────────────────────────────&#160;default&#160;─</text><text class="terminal-r1" x="1464" y="752" textLength="12.2" clip-path="url(#terminal-line-30)">
 </text><text class="terminal-r2" x="0" y="776.4" textLength="12.2" clip-path="url(#terminal-line-31)">&gt;</text><text class="terminal-r1" x="1464" y="776.4" textLength="12.2" clip-path="url(#terminal-line-31)">
 </text><text class="terminal-r1" x="1464" y="800.8" textLength="12.2" clip-path="url(#terminal-line-32)">
 </text><text class="terminal-r1" x="1464" y="825.2" textLength="12.2" clip-path="url(#terminal-line-33)">
 </text><text class="terminal-r1" x="0" y="849.6" textLength="1464" clip-path="url(#terminal-line-34)">────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────</text><text class="terminal-r1" x="1464" y="849.6" textLength="12.2" clip-path="url(#terminal-line-34)">
-</text><text class="terminal-r5" x="0" y="874" textLength="158.6" clip-path="url(#terminal-line-35)">/test/workdir</text><text class="terminal-r5" x="1256.6" y="874" textLength="207.4" clip-path="url(#terminal-line-35)">6%&#160;of&#160;200k&#160;tokens</text>
+</text><text class="terminal-r5" x="0" y="874" textLength="158.6" clip-path="url(#terminal-line-35)">/test/workdir</text><text class="terminal-r5" x="1220" y="874" textLength="244" clip-path="url(#terminal-line-35)">12k/200k&#160;tokens&#160;(6%)</text>
     </g>
     </g>
 </svg>

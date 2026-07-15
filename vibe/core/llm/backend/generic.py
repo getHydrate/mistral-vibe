@@ -2,12 +2,12 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Sequence
 import json
-import os
 import types
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import httpx
 
+from vibe.core.config import resolve_api_key
 from vibe.core.llm.backend._image import to_data_uri as _to_data_uri
 from vibe.core.llm.backend.anthropic import AnthropicAdapter
 from vibe.core.llm.backend.base import APIAdapter, PreparedRequest
@@ -23,7 +23,7 @@ from vibe.core.types import (
     StrToolChoice,
 )
 from vibe.core.utils import async_generator_retry, async_retry
-from vibe.core.utils.http import build_ssl_context
+from vibe.core.utils.http import VibeAsyncHTTPClient, build_ssl_context
 from vibe.core.utils.sse import iter_sse_lines
 
 if TYPE_CHECKING:
@@ -123,6 +123,7 @@ class OpenAIAdapter(APIAdapter):
                             "reasoning_state",
                             "injected",
                             "images",
+                            "user_display_content",
                         },
                     ),
                     field_name,
@@ -211,14 +212,14 @@ class GenericBackend:
     def __init__(
         self,
         *,
-        client: httpx.AsyncClient | None = None,
+        client: VibeAsyncHTTPClient | None = None,
         provider: ProviderConfig,
         timeout: float = 720.0,
     ) -> None:
         """Initialize the backend.
 
         Args:
-            client: Optional httpx client to use. If not provided, one will be created.
+            client: Optional Vibe HTTP client to use. If not provided, one will be created.
         """
         self._client = client
         self._owns_client = client is None
@@ -227,7 +228,7 @@ class GenericBackend:
 
     async def __aenter__(self) -> GenericBackend:
         if self._client is None:
-            self._client = httpx.AsyncClient(
+            self._client = VibeAsyncHTTPClient(
                 timeout=httpx.Timeout(self._timeout),
                 limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
                 verify=build_ssl_context(),
@@ -244,9 +245,9 @@ class GenericBackend:
             await self._client.aclose()
             self._client = None
 
-    def _get_client(self) -> httpx.AsyncClient:
+    def _get_client(self) -> VibeAsyncHTTPClient:
         if self._client is None:
-            self._client = httpx.AsyncClient(
+            self._client = VibeAsyncHTTPClient(
                 timeout=httpx.Timeout(self._timeout),
                 limits=httpx.Limits(max_keepalive_connections=5, max_connections=10),
                 verify=build_ssl_context(),
@@ -266,11 +267,7 @@ class GenericBackend:
         extra_headers: dict[str, str] | None = None,
         metadata: dict[str, str] | None = None,
     ) -> LLMChunk:
-        api_key = (
-            os.getenv(self._provider.api_key_env_var)
-            if self._provider.api_key_env_var
-            else None
-        )
+        api_key = resolve_api_key(self._provider.api_key_env_var)
 
         api_style = getattr(self._provider, "api_style", "openai")
         adapter = _get_adapter(api_style)
@@ -304,6 +301,7 @@ class GenericBackend:
                 provider=self._provider.name,
                 endpoint=url,
                 error=e,
+                response=e.response,
                 model=model.name,
                 messages=messages,
                 temperature=temperature,
@@ -334,11 +332,7 @@ class GenericBackend:
         extra_headers: dict[str, str] | None = None,
         metadata: dict[str, str] | None = None,
     ) -> AsyncGenerator[LLMChunk, None]:
-        api_key = (
-            os.getenv(self._provider.api_key_env_var)
-            if self._provider.api_key_env_var
-            else None
-        )
+        api_key = resolve_api_key(self._provider.api_key_env_var)
 
         api_style = getattr(self._provider, "api_style", "openai")
         adapter = _get_adapter(api_style)
@@ -372,6 +366,7 @@ class GenericBackend:
                 provider=self._provider.name,
                 endpoint=url,
                 error=e,
+                response=e.response,
                 model=model.name,
                 messages=messages,
                 temperature=temperature,

@@ -31,10 +31,11 @@ agents, prompts, logs, and session data live here.
   .env                 # API keys and credentials (dotenv format)
   vibehistory          # Command history
   trusted_folders.toml # Trust database for project folders
+  connector_bootstrap_cache.json # Short-lived connector discovery cache
   agents/              # Custom agent profiles (*.toml)
   prompts/             # Custom prompts (*.md)
   skills/              # User-level skills (each skill is a subdirectory with SKILL.md)
-  tools/               # Custom tool definitions
+  tools/               # Custom tools (<name>.py); descriptions & overrides in tools/prompts/<name>.md
   logs/
     vibe.log           # Main log file
     session/           # Session log files
@@ -50,10 +51,19 @@ When in a trusted folder, Vibe also looks for project-local configuration:
 - `.vibe/config.toml` - Project-specific config (overrides user config)
 - `.vibe/hooks.toml` - Project-specific hooks (requires trusted folder)
 - `.vibe/skills/` - Project-specific skills
-- `.vibe/tools/` - Project-specific tools
+- `.vibe/tools/` - Project-specific tools (`<name>.py`); a `prompts/<name>.md` beside them sets or overrides the description of the tool named `<name>` — builtin, MCP, or custom (e.g. `.vibe/tools/prompts/bash.md` re-describes `bash`). Same `tools/*.py` + `tools/prompts/*.md` layout as the builtins.
 - `.vibe/agents/` - Project-specific agents
 - `.vibe/prompts/` - Project-specific prompts
 - `.agents/skills/` - Standard agent skills directory
+
+### AGENTS.md Discovery
+
+`AGENTS.md` files provide directory-scoped instructions to the model. At startup,
+Vibe loads `~/.vibe/AGENTS.md` and every `AGENTS.md` from the project root up
+through the trust chain. `AGENTS.md` files in subdirectories are discovered
+lazily: when `read_file` reads a file below the project root, any `AGENTS.md`
+between the file's parent and the project root is injected into
+context.
 
 ## Lifecycle: Exit, Update, Version, Resume
 
@@ -62,7 +72,9 @@ When in a trusted folder, Vibe also looks for project-local configuration:
 Chat input (case-insensitive): `/exit`, `exit`, `quit`, `:q`, `:quit`.
 Keyboard: `Ctrl+C` / `Ctrl+D` — press twice within ~1s to quit. For `Ctrl+C`,
 the first press instead interrupts the running job or clears the input if either
-is present. `Ctrl+Z` suspends on POSIX (resume with `fg`).
+is present. Set `ask_confirmation_on_exit = false` to make `Ctrl+D` quit on the
+first press (also toggleable in `/config`); `Ctrl+C` always requires a second
+press. `Ctrl+Z` suspends on POSIX (resume with `fg`).
 
 ### Update
 
@@ -70,7 +82,8 @@ Vibe never updates silently. With `enable_update_checks = true` (default), it
 polls PyPI for `mistral-vibe` daily and prompts on the next launch when a
 newer release exists; accepting runs `uv tool upgrade mistral-vibe`, then
 `brew upgrade mistral-vibe` as a fallback. Disable via `enable_update_checks
-= false`. Initial install: `uv tool install mistral-vibe`.
+= false`. Run `vibe --check-upgrade` to check immediately, prompt to install a newer
+version if one exists, and exit. Initial install: `uv tool install mistral-vibe`.
 
 ### Version
 
@@ -92,8 +105,7 @@ current folder**: only sessions whose `cwd` matches where Vibe is launched are
 listed, so the same directory shows its own history and nothing else. Switch
 folders to see a different set. The explicit `--resume <SESSION_ID>` form is
 **not** folder-scoped: it resolves the session by id regardless of which folder
-it ran in. When Vibe Code is enabled, active **remote** sessions are listed
-alongside local ones in the picker (tagged `remote`) and are not folder-scoped.
+it ran in.
 
 ## Configuration (config.toml)
 
@@ -110,10 +122,10 @@ from `~/.vibe/prompts/`, and finally from the built-in bundled prompts.
 active_model = "mistral-medium-3.5"  # Model alias to use (see [[models]])
 
 # UI preferences
-vim_keybindings = false
 disable_welcome_banner_animation = false
 autocopy_to_clipboard = true
 file_watcher_for_autocomplete = false
+ask_confirmation_on_exit = true  # Require a second Ctrl+D to quit (Ctrl+C always confirms)
 
 # Behavior
 bypass_tool_permissions = false    # Skip tool approval prompts
@@ -124,6 +136,7 @@ enable_update_checks = true       # Daily PyPI check; prompts on next launch whe
 enable_notifications = true
 enable_system_trust_store = false  # Use OS trust store for outbound HTTPS
 api_timeout = 720.0               # API request timeout in seconds
+api_retry_max_elapsed_time = 300.0  # Retry budget for retryable API failures in seconds
 auto_compact_threshold = 200000   # Token count before auto-compaction
 
 # Git commit behavior
@@ -191,15 +204,27 @@ alias = "local"
 tool_paths = ["/path/to/custom/tools"]
 
 # Enable only specific tools (glob and regex supported)
-enabled_tools = ["bash", "read", "grep"]
+enabled_tools = ["bash", "read_file", "grep"]
 
-# Disable specific tools
-disabled_tools = ["webfetch"]
+# Disable specific tools after enabled_tools filtering
+disabled_tools = ["web_fetch"]
+
+# Opt into the managed PTY bash experiment
+experimental_bash_tool = true
 
 # Per-tool configuration
 [tools.bash]
 allowlist = ["git", "npm", "python"]
 ```
+
+The built-in `bash` tool runs one-off shell commands by default. Set
+`experimental_bash_tool = true` to replace it with the experimental managed PTY
+implementation under the same `bash` tool name, which also enables the companion
+tools `bash_output`, `bash_stdin`, `bash_sessions`, and `bash_log_file` and
+persists session logs under `~/.vibe/bash-tool/`. Both implementations read
+permissions and allow/deny lists from `[tools.bash]`. Output polling uses byte
+offset cursors (`cursor` / `next_cursor`), `max_bytes` caps per-call inline
+output, and `max_inline_bytes` configures the default cap.
 
 **Special case — `find` command:** Even if `find` is in the bash allowlist,
 Vibe detects `-exec`, `-execdir`, `-ok`, and `-okdir` predicates and will
@@ -258,6 +283,20 @@ default_agent = "plan"
 
 ### MCP Servers
 
+Hosted OAuth MCP servers can be added from inside Vibe:
+
+```text
+/mcp add https://mcp.linear.app/mcp
+/mcp add https://mcp.example.com/mcp --name docs --scope read --transport http --no-login
+```
+
+`/mcp add` is OAuth-only. It writes `auth.type = "oauth"` with optional
+scopes and starts login by default. It uses `transport = "streamable-http"`
+unless you pass `--transport http`. Pass `--no-login` to add the server without
+starting OAuth login. The shortcut supports `streamable-http` and `http`
+transports. For API-key/static auth, edit `config.toml` using the static auth
+example below.
+
 ```toml
 [[mcp_servers]]
 name = "my-server"
@@ -270,7 +309,32 @@ name = "remote-server"
 transport = "http"
 url = "https://mcp.example.com"
 api_key_env = "MCP_API_KEY"
+
+[[mcp_servers]]
+name = "linear"
+transport = "streamable-http"
+url = "https://mcp.linear.app/mcp"
+
+[mcp_servers.auth]
+type = "oauth"
+scopes = ["read", "write"]
+# Optional: client_id = "pre-registered-public-client"
+# Optional: client_metadata_url = "https://example.com/client-metadata.json"
+# Optional: redirect_port = 47823
 ```
+
+HTTP MCP servers can use either static auth or OAuth:
+
+- Static auth: legacy `api_key_env` / `headers` keys still work and are
+  promoted to `auth.type = "static"` internally.
+- OAuth auth: use `auth.type = "oauth"` with `scopes`. Vibe stores tokens
+  in the OS keyring under `mcp-oauth:<alias>:tokens`, dynamic client info
+  under `mcp-oauth:<alias>:client_info`, and config drift fingerprints under
+  `mcp-oauth:<alias>:fingerprint`.
+- Headless environments without an OS keyring cannot store OAuth tokens; use
+  static auth via `api_key_env` instead.
+- For SSH/remote browser callbacks, forward the loopback port:
+  `ssh -L 47823:127.0.0.1:47823 <host>`.
 
 ### Connectors
 
@@ -486,7 +550,7 @@ non-conforming stdout) emits a UI warning and lets the gated action proceed
 ### Pattern Matching
 
 Tool, skill, and agent names support three matching modes:
-- **Exact**: `"bash"`, `"read"`
+- **Exact**: `"bash"`, `"read_file"`
 - **Glob**: `"bash*"`, `"mcp_*"`
 - **Regex**: `"re:^serena_.*$"` (full match, case-insensitive)
 
@@ -496,19 +560,23 @@ Tool, skill, and agent names support three matching modes:
 vibe [PROMPT]                       # Start interactive session with optional prompt
 vibe -p TEXT / --prompt TEXT         # Programmatic mode using `default_agent`, one-shot, exit
 vibe -p TEXT --auto-approve          # Programmatic mode with all tool calls approved
+vibe -p TEXT --agent lean --yolo      # Lean mode with all tool calls approved
 vibe --agent NAME                   # Select agent profile (falls back to `default_agent` config)
-vibe --auto-approve                  # Shortcut for `--agent auto-approve`
+vibe --auto-approve / --yolo         # Approve all tool calls for the selected agent
 vibe --workdir DIR                  # Change working directory
+vibe --worktree NAME                # Create/reuse a git worktree under $VIBE_HOME/worktrees on branch NAME and run inside it. Auto-cleanup only for worktrees Vibe created this run and only after a session started; reused worktrees and attached (pre-existing) branches are kept unless confirmed. -p sessions keep worktrees. Ignored with --setup/--check-upgrade.
 vibe --add-dir DIR                  # Extra working dir loaded for context (repeatable). Implicitly trusted.
 vibe --trust                        # Trust cwd for this invocation only (not persisted)
 vibe -c / --continue                # Continue most recent session in this terminal (TTY-scoped, falls back to latest in cwd)
 vibe --resume [SESSION_ID]          # Resume a specific session
 vibe -v / --version                 # Show version
 vibe --setup                        # Run onboarding/setup
+vibe --check-upgrade                # Check for a Vibe update now, prompt to install it, and exit
 vibe --max-turns N                  # Max assistant turns (programmatic mode)
 vibe --max-price DOLLARS            # Max cost limit (programmatic mode)
 vibe --max-tokens N                 # Max total session tokens (programmatic mode)
 vibe --enabled-tools TOOL           # Enable specific tools (repeatable)
+vibe --disabled-tools TOOL          # Disable specific tools (repeatable)
 vibe --output text|json|streaming   # Output format (programmatic mode)
 ```
 
@@ -527,7 +595,8 @@ There are two kinds of agents:
 - **accept-edits**: Auto-approves file edits but asks for other tools
 - **auto-approve**: Auto-approves all tool calls
 - **lean**: Specialized Lean 4 proof assistant. Not available by default — must be
-  installed with `/leanstall` (removed with `/unleanstall`)
+  installed with `/leanstall` (removed with `/unleanstall`). Use `--agent lean
+  --auto-approve` or `--agent lean --yolo` to run Lean mode without tool prompts.
 
 ### Subagents
 
@@ -550,11 +619,19 @@ Custom agents are TOML files in `~/.vibe/agents/NAME.toml`.
 - `/compact` - Compact conversation history by summarizing
 - `/status` - Display agent statistics
 - `/voice` - Configure voice settings
-- `/mcp` - Display available MCP servers (pass a server name to list its tools)
+- `/mcp` - Display MCP servers and connector status; pass a server or connector
+  name to list its tools or open its auth panel when authentication is required
+- `/mcp add <url>` - Add a hosted OAuth MCP server. Supports `--name <alias>`,
+  repeatable `--scope <scope>`, `--transport <http|streamable-http>`, and
+  `--no-login`. Starts OAuth login by default. OAuth-only; use `config.toml`
+  for API-key/static auth.
+- `/mcp status` - Display MCP auth state (`ok`, `needs_auth`, `static`, `stdio`)
+- `/mcp login <alias>` - Start OAuth login for an MCP server
+- `/mcp logout <alias>` - Log out from an MCP server and delete stored OAuth
+  secrets
 - `/resume` (or `/continue`) - Browse and resume past sessions for the current
-  folder (plus active remote sessions when Vibe Code is enabled). The picker
-  header shows the folder being listed. Press `D` twice to delete a local saved
-  session; remote sessions and the active session cannot be deleted here.
+  folder. The picker header shows the folder being listed. Press `d` twice to
+  delete a saved session; the active session cannot be deleted here.
 - `/rewind` - Rewind to a previous message
 - `/loop <interval> <prompt>` - Schedule a recurring prompt (e.g. `/loop 30s ping`).
   Intervals: `Ns/Nm/Nh/Nd`, minimum 30s, max 50 loops/session.
@@ -594,7 +671,7 @@ Image attachments:
   not added to the conversation.
 - Snapshotted into `<session_dir>/attachments/<sha1>.<ext>` so that
   resumed sessions stay reproducible even if the source file is moved.
-- Capped at 10 MB per image and 8 images per message.
+- Capped at 10 MiB per image and 8 images per message.
 - Out-of-project paths work via `@/abs/path/to.png` (the picker only
   suggests project files, but the `@`-parser accepts absolute paths).
   Drag-and-drop from Finder into Terminal, iTerm2, or Ghostty is
@@ -603,9 +680,19 @@ Image attachments:
   automatically prepends `@` (and quotes paths containing spaces).
   Non-image paths are pasted verbatim so non-image use cases are not
   affected.
-- Rendered in the chat bubble as a dim footer line linking each
-  attachment to its snapshot. Clicking opens the file with the OS
-  default image viewer.
+- **Image copy/paste from the clipboard** (**macOS only** for now):
+  writes the image to `<session_dir>/attachments/clipboard-<ts>.png`
+  (or the system temp dir when no session is active) and inserts an
+  `@<path>` token at the cursor. Two entry points:
+  1. `Ctrl+V` keybinding inside the prompt.
+  2. `/paste-image` slash command.
+
+  Uses `osascript` with a TIFF→PNG fallback via `sips`. On Linux and
+  Windows the binding and the slash command are not registered at all,
+  so the feature is invisible to users on those platforms.
+- Rendered in the chat bubble as one dim `attached image:` footer line
+  per image, linking each attachment to its snapshot. Clicking opens the
+  file with the OS default image viewer.
 
 ## Input Queue
 
@@ -644,6 +731,20 @@ Detailed instructions for the model...
 3. `.agents/skills/` in trusted project directory
 4. `~/.vibe/skills/` (user global)
 5. `~/.agents/skills/` (user global, Agent Skills standard)
+
+### Invoking Skills
+
+Two entry points:
+- The model loads a skill on demand via the `skill` tool.
+- The user invokes a `user-invocable` skill by typing `/skill-name` (optionally
+  followed by extra instructions). The user turn stays the literal `/skill-name`
+  text; the skill is loaded programmatically and appears to the model as a
+  synthetic `skill` tool call and result immediately after that turn — the model
+  does not call the tool itself.
+
+Skills with `user-invocable: false` are model-only: they are hidden from the
+slash menu and `/skill-name` will not resolve them (it is treated as a plain
+prompt). The model can still load them via the `skill` tool.
 
 ## Environment Variables
 

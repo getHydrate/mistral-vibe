@@ -104,7 +104,7 @@ pip install mistral-vibe
 - **Interactive Chat**: A conversational AI agent that understands your requests and breaks down complex tasks.
 - **Powerful Toolset**: A suite of tools for file manipulation, code searching, version control, and command execution, right from the chat prompt.
   - Read, write, and patch files (`read`, `write_file`, `edit`).
-  - Execute shell commands in a stateful terminal (`bash`).
+  - Execute shell commands (`bash`), with an experimental managed PTY mode for polling and stdin helpers.
   - Recursively search code with `grep` (with `ripgrep` support).
   - Manage a `todo` list to track the agent's work.
   - Ask interactive questions to gather user input (`ask_user_question`).
@@ -147,8 +147,8 @@ custom agent file in `~/.vibe/agents/` or the project's `.vibe/agents/`
 directory. Subagents such as `explore` are not accepted.
 
 > Note: `default_agent` applies in both interactive and programmatic
-> (`-p` / `--prompt`) sessions. Pass `--auto-approve` when a run should
-> approve all tool calls without prompting.
+> (`-p` / `--prompt`) sessions. Pass `--auto-approve` or `--yolo` with any
+> agent when a run should approve all tool calls without prompting.
 
 ### Subagents and Task Delegation
 
@@ -247,7 +247,7 @@ Simply run `vibe` to enter the interactive chat loop.
 - **Todo View Toggle**: Press `Ctrl+T` to toggle the todo list view.
 - **Debug Console**: Press `Ctrl+\` to toggle the debug console.
 - **Agent Selection**: Press `Shift+Tab` to cycle through agents (default, plan, ...).
-- **Exit**: Type `/exit`, `exit`, `quit`, `:q`, or `:quit` in the input box, or press `Ctrl+C` / `Ctrl+D` twice within ~1 second.
+- **Exit**: Type `/exit`, `exit`, `quit`, `:q`, or `:quit` in the input box, or press `Ctrl+C` / `Ctrl+D` twice within ~1 second. Set `ask_confirmation_on_exit = false` (or toggle it in `/config`) to make `Ctrl+D` quit on the first press; `Ctrl+C` always requires confirmation.
 
 You can start Vibe with a prompt using the following command:
 
@@ -272,8 +272,8 @@ vibe --prompt "Refactor the main function in cli/main.py to be more modular."
 ```
 
 By default, it uses your configured `default_agent` (`default` unless changed).
-To approve all tool calls without prompting, pass `--auto-approve` (also
-available for interactive sessions):
+To approve all tool calls without prompting, pass `--auto-approve` or `--yolo`
+(also available for interactive sessions):
 
 ```bash
 vibe --prompt "Refactor the main function in cli/main.py to be more modular." --auto-approve
@@ -287,8 +287,9 @@ When using `--prompt`, you can specify additional options:
 - **`--max-price DOLLARS`**: Set a maximum cost limit in dollars. The session will be interrupted if the cost exceeds this limit.
 - **`--max-tokens N`**: Set a maximum cumulative LLM token budget for the session, counting both prompt and completion tokens. The session will be interrupted if usage exceeds this limit.
 - **`--agent NAME`**: Select the agent profile for this run.
-- **`--auto-approve`**: Shortcut for `--agent auto-approve`. Approves all tool calls without prompting, including in interactive sessions.
+- **`--auto-approve`, `--yolo`**: Approves all tool calls without prompting, including in interactive sessions. Can be combined with any `--agent` value.
 - **`--enabled-tools TOOL`**: Enable specific tools. In programmatic mode, this disables all other tools. Can be specified multiple times. Supports exact names, glob patterns (e.g., `bash*`), or regex with `re:` prefix (e.g., `re:^serena_.*$`).
+- **`--disabled-tools TOOL`**: Disable specific tools after `--enabled-tools` filtering. Can be specified multiple times. Supports exact names, glob patterns (e.g., `bash*`), or regex with `re:` prefix (e.g., `re:^serena_.*$`).
 - **`--output FORMAT`**: Set the output format. Options:
   - `text` (default): Human-readable text output
   - `json`: All messages as JSON at the end
@@ -525,10 +526,25 @@ Note: This implies that you have set up a redteam prompt named `~/.vibe/prompts/
 
 ### Tool Management
 
+The built-in `bash` tool runs one-off shell commands by default. Set
+`experimental_bash_tool = true` to replace it with the experimental managed PTY
+implementation under the same `bash` tool name. In that mode, `bash` returns a
+`session_id`, inline output, a cursor for polling more output with `bash_output`,
+and a log path under `~/.vibe/bash-tool/`. Long-running commands can be left
+alive with `background = true`, and interactive commands can be driven with
+`bash_stdin`. Both implementations use the same permissions, allowlists, and
+denylists from `[tools.bash]`.
+
+```toml
+experimental_bash_tool = true
+```
+
 #### Enable/Disable Tools with Patterns
 
 You can control which tools are active using `enabled_tools` and `disabled_tools`.
 These fields support exact names, glob patterns, and regular expressions.
+When both are set, `enabled_tools` first narrows the tool set, then
+`disabled_tools` removes matching tools from that set.
 
 Examples:
 
@@ -551,6 +567,20 @@ Notes:
 ### MCP Server Configuration
 
 You can configure MCP (Model Context Protocol) servers to extend Vibe's capabilities. Add MCP server configurations under the `mcp_servers` section:
+
+For hosted OAuth MCP servers, you can add the server from inside Vibe:
+
+```text
+/mcp add https://mcp.linear.app/mcp
+/mcp add https://mcp.example.com/mcp --name docs --scope read --transport http --no-login
+```
+
+`/mcp add` is OAuth-only. It writes `auth.type = "oauth"` with optional
+scopes and starts login by default. It uses `transport = "streamable-http"`
+unless you pass `--transport http`. Pass `--no-login` to add the server without
+starting OAuth login. The shortcut supports `streamable-http` and `http`
+transports. For API-key/static auth, edit `config.toml` using the static auth
+example below.
 
 ```toml
 # Example MCP server configurations
@@ -595,6 +625,20 @@ Key fields:
 - `startup_timeout_sec`: Timeout in seconds for the server to start and initialize (default 10s)
 - `tool_timeout_sec`: Timeout in seconds for tool execution (default 60s)
 - `env`: Environment variables to set for the MCP server of transport type stdio
+
+HTTP MCP servers can use either static auth or OAuth. Static auth uses
+`api_key_env` / `headers` in `config.toml`; OAuth uses an `auth` block:
+
+```toml
+[[mcp_servers]]
+name = "linear"
+transport = "streamable-http"
+url = "https://mcp.linear.app/mcp"
+
+[mcp_servers.auth]
+type = "oauth"
+scopes = []
+```
 
 MCP tools are named using the pattern `{server_name}_{tool_name}` and can be configured with permissions like built-in tools:
 
@@ -779,9 +823,25 @@ vibe --add-dir /path/to/other-project --add-dir /path/to/library
 
 Each path is implicitly trusted (no trust prompt) and contributes its `AGENTS.md` and `.vibe/` configuration (tools, skills, agents, prompts, hooks) to the session. File-tool permissions treat each `--add-dir` path the same way as your primary working directory — reads and writes inside them don't require the "outside workdir" prompt. Nested paths collapse: passing `/repo` and `/repo/sub` is equivalent to passing just `/repo`.
 
+Use `--worktree NAME` to create (or reuse) a [git worktree](https://git-scm.com/docs/git-worktree) and run inside it:
+
+```bash
+vibe --worktree my-feature
+```
+
+The worktree lives under `$VIBE_HOME/worktrees/<repo-name>-<repo-hash>/NAME` and is checked out on a branch named `NAME` (created if it doesn't exist, attached if it does). Vibe `cd`s into it before the session starts and trusts it for the session (no trust prompt). If you start Vibe from a subdirectory, Vibe enters the matching subdirectory inside the worktree.
+
+Existing worktrees are reused only when they belong to the same git repository and are checked out on branch `NAME`; otherwise Vibe exits with an error instead of running in the wrong checkout.
+
+Automatic cleanup only applies to worktrees Vibe created this run, and only after a session actually started — a startup failure (bad config, `--continue` with no sessions) never deletes anything, and a reused worktree is always left in place. When an interactive session exits, Vibe removes the worktree directory automatically if there are no uncommitted changes, untracked files, or commits beyond the commit where the worktree session started. If any of those exist, Vibe asks whether to keep or remove the worktree. When Vibe created the branch it is deleted alongside the worktree; a branch that already existed and was merely attached is kept unless you confirm its deletion. Keeping preserves the directory and branch so you can return later; removing force-deletes them, discarding changes, untracked files, and commits. Programmatic runs (`vibe -p ... --worktree NAME`) do not clean up automatically because there is no exit prompt; remove them manually with `git worktree remove`. `--worktree` is ignored with `--setup` and `--check-upgrade`.
+
+Sessions are scoped per directory, so `-c`/`--continue` and the `--resume` picker only see sessions started inside that worktree. To carry a session across worktrees, resume it explicitly by ID with `--resume <ID>`.
+
 ### Update Settings
 
 Vibe checks PyPI at most once per day during a session. When a newer version is found, the next launch shows an update prompt before opening the chat, offering to either update immediately (via `uv tool upgrade mistral-vibe` or `brew upgrade mistral-vibe`) or continue with the current version.
+
+Run `vibe --check-upgrade` to check PyPI immediately, prompt to install a newer version if one exists, and exit.
 
 To disable the daily check entirely, add this to your `config.toml`:
 
@@ -811,6 +871,7 @@ This affects where Vibe looks for:
 
 - `config.toml` - Main configuration
 - `.env` - API keys
+- `connector_bootstrap_cache.json` - Short-lived connector discovery cache
 - `agents/` - Custom agent configurations
 - `prompts/` - Custom system and compaction prompts
 - `tools/` - Custom tools
@@ -827,7 +888,7 @@ Mistral Vibe can be used in text editors and IDEs that support [Agent Client Pro
 
 ## Data collection & usage
 
-Use of Vibe is subject to our [Privacy Policy](https://legal.mistral.ai/terms/privacy-policy) and may include the collection and processing of data related to your use of the service, such as usage data, to operate, maintain, and improve Vibe. You can disable telemetry in your `config.toml` by setting `enable_telemetry = false`.
+Use of Vibe is subject to our [Privacy Policy](https://legal.mistral.ai/terms/privacy-policy) and may include the collection and processing of data related to your use of the service, such as usage data, to operate, maintain, and improve Vibe. You can disable telemetry and crash reporting in your `config.toml` by setting `enable_telemetry = false`.
 
 
 ## License

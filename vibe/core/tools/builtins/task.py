@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
-from contextlib import aclosing
+from contextlib import aclosing, suppress
 import fnmatch
-from typing import ClassVar
 
 from pydantic import BaseModel, Field
 
@@ -35,10 +34,10 @@ from vibe.core.types import (
 
 
 class TaskArgs(BaseModel):
-    task: str = Field(description="The task to delegate to the subagent")
+    task: str = Field(description="The task for the agent to perform")
     agent: str = Field(
         default="explore",
-        description="Name of the agent profile to use (must be a subagent)",
+        description="The type of specialized subagent to use for this task",
     )
 
 
@@ -57,13 +56,6 @@ class Task(
     BaseTool[TaskArgs, TaskResult, TaskToolConfig, BaseToolState],
     ToolUIData[TaskArgs, TaskResult],
 ):
-    description: ClassVar[str] = (
-        "Delegate a task to a subagent for independent execution. "
-        "Useful for exploration, research, or parallel work that doesn't "
-        "require user interaction. The subagent runs in-memory and "
-        "saves interaction logs."
-    )
-
     @classmethod
     def get_call_display(cls, event: ToolCallEvent) -> ToolCallDisplay:
         args = event.args
@@ -133,8 +125,7 @@ class Task(
         subagent_loop = AgentLoop(
             config=base_config,
             agent_name=args.agent,
-            entrypoint_metadata=ctx.entrypoint_metadata,
-            terminal_emulator=ctx.terminal_emulator,
+            launch_context=ctx.launch_context,
             is_subagent=True,
             defer_heavy_init=True,
             permission_store=ctx.permission_store,
@@ -186,6 +177,9 @@ class Task(
             turns_used = sum(
                 msg.role == Role.assistant for msg in subagent_loop.messages
             )
+        finally:
+            with suppress(Exception):
+                await subagent_loop.aclose()
 
         yield TaskResult(
             response="".join(accumulated_response),

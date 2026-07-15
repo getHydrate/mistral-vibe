@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
-from typing import ClassVar, cast
+from typing import cast
 
 from pydantic import BaseModel, Field
 
@@ -29,13 +29,12 @@ class Question(BaseModel):
     question: str = Field(description="The question text")
     header: str = Field(
         default="",
-        description="Short header for the question (1-2 words, e.g. 'Auth', 'Database')",
-        max_length=12,
+        description="Short chip/tag label for the question (max 20 chars)",
+        max_length=20,
     )
     options: list[Choice] = Field(
-        description="Available options (2-4, not including 'Other'). An 'Other' option for free text is automatically added.",
+        description="Available options (2-4 recommended, not including 'Other'). An 'Other' option for free text is automatically added.",
         min_length=2,
-        max_length=4,
     )
     multi_select: bool = Field(
         default=False, description="If true, user can select multiple options"
@@ -47,9 +46,8 @@ class Question(BaseModel):
 
 class AskUserQuestionArgs(BaseModel):
     questions: list[Question] = Field(
-        description="Questions to ask (1-4). Displayed as tabs if multiple.",
+        description="Questions to ask (1-4 recommended). Displayed as tabs if multiple.",
         min_length=1,
-        max_length=4,
     )
     footer_note: str | None = Field(
         default=None,
@@ -79,12 +77,6 @@ class AskUserQuestion(
     ],
     ToolUIData[AskUserQuestionArgs, AskUserQuestionResult],
 ):
-    description: ClassVar[str] = (
-        "Ask the user one or more questions and wait for their responses. "
-        "Each question has 2-4 choices plus an automatic 'Other' option for free text. "
-        "Use this to gather preferences, clarify requirements, or get decisions."
-    )
-
     @classmethod
     def format_call_display(cls, args: AskUserQuestionArgs) -> ToolCallDisplay:
         count = len(args.questions)

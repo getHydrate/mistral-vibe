@@ -5,7 +5,8 @@ from collections.abc import AsyncGenerator
 from functools import lru_cache
 import os
 from pathlib import Path
-from typing import ClassVar, Literal, final
+import shlex
+from typing import Literal, final
 
 from pydantic import BaseModel, Field
 from tree_sitter import Language, Node, Parser
@@ -54,6 +55,13 @@ def _extract_commands(command: str) -> list[str]:
                     and child.text is not None
                 ):
                     parts.append(child.text.decode("utf-8"))
+            # When a command has a heredoc (or other redirect), tree-sitter
+            # wraps it in a redirected_statement and the redirect is a sibling
+            # of the command node, not a child.  Without this check,
+            # `python3 << 'EOF'` is extracted as bare `python3` and
+            # incorrectly blocked by the standalone denylist.
+            if parts and node.parent and node.parent.type == "redirected_statement":
+                parts.append("<redirect>")
             if parts:
                 commands.append(" ".join(parts))
 
@@ -190,6 +198,13 @@ _PATH_COMMANDS = {
 _FIND_EXECUTION_PREDICATES = {"-exec", "-execdir", "-ok", "-okdir"}
 
 
+def _split_command_tokens(command: str) -> list[str]:
+    try:
+        return shlex.split(command)
+    except ValueError:
+        return command.split()
+
+
 def _collect_outside_dirs(command_parts: list[str]) -> set[str]:
     """Collect parent directories referenced outside the workdir.
 
@@ -202,7 +217,7 @@ def _collect_outside_dirs(command_parts: list[str]) -> set[str]:
     """
     dirs: set[str] = set()
     for part in command_parts:
-        tokens = part.split()
+        tokens = _split_command_tokens(part)
         command = tokens[0] if tokens else None
         if not command or command not in _PATH_COMMANDS:
             continue
@@ -267,7 +282,7 @@ class BashToolConfig(BaseToolConfig):
 
 
 class BashArgs(BaseModel):
-    command: str
+    command: str = Field(description="The shell command to execute")
     timeout: int | None = Field(
         default=None, description="Override the default command timeout."
     )
@@ -284,8 +299,6 @@ class Bash(
     BaseTool[BashArgs, BashResult, BashToolConfig, BaseToolState],
     ToolUIData[BashArgs, BashResult],
 ):
-    description: ClassVar[str] = "Run a one-off bash command and capture its output."
-
     @classmethod
     def format_call_display(cls, args: BashArgs) -> ToolCallDisplay:
         return ToolCallDisplay(summary=f"bash: {args.command}")

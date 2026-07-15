@@ -14,6 +14,7 @@ import pytest
 import zstandard
 
 from tests.conftest import build_test_vibe_config
+from tests.constants import TELEPORT_COMPLETE_URL, TELEPORT_SESSIONS_PATH
 from vibe.core.teleport.errors import (
     ServiceTeleportError,
     ServiceTeleportNotSupportedError,
@@ -29,13 +30,14 @@ from vibe.core.teleport.types import (
     TeleportPushResponseEvent,
     TeleportStartingWorkflowEvent,
 )
+from vibe.core.utils.http import VibeAsyncHTTPClient
 
 
 def _reimport_agent_loop() -> Any:
     to_clear = ("vibe.core.agent_loop", "git", "vibe.core.teleport")
     for k in [k for k in sys.modules if any(k.startswith(m) for m in to_clear)]:
         del sys.modules[k]
-    return importlib.import_module("vibe.core.agent_loop")
+    return importlib.import_module("vibe.core.agent_loop._loop")
 
 
 def _make_service(tmp_path: Path, **kwargs: Any) -> TeleportService:
@@ -59,7 +61,7 @@ def _mock_handler() -> Any:
                 "webSessionId": "web-session-id",
                 "projectId": "project-id",
                 "status": "running",
-                "url": "https://chat.example.com/code/project-id/web-session-id",
+                "url": TELEPORT_COMPLETE_URL,
             },
         )
 
@@ -118,6 +120,7 @@ class TestTeleportServiceCheckSupported:
     ) -> None:
         service._git.get_info = AsyncMock(
             return_value=GitRepoInfo(
+                remote_name="origin",
                 remote_url="https://github.com/owner/repo.git",
                 owner="owner",
                 repo="repo",
@@ -170,6 +173,7 @@ class TestTeleportServiceExecute:
         request = service._build_nuage_request(
             prompt="test prompt",
             git_info=GitRepoInfo(
+                remote_name="origin",
                 remote_url="https://github.com/owner/repo",
                 owner="owner",
                 repo="repo",
@@ -191,6 +195,7 @@ class TestTeleportServiceExecute:
         request = service._build_nuage_request(
             prompt="test prompt",
             git_info=GitRepoInfo(
+                remote_name="origin",
                 remote_url="https://github.com/owner/repo",
                 owner="owner",
                 repo="repo",
@@ -218,11 +223,13 @@ class TestTeleportServiceExecute:
                     "webSessionId": "web-session-id",
                     "projectId": "project-id",
                     "status": "running",
-                    "url": "https://chat.example.com/code/project-id/web-session-id",
+                    "url": TELEPORT_COMPLETE_URL,
                 },
             )
 
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+        async with VibeAsyncHTTPClient(
+            transport=httpx.MockTransport(handler)
+        ) as client:
             service = _make_service(
                 tmp_path,
                 vibe_code_sessions_base_url="https://chat.example.com",
@@ -231,6 +238,7 @@ class TestTeleportServiceExecute:
             service._git.fetch = AsyncMock()
             service._git.get_info = AsyncMock(
                 return_value=GitRepoInfo(
+                    remote_name="upstream",
                     remote_url="https://github.com/owner/repo",
                     owner="owner",
                     repo="repo",
@@ -247,11 +255,10 @@ class TestTeleportServiceExecute:
         assert isinstance(events[0], TeleportCheckingGitEvent)
         assert isinstance(events[1], TeleportStartingWorkflowEvent)
         assert isinstance(events[2], TeleportCompleteEvent)
-        assert (
-            events[2].url == "https://chat.example.com/code/project-id/web-session-id"
-        )
-        assert seen_url == "https://chat.example.com/api/v1/code/sessions"
+        assert events[2].url == TELEPORT_COMPLETE_URL
+        assert seen_url == f"https://chat.example.com{TELEPORT_SESSIONS_PATH}"
         assert seen_body is not None
+        assert seen_body["project_name"] == DEFAULT_NUAGE_PROJECT_NAME
         assert seen_body["message"] == {
             "role": "user",
             "parts": [{"type": "text", "text": "test prompt"}],
@@ -266,6 +273,13 @@ class TestTeleportServiceExecute:
         assert repos[0]["diff"]["compression"] == "zstd"
         assert len(repos[0]["diff"]["content"]) > 0
         assert "idempotencyKey" in seen_body
+        service._git.fetch.assert_awaited_once_with("upstream")
+        service._git.is_commit_pushed.assert_awaited_once_with(
+            "abc123", remote="upstream", fetch=False
+        )
+        service._git.is_branch_pushed.assert_awaited_once_with(
+            remote="upstream", fetch=False
+        )
 
     @pytest.mark.asyncio
     async def test_execute_requires_branch(self, tmp_path: Path) -> None:
@@ -273,6 +287,7 @@ class TestTeleportServiceExecute:
         service._git.fetch = AsyncMock()
         service._git.get_info = AsyncMock(
             return_value=GitRepoInfo(
+                remote_name="origin",
                 remote_url="https://github.com/owner/repo",
                 owner="owner",
                 repo="repo",
@@ -297,13 +312,14 @@ class TestTeleportServiceExecute:
 
     @pytest.mark.asyncio
     async def test_execute_push_confirmation_approved(self, tmp_path: Path) -> None:
-        async with httpx.AsyncClient(
+        async with VibeAsyncHTTPClient(
             transport=httpx.MockTransport(_mock_handler())
         ) as client:
             service = _make_service(tmp_path, client=client)
             service._git.fetch = AsyncMock()
             service._git.get_info = AsyncMock(
                 return_value=GitRepoInfo(
+                    remote_name="github",
                     remote_url="https://github.com/owner/repo",
                     owner="owner",
                     repo="repo",
@@ -329,7 +345,8 @@ class TestTeleportServiceExecute:
             )
             events = [event async for event in gen]
 
-        service._git.push_current_branch.assert_awaited_once()
+        service._git.get_unpushed_commit_count.assert_awaited_once_with("github")
+        service._git.push_current_branch.assert_awaited_once_with("github")
         assert isinstance(events[0], TeleportStartingWorkflowEvent)
         assert isinstance(events[1], TeleportCompleteEvent)
 
@@ -339,6 +356,7 @@ class TestTeleportServiceExecute:
         service._git.fetch = AsyncMock()
         service._git.get_info = AsyncMock(
             return_value=GitRepoInfo(
+                remote_name="origin",
                 remote_url="https://github.com/owner/repo",
                 owner="owner",
                 repo="repo",
