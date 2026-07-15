@@ -1,4 +1,23 @@
-# Mistral Vibe
+# Mistral Vibe — Hydrate fork
+
+> [!IMPORTANT]
+> This is the **[Hydrate](https://gethydrate.dev) fork** of
+> [Mistral Vibe](https://github.com/mistralai/mistral-vibe), tracking
+> upstream (currently **v2.19.1**) as a strict superset. It adds:
+>
+> - **Ten lifecycle hook events** on top of upstream's native
+>   `post_agent_turn` / `before_tool` / `after_tool`: `user_prompt_submit`,
+>   `session_start`, `session_end`, `pre_compact`, `post_compact`,
+>   `stop_failure`, `notification`, `subagent_start`, `subagent_stop`,
+>   `worktree_create` — plus a blocking `permission_request` tool hook.
+>   See [Lifecycle hooks (Hydrate fork)](#lifecycle-hooks-hydrate-fork).
+> - An **external status line** (`status_line_command`) accepting the same
+>   stdin JSON contract as Claude Code's `statusLine`. See
+>   [Status line](#status-line).
+>
+> With no fork hooks or status line configured, behavior is identical to
+> upstream. Install this fork:
+> `uv tool install git+https://github.com/getHydrate/mistral-vibe@hydrate-main`
 
 [![PyPI Version](https://img.shields.io/pypi/v/mistral-vibe)](https://pypi.org/project/mistral-vibe)
 [![Python Version](https://img.shields.io/badge/python-3.12%2B-blue)](https://www.python.org/downloads/release/python-3120/)
@@ -23,19 +42,6 @@ Mistral Vibe is a command-line coding assistant powered by Mistral's models. It 
 
 > [!WARNING]
 > Mistral Vibe works on Windows, but we officially support and target UNIX environments.
-
-> [!NOTE]
-> This is the **[Hydrate](https://gethydrate.dev) fork** of Mistral Vibe,
-> tracking upstream (currently **v2.19.1**). It is a strict superset: it
-> adds nine session-lifecycle hook events — `user_prompt_submit`,
-> `session_start`, `pre_compact`, `post_compact`, `stop_failure`,
-> `notification`, `subagent_start`, `subagent_stop`, `session_end` — and
-> a `permission_request` tool hook on top of upstream's native
-> `post_agent_turn` / `before_tool` / `after_tool` hooks, so Hydrate can
-> deliver pre-prompt recall and lifecycle guardrails. With no fork hooks
-> configured, behavior is
-> identical to upstream. See
-> [Lifecycle hooks (Hydrate fork)](#lifecycle-hooks-hydrate-fork).
 
 ### One-line install (recommended)
 
