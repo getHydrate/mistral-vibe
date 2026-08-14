@@ -18,7 +18,7 @@ import pytest
 
 from tests.conftest import build_test_vibe_config
 from tests.stubs.fake_mcp_registry import FakeMCPRegistry
-from vibe.core.config import MCPHttp, MCPStdio, MCPStreamableHttp, VibeConfig
+from vibe.core.config import MCPHttp, MCPStdio, MCPStreamableHttp, VibeConfigSchema
 from vibe.core.tools.base import BaseToolConfig, BaseToolState, InvokeContext
 from vibe.core.tools.mcp import (
     AuthStatus,
@@ -600,6 +600,14 @@ class TestMCPRegistry:
 
         assert len(registry._cache) == 0
 
+    def test_clear_drops_failed(self):
+        registry = MCPRegistry()
+        registry._failed["stale"] = "boom"
+
+        registry.clear()
+
+        assert registry.pop_failed() == {}
+
     def test_count_loaded_excludes_failed_servers(self):
         registry = MCPRegistry()
         ok_srv = self._make_http_server("ok", url="http://ok:1")
@@ -684,6 +692,7 @@ class TestMCPRegistry:
             tools = await registry._discover_http(srv)
 
         assert tools is None
+        assert registry.pop_failed() == {"fail": "down"}
 
     @pytest.mark.asyncio
     async def test_discover_stdio_success(self):
@@ -713,6 +722,86 @@ class TestMCPRegistry:
             tools = await registry._discover_stdio(srv)
 
         assert tools is None
+        assert registry.pop_failed() == {"broken": "no binary"}
+
+    @pytest.mark.asyncio
+    async def test_exception_group_single_error_is_unwrapped(self):
+        registry = MCPRegistry()
+        srv = self._make_http_server("grouped", url="http://grouped:1")
+
+        # Simulate the MCP library wrapping errors in ExceptionGroup
+        wrapped_error = ExceptionGroup(
+            "unhandled errors in a TaskGroup", [ConnectionError("connection refused")]
+        )
+
+        with patch(
+            "vibe.core.tools.mcp.registry.list_tools_http", side_effect=wrapped_error
+        ):
+            tools = await registry._discover_http(srv)
+
+        assert tools is None
+        # After our change, this should extract the inner error message
+        assert registry.pop_failed() == {"grouped": "connection refused"}
+
+    @pytest.mark.asyncio
+    async def test_exception_group_multiple_errors_are_joined(self):
+        registry = MCPRegistry()
+        srv = self._make_http_server("multi", url="http://multi:1")
+
+        wrapped_error = ExceptionGroup(
+            "multiple errors",
+            [ConnectionError("connection refused"), TimeoutError("timed out")],
+        )
+
+        with patch(
+            "vibe.core.tools.mcp.registry.list_tools_http", side_effect=wrapped_error
+        ):
+            tools = await registry._discover_http(srv)
+
+        assert tools is None
+        # Should join multiple error messages with "; "
+        assert registry.pop_failed() == {"multi": "connection refused; timed out"}
+
+    @pytest.mark.asyncio
+    async def test_nested_base_exception_group_is_unwrapped_recursively(self):
+        registry = MCPRegistry()
+        srv = self._make_http_server("nested", url="http://nested:1")
+
+        inner = BaseExceptionGroup(
+            "inner", [ConnectionError("connection refused"), TimeoutError("timed out")]
+        )
+        wrapped_error = BaseExceptionGroup(
+            "unhandled errors in a TaskGroup", [inner, RuntimeError("boom")]
+        )
+
+        with patch(
+            "vibe.core.tools.mcp.registry.list_tools_http", side_effect=wrapped_error
+        ):
+            tools = await registry._discover_http(srv)
+
+        assert tools is None
+        assert registry.pop_failed() == {
+            "nested": "connection refused; timed out; boom"
+        }
+
+    @pytest.mark.asyncio
+    async def test_exception_group_drops_empty_cancelled_error(self):
+        registry = MCPRegistry()
+        wrapped_error = BaseExceptionGroup(
+            "unhandled errors in a TaskGroup",
+            [ConnectionError("connection refused"), asyncio.CancelledError()],
+        )
+
+        formatted = registry._format_mcp_error(wrapped_error)
+
+        assert formatted == "connection refused"
+
+    def test_bare_cancelled_error_falls_back_to_type_name(self):
+        registry = MCPRegistry()
+
+        formatted = registry._format_failed(asyncio.CancelledError())
+
+        assert formatted == "CancelledError"
 
     def test_get_tools_discovers_only_uncached(self):
         registry = MCPRegistry()
@@ -928,7 +1017,7 @@ class TestMCPDisableFiltering:
     @staticmethod
     def _make_config(
         mcp_servers: list[MCPHttp | MCPStdio | MCPStreamableHttp] | None = None,
-    ) -> VibeConfig:
+    ) -> VibeConfigSchema:
         return build_test_vibe_config(mcp_servers=mcp_servers or [])
 
     def test_disabled_server_excludes_all_tools(self):

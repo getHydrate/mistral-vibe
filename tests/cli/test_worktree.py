@@ -7,7 +7,7 @@ from pathlib import Path
 from git import Repo
 import pytest
 
-from vibe.core.config._settings import SessionLoggingConfig
+from vibe.core.config.models import SessionLoggingConfig
 from vibe.core.paths import VIBE_HOME
 from vibe.core.session.session_loader import SessionLoader
 from vibe.core.worktree import (
@@ -156,7 +156,7 @@ def test_cleanup_state_detects_new_commits(git_repo: Repo, tmp_path: Path) -> No
 
     assert cleanup_state.is_clean is False
     assert cleanup_state.new_commit_count == 1
-    assert cleanup_state.reasons == ("1 new commit",)
+    assert cleanup_state.reasons == ("1 commit added during this session",)
 
 
 def test_reused_worktree_cleanup_starts_from_current_head(

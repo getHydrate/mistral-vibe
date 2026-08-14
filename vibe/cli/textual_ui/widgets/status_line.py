@@ -45,7 +45,10 @@ class StatusLine(NoMarkupStatic):
     def on_mount(self) -> None:
         if self._interval > 0:
             self.set_interval(self._interval, self.trigger_refresh)
-        self.trigger_refresh()
+        # Defer the first run: is_mounted is still False inside on_mount (the
+        # trigger_refresh guard would drop it), so kick it once the widget is
+        # fully mounted on the next refresh cycle.
+        self.call_after_refresh(self.trigger_refresh)
 
     def trigger_refresh(self) -> None:
         """Run the command now (skipped internally if one is in flight)."""

@@ -5,8 +5,8 @@ from typing import NamedTuple
 from textual import events
 
 from vibe.cli.autocompletion.base import CompletionResult, CompletionView
+from vibe.cli.autocompletion.completers import CommandCompleter
 from vibe.cli.autocompletion.slash_command import SlashCommandController
-from vibe.core.autocompletion.completers import CommandCompleter
 
 
 class Suggestion(NamedTuple):
@@ -135,6 +135,42 @@ def test_on_key_tab_applies_selected_completion() -> None:
     assert result is CompletionResult.HANDLED
     assert view.replacements == [Replacement(0, 2, "/config")]
     assert view.reset_count == 1
+
+
+def test_on_key_tab_replaces_whole_command_word_when_caret_mid_token() -> None:
+    controller, view = make_controller()
+    controller.on_text_changed("/config", cursor_index=len("/config"))
+
+    # The caret moved into the middle of the token (via arrow key or click)
+    # before accepting; the whole command word must be replaced, not a prefix,
+    # so the accepted command is not corrupted with a leftover tail.
+    controller.on_key(key_event("tab"), text="/config", cursor_index=3)
+
+    assert view.replacements[-1] == Replacement(0, len("/config"), "/config")
+
+
+def test_on_key_tab_preserves_text_after_newline() -> None:
+    controller, view = make_controller()
+    text = "/config\nfoo"
+    controller.on_text_changed(text, cursor_index=len("/config"))
+
+    # Chat input allows newlines (shift+enter); accepting the command must
+    # replace only the command word, not wipe the following line.
+    controller.on_key(key_event("tab"), text=text, cursor_index=len("/config"))
+
+    assert view.replacements[-1] == Replacement(0, len("/config"), "/config")
+
+
+def test_selection_survives_re_render_with_unchanged_suggestions() -> None:
+    controller, view = make_controller(prefix="/c")
+    controller.on_key(key_event("down"), text="/c", cursor_index=2)
+    assert view.suggestion_events[-1].selected_index == 1
+
+    # A caret move re-runs on_text_changed with the same text/suggestions; the
+    # highlighted item must not jump back to the top.
+    controller.on_text_changed("/c", cursor_index=2)
+
+    assert view.suggestion_events[-1].selected_index == 1
 
 
 def test_on_key_down_and_up_cycle_selection() -> None:

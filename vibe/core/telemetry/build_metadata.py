@@ -13,7 +13,7 @@ from vibe.core.telemetry.types import (
     TerminalEmulator,
 )
 from vibe.core.types import LLMMessage
-from vibe.core.utils.platform import get_platform_id, get_platform_version
+from vibe.utils.platform import get_platform_id, get_platform_version
 
 
 def build_base_metadata(
@@ -22,6 +22,7 @@ def build_base_metadata(
     session_id: str | None,
     parent_session_id: str | None = None,
     experiments: dict[str, str] | None = None,
+    user_plan: str | None = None,
 ) -> dict[str, Any]:
     launch_payload = (
         launch_context.telemetry_fields() if launch_context is not None else {}
@@ -35,6 +36,7 @@ def build_base_metadata(
             session_id=session_id,
             parent_session_id=parent_session_id,
             experiments=experiments or None,
+            user_plan=user_plan,
             **launch_payload,
         ).model_dump(exclude_none=True),
     )
@@ -47,6 +49,7 @@ def build_request_metadata(
     parent_session_id: str | None = None,
     call_type: TelemetryCallType,
     message_id: str | None = None,
+    user_plan: str | None = None,
 ) -> TelemetryRequestMetadata:
     launch_payload = (
         launch_context.telemetry_fields() if launch_context is not None else {}
@@ -59,6 +62,7 @@ def build_request_metadata(
         parent_session_id=parent_session_id,
         call_type=call_type,
         message_id=message_id,
+        user_plan=user_plan,
         **launch_payload,
     )
 

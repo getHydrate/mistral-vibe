@@ -3,18 +3,30 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 from collections.abc import Callable
+import copy
 from typing import Any
 
 from jsonpatch import JsonPatchException, apply_patch
-from jsonpointer import JsonPointerException
+from jsonpointer import JsonPointer, JsonPointerException
 from pydantic import ValidationError
 
 from vibe.core.config.builder import ConfigBuilder
 from vibe.core.config.event_bus import EventBus
 from vibe.core.config.layer import ConfigLayer, LayerNotLoadedError, RawConfig
-from vibe.core.config.patch import AddOperationPatch, ConfigPatch, PatchOp
+from vibe.core.config.patch import (
+    AddOperationPatch,
+    ConfigPatch,
+    PatchOp,
+    ensure_parent_paths,
+    resolve_upsert_op,
+)
 from vibe.core.config.schema import ConfigSchema
-from vibe.core.config.types import ConfigChangeCallback, ConflictStrategy
+from vibe.core.config.types import (
+    ConfigChangeCallback,
+    ConfigChangeEvent,
+    ConflictStrategy,
+)
+from vibe.core.utils.concurrency import run_sync
 
 
 class ConfigPatchValidationError(Exception):
@@ -49,6 +61,24 @@ class ConfigOrchestrator[S: ConfigSchema]:
         self._default_layer_resolver = default_layer_resolver
         self._bus = bus if bus is not None else EventBus()
 
+    def copy(self) -> ConfigOrchestrator[S]:
+        """Return an independent in-memory copy of this orchestrator.
+
+        The builder and its layers are deep-copied so writes on the copy never
+        touch the original. The default-layer resolver is rebound to the copied
+        layers, and the copy starts with a fresh event bus so it does not
+        inherit the original's subscribers.
+        """
+        builder = self._builder.copy()
+        default_layer_name = self._default_layer_resolver().name
+        layers_by_name = {layer.name: layer for layer in builder.layers}
+        return type(self)(
+            builder,
+            copy.deepcopy(self._config),
+            lambda: layers_by_name[default_layer_name],
+            bus=None,
+        )
+
     @classmethod
     async def create(
         cls,
@@ -57,9 +87,10 @@ class ConfigOrchestrator[S: ConfigSchema]:
         layers: list[ConfigLayer[RawConfig]],
         default_layer_resolver: DefaultLayerResolver,
         bus: EventBus | None = None,
+        validation_context: dict[str, Any] | None = None,
     ) -> ConfigOrchestrator[S]:
         """Build an orchestrator from a schema and an ordered list of layers."""
-        builder = ConfigBuilder[S](schema)
+        builder = ConfigBuilder[S](schema, validation_context=validation_context)
         builder.add_layers(layers)
         config = await builder.build()
         instance = cls(builder, config, default_layer_resolver, bus)
@@ -69,11 +100,54 @@ class ConfigOrchestrator[S: ConfigSchema]:
     def config(self) -> S:
         return self._config
 
+    def rebuild(self) -> None:
+        """Re-merge the layer stack synchronously and install the result."""
+        self._config = run_sync(self._builder.build())
+
+    @property
+    def layers(self) -> tuple[ConfigLayer[RawConfig], ...]:
+        """Active layers, lowest to highest priority. Read-only view."""
+        return tuple(self._builder.layers)
+
+    @property
+    def writable_layer_name(self) -> str:
+        """Name of the layer that implicit writes are routed to."""
+        return self._resolve_default_layer_name()
+
     def get_layer(self, name: str) -> ConfigLayer[RawConfig]:
         for layer in self._builder.layers:
             if layer.name == name:
                 return layer
         raise KeyError(f"No layer named {name!r}")
+
+    def insert_layer(self, layer: ConfigLayer[RawConfig], index: int) -> None:
+        """Insert a layer at *index* (0 = lowest priority). Rebuild to apply."""
+        self._builder.insert_layer(layer, index)
+
+    def remove_layer(self, index: int) -> ConfigLayer[RawConfig]:
+        """Remove and return the layer at *index*. Rebuild to apply."""
+        return self._builder.remove_layer(index)
+
+    def replace_or_append_layer(self, name: str, layer: ConfigLayer[RawConfig]) -> None:
+        """Replace the layer named *name* in place, or append it when absent."""
+        index = next(
+            (i for i, existing in enumerate(self.layers) if existing.name == name), None
+        )
+        if index is None:
+            self.insert_layer(layer, len(self.layers))
+            return
+        self.remove_layer(index)
+        self.insert_layer(layer, index)
+
+    async def load_persistence_layer(self) -> RawConfig:
+        return await self._default_layer_resolver().load()
+
+    def persisted_active_model(self) -> str:
+        data = self._default_layer_resolver().cached_data
+        if data is None:
+            return ""
+        value = getattr(data, "active_model", "")
+        return value if isinstance(value, str) else ""
 
     async def reload(self) -> None:
         """Force-reload all layers and atomically replace the config snapshot."""
@@ -92,6 +166,31 @@ class ConfigOrchestrator[S: ConfigSchema]:
             reason=reason,
         )
 
+    async def upsert_field(
+        self,
+        path: str,
+        *,
+        key_field: str,
+        value: dict[str, Any],
+        reason: str = "No reason",
+        target_layer: str | None = None,
+    ) -> list[BaseException]:
+        """Insert or replace one entry in a persisted config list section.
+
+        *path* is a JSON Pointer to the list field (e.g. ``/providers``);
+        *key_field* identifies an entry within that list (e.g. ``name``).
+        When an entry with the same key already exists it is replaced in
+        place, otherwise the value is appended (or the section is created
+        when empty).
+        """
+        layer_name = target_layer or self._resolve_default_layer_name()
+        raw: dict[str, Any] = (await (self.get_layer(layer_name)).load()).model_dump()
+        existing = JsonPointer(path).resolve(raw, default=[])
+        operation = resolve_upsert_op(
+            existing, path, key_field, value, target_layer_name=layer_name
+        )
+        return await self.apply_patch([operation], reason=reason)
+
     async def apply_patch(
         self,
         operations: list[PatchOp],
@@ -108,11 +207,13 @@ class ConfigOrchestrator[S: ConfigSchema]:
         if not operations:
             return []
 
+        before = self._config.model_dump(mode="json")
+
         # Simulate and validate final config
         try:
-            self.config.model_validate(
+            self._builder.validate(
                 apply_patch(
-                    self._config.model_dump(),
+                    ensure_parent_paths(self._config.model_dump(), operations),
                     patch=[operation.to_json_patch() for operation in operations],
                     in_place=False,
                 )
@@ -145,8 +246,17 @@ class ConfigOrchestrator[S: ConfigSchema]:
             )
         results = await asyncio.gather(*tasks, return_exceptions=True)
         failures = [r for r in results if isinstance(r, BaseException)]
+        has_success = any(not isinstance(r, BaseException) for r in results)
 
         await self.reload()
+        after = self._config.model_dump(mode="json")
+        changed_keys = _changed_keys_between(before, after)
+        if has_success and changed_keys:
+            self._bus.publish(
+                ConfigChangeEvent(
+                    changed_keys=changed_keys, before=before, after=after, reason=reason
+                )
+            )
 
         return failures
 
@@ -174,7 +284,6 @@ class ConfigOrchestrator[S: ConfigSchema]:
             raise DefaultLayerResolutionError(
                 f"Default layer resolver returned unknown layer {layer.name!r}"
             )
-
         return layer.name
 
     def subscribe(
@@ -190,3 +299,33 @@ class ConfigOrchestrator[S: ConfigSchema]:
                 every change (wildcard).
         """
         return self._bus.subscribe(callback, keys=keys)
+
+
+_MISSING = object()
+
+
+def _changed_keys_between(
+    before: dict[str, Any], after: dict[str, Any]
+) -> frozenset[str]:
+    changed: set[str] = set()
+    _collect_changed_keys(before, after, (), changed)
+    return frozenset(changed)
+
+
+def _collect_changed_keys(
+    before: Any, after: Any, path: tuple[str, ...], changed: set[str]
+) -> None:
+    if before == after:
+        return
+
+    if isinstance(before, dict) and isinstance(after, dict):
+        for key in sorted(before.keys() | after.keys()):
+            _collect_changed_keys(
+                before.get(key, _MISSING),
+                after.get(key, _MISSING),
+                (*path, key),
+                changed,
+            )
+        return
+
+    changed.add("/".join(path))

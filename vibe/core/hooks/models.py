@@ -18,9 +18,9 @@ class HookMessageSeverity(StrEnum):
 
 
 class HookType(StrEnum):
-    POST_AGENT_TURN = auto()
-    BEFORE_TOOL = auto()
-    AFTER_TOOL = auto()
+    POST_AGENT = auto()
+    PRE_TOOL = auto()
+    POST_TOOL = auto()
     USER_PROMPT_SUBMIT = auto()
     SESSION_START = auto()
     SESSION_END = auto()
@@ -36,7 +36,7 @@ class HookType(StrEnum):
 
 # Tool hooks accept ``match`` / ``strict``; the lifecycle hooks below do not.
 _TOOL_HOOK_TYPES = frozenset(
-    {HookType.BEFORE_TOOL, HookType.AFTER_TOOL, HookType.PERMISSION_REQUEST}
+    {HookType.PRE_TOOL, HookType.POST_TOOL, HookType.PERMISSION_REQUEST}
 )
 
 
@@ -79,16 +79,16 @@ class HookConfig(BaseModel):
         if self.match is not None and self.type not in _TOOL_HOOK_TYPES:
             raise ValueError(
                 "match is only valid for tool hooks"
-                " (before_tool / after_tool / permission_request)"
+                " (pre_tool / post_tool / permission_request)"
             )
         if self.strict and self.type not in _TOOL_HOOK_TYPES:
             raise ValueError(
                 "strict is only valid for tool hooks"
-                " (before_tool / after_tool / permission_request)"
+                " (pre_tool / post_tool / permission_request)"
             )
-        if self.match_status is not None and self.type is not HookType.AFTER_TOOL:
+        if self.match_status is not None and self.type is not HookType.POST_TOOL:
             raise ValueError(
-                "match_status is only valid for after_tool hooks"
+                "match_status is only valid for post_tool hooks"
                 " (only they observe a tool_status)"
             )
         if self.timeout is None:
@@ -118,23 +118,23 @@ class HookSessionContext(BaseModel):
     parent_session_id: str | None = None
 
 
-class PostAgentTurnInvocation(HookSessionContext):
-    hook_event_name: Literal[HookType.POST_AGENT_TURN] = HookType.POST_AGENT_TURN
+class PostAgentInvocation(HookSessionContext):
+    hook_event_name: Literal[HookType.POST_AGENT] = HookType.POST_AGENT
     # True when this run is a retry caused by this hook's previous deny
     # (mirrors Claude Code's Stop contract, so loop-guard scripts can
     # check it to break deny loops).
     stop_hook_active: bool = False
 
 
-class BeforeToolInvocation(HookSessionContext):
-    hook_event_name: Literal[HookType.BEFORE_TOOL] = HookType.BEFORE_TOOL
+class PreToolInvocation(HookSessionContext):
+    hook_event_name: Literal[HookType.PRE_TOOL] = HookType.PRE_TOOL
     tool_name: str
     tool_call_id: str
     tool_input: dict[str, Any]
 
 
-class AfterToolInvocation(HookSessionContext):
-    hook_event_name: Literal[HookType.AFTER_TOOL] = HookType.AFTER_TOOL
+class PostToolInvocation(HookSessionContext):
+    hook_event_name: Literal[HookType.POST_TOOL] = HookType.POST_TOOL
     tool_name: str
     tool_call_id: str
     tool_input: dict[str, Any]
@@ -259,9 +259,9 @@ class PermissionRequestInvocation(HookSessionContext):
 
 
 HookInvocation = (
-    PostAgentTurnInvocation
-    | BeforeToolInvocation
-    | AfterToolInvocation
+    PostAgentInvocation
+    | PreToolInvocation
+    | PostToolInvocation
     | UserPromptSubmitInvocation
     | SessionStartInvocation
     | SessionEndInvocation
@@ -292,26 +292,26 @@ def build_invocation(
     """Build the right HookInvocation subclass for *hook_type*."""
     base = ctx.model_dump()
     match hook_type:
-        case HookType.POST_AGENT_TURN:
-            return PostAgentTurnInvocation(**base)
-        case HookType.BEFORE_TOOL:
+        case HookType.POST_AGENT:
+            return PostAgentInvocation(**base)
+        case HookType.PRE_TOOL:
             if tool_name is None or tool_call_id is None:
                 raise ValueError(
-                    "tool_name and tool_call_id are required for before_tool hooks"
+                    "tool_name and tool_call_id are required for pre_tool hooks"
                 )
-            return BeforeToolInvocation(
+            return PreToolInvocation(
                 **base,
                 tool_name=tool_name,
                 tool_call_id=tool_call_id,
                 tool_input=tool_input or {},
             )
-        case HookType.AFTER_TOOL:
+        case HookType.POST_TOOL:
             if tool_name is None or tool_call_id is None or tool_status is None:
                 raise ValueError(
                     "tool_name, tool_call_id, and tool_status are required"
-                    " for after_tool hooks"
+                    " for post_tool hooks"
                 )
-            return AfterToolInvocation(
+            return PostToolInvocation(
                 **base,
                 tool_name=tool_name,
                 tool_call_id=tool_call_id,
@@ -361,9 +361,9 @@ class HookExecutionResult(BaseModel):
 class HookSpecificOutput(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
-    # before_tool only.
+    # pre_tool only.
     tool_input: dict[str, Any] | None = None
-    # after_tool only.
+    # post_tool only.
     additional_context: str | None = None
 
 
@@ -396,7 +396,7 @@ class PermissionRequestHookResponse(HookStructuredResponse):
 
 
 class HookUserMessage(BaseModel):
-    """post_agent_turn deny: ``content`` is injected as a retry user
+    """post_agent deny: ``content`` is injected as a retry user
     message.
     """
 
@@ -404,7 +404,7 @@ class HookUserMessage(BaseModel):
 
 
 class HookToolDenial(BaseModel):
-    """before_tool deny: ``content`` becomes the tool error returned to
+    """pre_tool deny: ``content`` becomes the tool error returned to
     the LLM.
     """
 
@@ -413,7 +413,7 @@ class HookToolDenial(BaseModel):
 
 
 class HookToolInputRewrite(BaseModel):
-    """before_tool: one per rewriting hook in the chain. The agent loop
+    """pre_tool: one per rewriting hook in the chain. The agent loop
     validates each as it arrives — the first invalid rewrite aborts the
     chain and synthesizes a denial.
     """
@@ -423,7 +423,7 @@ class HookToolInputRewrite(BaseModel):
 
 
 class HookTextReplacement(BaseModel):
-    """after_tool: ``text`` is the cumulative LLM-bound output after the
+    """post_tool: ``text`` is the cumulative LLM-bound output after the
     handler applied its replacement or append.
     """
 
@@ -472,13 +472,13 @@ class HookEvent(BaseEvent):
 
 
 class HookRunStartEvent(HookEvent):
-    scope: HookType = HookType.POST_AGENT_TURN
+    scope: HookType = HookType.POST_AGENT
     tool_name: str | None = None
     tool_call_id: str | None = None
 
 
 class HookRunEndEvent(HookEvent):
-    scope: HookType = HookType.POST_AGENT_TURN
+    scope: HookType = HookType.POST_AGENT
     tool_call_id: str | None = None
 
 
@@ -486,7 +486,7 @@ class HookRunEndEvent(HookEvent):
 # chains interleave on the wire.
 class HookStartEvent(HookEvent):
     hook_name: str
-    scope: HookType = HookType.POST_AGENT_TURN
+    scope: HookType = HookType.POST_AGENT
     tool_call_id: str | None = None
 
 
@@ -494,5 +494,5 @@ class HookEndEvent(HookEvent):
     hook_name: str
     status: HookMessageSeverity
     content: str | None = None
-    scope: HookType = HookType.POST_AGENT_TURN
+    scope: HookType = HookType.POST_AGENT
     tool_call_id: str | None = None

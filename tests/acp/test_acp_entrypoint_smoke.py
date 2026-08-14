@@ -6,9 +6,17 @@ import contextlib
 import io
 import os
 from pathlib import Path
+import subprocess
+import sys
 from typing import Any, cast
 
-from acp import PROTOCOL_VERSION, Client, RequestError, connect_to_agent
+from acp import (
+    PROTOCOL_VERSION,
+    Client,
+    CreateElicitationResponse,
+    RequestError,
+    connect_to_agent,
+)
 from acp.schema import ClientCapabilities, Implementation
 import pexpect
 import pytest
@@ -40,6 +48,16 @@ class _AcpSmokeClient(Client):
 
     async def create_terminal(self, *args: Any, **kwargs: Any) -> Any:
         msg = "terminal/create"
+        raise RequestError.method_not_found(msg)
+
+    async def create_elicitation(
+        self, message: str, mode: Any, **kwargs: Any
+    ) -> CreateElicitationResponse:
+        msg = "elicitation/create"
+        raise RequestError.method_not_found(msg)
+
+    async def complete_elicitation(self, elicitation_id: str, **kwargs: Any) -> None:
+        msg = "elicitation/complete"
         raise RequestError.method_not_found(msg)
 
     async def terminal_output(self, *args: Any, **kwargs: Any) -> Any:
@@ -180,6 +198,12 @@ async def test_vibe_acp_initialize_and_new_session(vibe_home_dir: Path) -> None:
         assert initialize_response.agent_info.name == "@mistralai/mistral-vibe"
         assert initialize_response.agent_info.title == "Mistral Vibe"
 
+        config_schema = await asyncio.wait_for(
+            conn.ext_method("config/schema", {}), timeout=10
+        )
+        assert config_schema["version"].startswith("sha256:")
+        assert config_schema["schema"]["title"] == "VibeConfigSchema"
+
         session = await asyncio.wait_for(
             conn.new_session(cwd=str(Path.cwd()), mcp_servers=[]), timeout=10
         )
@@ -311,6 +335,7 @@ def test_vibe_acp_setup_shows_onboarding_and_exits_on_cancel(
 
 
 @pytest.mark.asyncio
+@pytest.mark.timeout(30)
 async def test_vibe_acp_survives_broken_config(vibe_home_dir: Path) -> None:
     vibe_home_dir.mkdir(parents=True, exist_ok=True)
     (vibe_home_dir / "config.toml").write_text("{{{{invalid toml content!!")
@@ -334,6 +359,24 @@ async def test_vibe_acp_survives_broken_config(vibe_home_dir: Path) -> None:
         assert session.session_id
     finally:
         await _terminate_process(proc)
+
+
+def test_acp_agent_import_does_not_load_gitpython() -> None:
+    # GitPython probes for a git executable on import and raises when none is
+    # found. The ACP startup path (e.g. `vibe-acp --version`) must not import it,
+    # so binaries run on machines without git. See teleport lazy import.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "import sys, vibe.acp.agent; "
+            "assert 'git' not in sys.modules, 'gitpython imported on ACP module load'",
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 @pytest.mark.asyncio

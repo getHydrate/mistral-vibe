@@ -6,15 +6,20 @@ from pathlib import Path
 import shutil
 import tempfile
 
-from git import InvalidGitRepositoryError, Repo
-from git.exc import GitCommandError
-from giturlparse import parse as parse_git_url
-
 from vibe.core.teleport.errors import (
     ServiceTeleportError,
     ServiceTeleportNotSupportedError,
 )
 from vibe.core.utils import AsyncExecutor
+
+try:
+    from git import InvalidGitRepositoryError, NoSuchPathError, Repo
+    from git.exc import GitCommandError
+    from giturlparse import parse as parse_git_url
+except ImportError as e:
+    raise ServiceTeleportError(
+        "Teleport requires git to be installed. Please install git and try again."
+    ) from e
 
 
 @dataclass
@@ -34,6 +39,7 @@ class GitRepoInfo:
     commit: str
     diff: str
     default_branch: str | None = None
+    repo_root: Path | None = None
 
 
 class GitRepository:
@@ -57,6 +63,18 @@ class GitRepository:
         return self._find_github_remote(repo) is not None
 
     async def get_info(self) -> GitRepoInfo:
+        return await self._build_info(include_diff=True)
+
+    async def get_metadata(self) -> GitRepoInfo:
+        """Repo metadata without the (potentially large) working-tree diff.
+
+        Project-link actions only need remote/branch/root info, so they skip the
+        full `git diff` scan `get_info` runs, which would otherwise touch the
+        whole working tree. `diff` is returned as an empty string.
+        """
+        return await self._build_info(include_diff=False)
+
+    async def _build_info(self, *, include_diff: bool) -> GitRepoInfo:
         repo = self._repo_or_raise()
 
         parsed = self._find_github_remote(repo)
@@ -81,7 +99,7 @@ class GitRepository:
         default_branch = _remote_ref_branch_name(
             await self._get_remote_default_branch(repo, parsed.name), parsed.name
         )
-        diff = await self._get_diff(repo)
+        diff = await self._get_diff(repo) if include_diff else ""
 
         return GitRepoInfo(
             remote_name=parsed.name,
@@ -92,6 +110,7 @@ class GitRepository:
             commit=commit,
             diff=diff,
             default_branch=default_branch,
+            repo_root=_repo_root_path(repo),
         )
 
     async def fetch(self, remote: str = "origin") -> None:
@@ -151,7 +170,11 @@ class GitRepository:
         if self._repo is None:
             try:
                 self._repo = Repo(self._workdir, search_parent_directories=True)
-            except InvalidGitRepositoryError as e:
+            except (InvalidGitRepositoryError, NoSuchPathError) as e:
+                # NoSuchPathError: the workdir was moved/deleted between the
+                # picker selecting it and this call. Surface it as an ineligible
+                # root (mapped to a clear reject reason) instead of a generic
+                # failure.
                 raise ServiceTeleportNotSupportedError(
                     "Teleport requires a git repository. cd into a project with a .git directory and try again."
                 ) from e
@@ -274,3 +297,10 @@ def _remote_ref_branch_name(ref: str | None, remote: str) -> str | None:
     if ref.startswith(prefix):
         return ref.removeprefix(prefix)
     return ref
+
+
+def _repo_root_path(repo: Repo) -> Path | None:
+    working_tree_dir = repo.working_tree_dir
+    if not isinstance(working_tree_dir, str):
+        return None
+    return Path(working_tree_dir).resolve()

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
+from collections.abc import Mapping
 from enum import StrEnum, auto
+import logging
 import os
 from pathlib import Path
 import re
 import shlex
-from typing import Annotated, Any, Literal, get_args
+from string import Formatter
+from typing import Annotated, Any, Literal
 
 from pydantic import (
     BaseModel,
@@ -17,6 +20,12 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from vibe.config_values import (
+    THINKING_LEVELS as THINKING_LEVELS,
+    SpeechOutputFormat,
+    ThinkingLevel,
+    TranscriptionEncoding,
+)
 from vibe.core.config._defaults import (
     DEFAULT_AUTO_COMPACT_THRESHOLD,
     DEFAULT_MISTRAL_BROWSER_AUTH_API_BASE_URL,
@@ -24,6 +33,8 @@ from vibe.core.config._defaults import (
 )
 from vibe.core.paths import SESSION_LOG_DIR
 from vibe.core.types import Backend
+
+logger = logging.getLogger(__name__)
 
 
 class MissingAPIKeyError(RuntimeError):
@@ -77,6 +88,11 @@ class ProviderConfig(BaseModel):
     api_style: str = "openai"
     backend: Backend = Backend.GENERIC
     reasoning_field_name: str = "reasoning_content"
+    # Whether this provider reliably terminates streams with a finish reason.
+    # When True, a stream that ends without one is treated as an incomplete
+    # stream (and retried). Set to False for OpenAI-compatible endpoints that
+    # do not emit a finish reason, to avoid spurious incomplete-stream errors.
+    emits_finish_reason: bool = True
     project_id: str = ""
     region: str = ""
     extra_headers: dict[str, str] = Field(default_factory=dict)
@@ -125,6 +141,13 @@ class TranscribeProviderConfig(BaseModel):
     client: TranscribeClient = TranscribeClient.MISTRAL
 
 
+def normalize_mcp_server_name(value: str | None) -> str:
+    if not value:
+        return ""
+    normalized = re.sub(r"[^a-zA-Z0-9_-]", "_", value)
+    return normalized.strip("_-")[:256]
+
+
 class _MCPBase(BaseModel):
     name: str = Field(description="Short alias used to prefix tool names")
     prompt: str | None = Field(
@@ -157,9 +180,10 @@ class _MCPBase(BaseModel):
     @field_validator("name", mode="after")
     @classmethod
     def normalize_name(cls, v: str) -> str:
-        normalized = re.sub(r"[^a-zA-Z0-9_-]", "_", v)
-        normalized = normalized.strip("_-")
-        return normalized[:256]
+        normalized = normalize_mcp_server_name(v)
+        if not normalized:
+            raise ValueError("MCP server name must contain letters or numbers")
+        return normalized
 
 
 _LEGACY_STATIC_AUTH_KEYS = (
@@ -168,6 +192,8 @@ _LEGACY_STATIC_AUTH_KEYS = (
     "api_key_header",
     "api_key_format",
 )
+_ENV_VAR_PATTERN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_HEADER_NAME_PATTERN = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 
 
 class MCPStaticAuth(BaseModel):
@@ -197,17 +223,78 @@ class MCPStaticAuth(BaseModel):
         ),
     )
 
+    @field_validator("headers")
+    @classmethod
+    def _validate_headers(cls, headers: dict[str, str]) -> dict[str, str]:
+        normalized_names: set[str] = set()
+        for name in headers:
+            if not _HEADER_NAME_PATTERN.fullmatch(name):
+                raise ValueError(f"Invalid HTTP header name {name!r}")
+            normalized_name = name.lower()
+            if normalized_name in normalized_names:
+                raise ValueError(f"Duplicate HTTP header {name!r}")
+            normalized_names.add(normalized_name)
+        return headers
+
+    @field_validator("api_key_env")
+    @classmethod
+    def _validate_api_key_env(cls, value: str) -> str:
+        if value and not _ENV_VAR_PATTERN.fullmatch(value):
+            raise ValueError("api_key_env must be a valid environment variable name")
+        return value
+
+    @field_validator("api_key_header")
+    @classmethod
+    def _validate_api_key_header(cls, value: str) -> str:
+        if not _HEADER_NAME_PATTERN.fullmatch(value):
+            raise ValueError("api_key_header must be a valid HTTP header name")
+        return value
+
+    @field_validator("api_key_format")
+    @classmethod
+    def _validate_api_key_format(cls, value: str) -> str:
+        # Enumerate the real replacement fields rather than substring-matching
+        # `{token}`: escaped braces (`{{token}}`) contain that substring but
+        # yield no field, and a format spec (`{token:>5}`) is valid but omits it.
+        try:
+            fields = [
+                name for _, name, _, _ in Formatter().parse(value) if name is not None
+            ]
+        except ValueError as exc:
+            raise ValueError("api_key_format must be a valid format string") from exc
+        if any(name != "token" for name in fields):
+            raise ValueError("api_key_format may only reference the token placeholder")
+        if "token" not in fields:
+            raise ValueError("api_key_format must contain the `{token}` placeholder")
+        return value
+
+    @model_validator(mode="after")
+    def _warn_inert_api_key_fields(self) -> MCPStaticAuth:
+        if not self.api_key_env and (
+            self.api_key_header != "Authorization"
+            or self.api_key_format != "Bearer {token}"
+        ):
+            logger.warning(
+                "MCP static auth sets api_key_header/api_key_format without "
+                "api_key_env; these fields are ignored.",
+                extra={
+                    "api_key_header": self.api_key_header,
+                    "api_key_format": self.api_key_format,
+                },
+            )
+        return self
+
     def http_headers(self) -> dict[str, str]:
-        hdrs = dict(self.headers or {})
-        env_var = (self.api_key_env or "").strip()
-        if env_var and (token := os.getenv(env_var)):
-            target = (self.api_key_header or "").strip() or "Authorization"
-            if not any(h.lower() == target.lower() for h in hdrs):
-                try:
-                    value = (self.api_key_format or "{token}").format(token=token)
-                except Exception:
-                    value = token
-                hdrs[target] = value
+        hdrs = dict(self.headers)
+        has_explicit_api_key_header = any(
+            name.lower() == self.api_key_header.lower() for name in hdrs
+        )
+        if (
+            not has_explicit_api_key_header
+            and self.api_key_env
+            and (token := os.getenv(self.api_key_env))
+        ):
+            hdrs[self.api_key_header] = self.api_key_format.format(token=token)
         return hdrs
 
 
@@ -330,10 +417,6 @@ def _default_alias_to_name(data: Any) -> Any:
     return data
 
 
-ThinkingLevel = Literal["off", "low", "medium", "high", "max"]
-THINKING_LEVELS: list[str] = list(get_args(ThinkingLevel))
-
-
 class ModelConfig(BaseModel):
     name: str
     provider: str
@@ -341,10 +424,147 @@ class ModelConfig(BaseModel):
     temperature: float = 0.2
     input_price: float = 0.0  # Price per million input tokens
     output_price: float = 0.0  # Price per million output tokens
+    cached_input_price: float | None = (
+        None  # Price per million cached input tokens; None bills them at input_price
+    )
     thinking: ThinkingLevel = "off"
     supports_images: bool = False
     auto_compact_threshold: int = DEFAULT_AUTO_COMPACT_THRESHOLD
     _default_alias_to_name = model_validator(mode="before")(_default_alias_to_name)
+
+
+def normalize_model_configs(value: Any) -> Any:
+    """Read [[models]] lists or alias maps into the deep-mergeable internal map."""
+    if isinstance(value, Mapping):
+        normalized: dict[str, Any] = {}
+        for alias, payload in value.items():
+            normalized[alias] = _model_payload_with_alias(alias, payload)
+        return normalized
+
+    if isinstance(value, list):
+        normalized: dict[str, Any] = {}
+        for payload in value:
+            alias = _model_alias_from_payload(payload)
+            normalized[alias] = _model_payload_with_alias(alias, payload)
+        return normalized
+
+    return value
+
+
+def serialize_model_configs(value: Any) -> Any:
+    """Write the internal model map back as legacy [[models]] TOML entries.
+
+    None-valued fields are dropped: TOML has no null and tomli_w rejects it.
+    """
+    normalized = normalize_model_configs(value)
+    if not isinstance(normalized, Mapping):
+        return normalized
+    return [_serialize_model_entry(model) for model in normalized.values()]
+
+
+def _serialize_model_entry(model: Any) -> Any:
+    if isinstance(model, ModelConfig):
+        return model.model_dump(exclude_none=True)
+    if isinstance(model, Mapping):
+        return {key: value for key, value in model.items() if value is not None}
+    return model
+
+
+def normalize_model_configs_with_defaults(value: Any, defaults: Any) -> Any:
+    """Normalize models and fill sparse default-model overrides when required."""
+    normalized = normalize_model_configs(value)
+    if not isinstance(normalized, Mapping):
+        return normalized
+
+    default_models = normalize_model_configs(defaults)
+    if not isinstance(default_models, Mapping):
+        return normalized
+
+    if not _needs_default_model_payloads(normalized, default_models):
+        return normalized
+
+    return merge_model_payloads(
+        {
+            alias: _model_payload_for_merge(model)
+            for alias, model in default_models.items()
+        },
+        normalized,
+    )
+
+
+def _model_alias_from_payload(payload: Any) -> str:
+    if isinstance(payload, ModelConfig):
+        return payload.alias
+
+    if not isinstance(payload, Mapping):
+        raise ValueError("Model entries must be tables with an alias or name.")
+
+    alias = payload.get("alias", payload.get("name"))
+    if not isinstance(alias, str) or not alias:
+        raise ValueError("Model entries must define a non-empty alias or name.")
+    return alias
+
+
+def _model_payload_with_alias(alias: Any, payload: Any) -> Any:
+    if not isinstance(alias, str) or not alias:
+        raise ValueError("Model aliases must be non-empty strings.")
+
+    if isinstance(payload, ModelConfig):
+        if payload.alias != alias:
+            raise ValueError(
+                f"Model key '{alias}' does not match model alias '{payload.alias}'."
+            )
+        return payload
+
+    if not isinstance(payload, Mapping):
+        return payload
+
+    model_payload = dict(payload)
+    existing_alias = model_payload.get("alias")
+    if existing_alias is None:
+        model_payload["alias"] = alias
+        return model_payload
+
+    if existing_alias != alias:
+        raise ValueError(
+            f"Model key '{alias}' does not match model alias '{existing_alias}'."
+        )
+    return model_payload
+
+
+def _needs_default_model_payloads(
+    models: Mapping[str, Any], defaults: Mapping[str, Any]
+) -> bool:
+    """Return whether a known default model is missing required identity fields."""
+    for alias, payload in models.items():
+        if alias not in defaults or not isinstance(payload, Mapping):
+            continue
+        if "name" not in payload or "provider" not in payload:
+            return True
+    return False
+
+
+def _model_payload_for_merge(model: Any) -> dict[str, Any]:
+    """Convert a default model entry into a plain mapping for deep merge."""
+    if isinstance(model, ModelConfig):
+        return model.model_dump(mode="json")
+    if isinstance(model, Mapping):
+        return dict(model)
+    return {}
+
+
+def merge_model_payloads(
+    mapping: Mapping[str, Any], updating_mapping: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Recursively merge model payload mappings without mutating either input."""
+    merged = dict(mapping)
+    for key, value in updating_mapping.items():
+        existing = merged.get(key)
+        if isinstance(value, Mapping) and isinstance(existing, Mapping):
+            merged[key] = merge_model_payloads(existing, value)
+            continue
+        merged[key] = value
+    return merged
 
 
 class TranscribeModelConfig(BaseModel):
@@ -352,17 +572,11 @@ class TranscribeModelConfig(BaseModel):
     provider: str
     alias: str
     sample_rate: int = 16000
-    encoding: Literal["pcm_s16le"] = "pcm_s16le"
+    encoding: TranscriptionEncoding = "pcm_s16le"
     language: str = "en"
     target_streaming_delay_ms: int = 500
 
     _default_alias_to_name = model_validator(mode="before")(_default_alias_to_name)
-
-
-# Mirrors mistralai.client.models.SpeechOutputFormat, declared locally so the
-# config models don't pull the mistralai SDK into CLI startup. Compatibility
-# is type-checked where the value is passed to the SDK (MistralTTSClient).
-type SpeechOutputFormat = Literal["pcm", "wav", "mp3", "flac", "opus"]
 
 
 class TTSClient(StrEnum):
@@ -384,6 +598,12 @@ class TTSModelConfig(BaseModel):
     response_format: SpeechOutputFormat = "wav"
 
     _default_alias_to_name = model_validator(mode="before")(_default_alias_to_name)
+
+
+class OtelRedactionMode(StrEnum):
+    DEFAULT = auto()
+    NONE = auto()
+    STRICT = auto()
 
 
 class OtelSpanExporterConfig(BaseModel):

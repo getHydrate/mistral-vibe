@@ -93,6 +93,25 @@ def _escape_reserved_previous_user_message_tags(content: str) -> str:
     return content
 
 
+def render_teleport_summary_request(
+    base_summary_prompt: str, teleported_prompt: str, *, max_summary_chars: int
+) -> str:
+    return "\n".join([
+        base_summary_prompt,
+        "",
+        "## Teleport Message Context Instructions",
+        "Create concise message context for Vibe Code Web. Focus on prior "
+        "task state that the next agent needs in order to continue naturally.",
+        "Do not repeat the prompt that will be sent separately to start the "
+        "web session.",
+        f"Keep the summary under {max_summary_chars:,} characters.",
+        "",
+        "<teleported_prompt>",
+        escape(teleported_prompt, quote=False),
+        "</teleported_prompt>",
+    ])
+
+
 def parse_previous_user_messages(content: str) -> list[str]:
     block_start = content.find(_PREVIOUS_USER_MESSAGES_OPEN)
     if block_start < 0:
@@ -108,6 +127,9 @@ def parse_previous_user_messages(content: str) -> list[str]:
 
 
 def _is_compaction_context_message(message: LLMMessage) -> bool:
+    if message.context_boundary == "compaction":
+        return True
+
     content = message.content or ""
     return (
         message.role == Role.user
@@ -117,6 +139,24 @@ def _is_compaction_context_message(message: LLMMessage) -> bool:
         and _COMPACTION_SUMMARY_OPEN in content
         and _COMPACTION_SUMMARY_CLOSE in content
     )
+
+
+def select_model_context(messages: Sequence[LLMMessage]) -> list[LLMMessage]:
+    boundary_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if _is_compaction_context_message(messages[index])
+        ),
+        None,
+    )
+    if boundary_index is None:
+        return list(messages)
+
+    system_messages = [
+        message for message in messages[:boundary_index] if message.role == Role.system
+    ]
+    return [*system_messages, *messages[boundary_index:]]
 
 
 def collect_prior_user_messages(

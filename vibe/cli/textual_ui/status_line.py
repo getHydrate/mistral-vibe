@@ -13,13 +13,50 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
 from typing import Any
 
-from vibe.core.logger import logger
-from vibe.core.utils import kill_async_subprocess
-from vibe.core.utils.io import decode_safe
+from vibe.observability.logging import logger
+from vibe.utils.io import decode_safe
+from vibe.utils.platform import is_windows
 
 DEFAULT_COMMAND_TIMEOUT = 2.0
+
+
+async def _kill_status_subprocess(proc: asyncio.subprocess.Process) -> None:
+    """Force-terminate the status-line command's process group and wait for it.
+
+    Inlined rather than importing ``vibe.core.utils.kill_async_subprocess`` so
+    the Textual layer keeps no ``vibe.core`` dependency (see the app-server
+    boundary test). The command is spawned with ``start_new_session=True``, so
+    it owns its own process group.
+    """
+    if proc.returncode is not None:
+        return
+    try:
+        if is_windows():
+            try:
+                killer = await asyncio.create_subprocess_exec(
+                    "taskkill",
+                    "/F",
+                    "/T",
+                    "/PID",
+                    str(proc.pid),
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                )
+                await killer.wait()
+            except (FileNotFoundError, OSError):
+                proc.terminate()
+        else:
+            try:
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        await proc.wait()
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
 
 
 def build_status_line_payload(
@@ -104,12 +141,12 @@ class StatusLineRunner:
                 process.communicate(stdin_data), timeout=self._timeout
             )
         except TimeoutError:
-            await kill_async_subprocess(process)
+            await _kill_status_subprocess(process)
             logger.debug("Status line command timed out after %.1fs", self._timeout)
             return None
         except BaseException:
             if process.returncode is None:
-                await kill_async_subprocess(process)
+                await _kill_status_subprocess(process)
             raise
         if process.returncode != 0:
             logger.debug("Status line command exited with code %s", process.returncode)

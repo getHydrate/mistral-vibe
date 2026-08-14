@@ -6,17 +6,19 @@ from unittest.mock import patch
 
 import pytest
 
-from tests.cli.plan_offer.adapters.fake_whoami_gateway import FakeWhoAmIGateway
 from tests.conftest import (
     build_test_agent_loop,
     build_test_vibe_app,
     build_test_vibe_config,
 )
+from tests.stubs.fake_account_gateway import FakeAccountGateway
 from tests.update_notifier.adapters.fake_update_cache_repository import (
     FakeUpdateCacheRepository,
 )
 from tests.update_notifier.adapters.fake_update_gateway import FakeUpdateGateway
-from vibe.cli.plan_offer.ports.whoami_gateway import WhoAmIPlanType, WhoAmIResponse
+from vibe.app_server._account import WhoAmIResult
+from vibe.app_server.models import AccountPlanKind, CompletedEffectState
+from vibe.cli.textual_ui.widgets.compact import CompactMessage
 from vibe.cli.textual_ui.widgets.messages import (
     AssistantMessage,
     UserMessage,
@@ -24,13 +26,13 @@ from vibe.cli.textual_ui.widgets.messages import (
 )
 from vibe.cli.textual_ui.widgets.tools import ToolCallMessage, ToolResultMessage
 from vibe.cli.update_notifier import UpdateCache
-from vibe.core.config import VibeConfig
+from vibe.core.config import VibeConfigSchema
 from vibe.core.types import FunctionCall, LLMMessage, Role, ToolCall
 
 
 @pytest.mark.asyncio
 async def test_ui_displays_messages_when_resuming_session(
-    vibe_config: VibeConfig,
+    vibe_config: VibeConfigSchema,
 ) -> None:
     """Test that messages are properly displayed when resuming a session."""
     agent_loop = build_test_agent_loop(config=vibe_config)
@@ -84,12 +86,14 @@ async def test_ui_displays_messages_when_resuming_session(
         tool_result_messages = app.query(ToolResultMessage)
         assert len(tool_result_messages) == 1
         assert tool_result_messages[0].tool_name == "read"
-        assert tool_result_messages[0]._content == "File content here"
+        state = tool_result_messages[0]._state
+        assert isinstance(state, CompletedEffectState)
+        assert state.output_text == "File content here"
 
 
 @pytest.mark.asyncio
 async def test_ui_does_not_display_messages_when_only_system_messages_exist(
-    vibe_config: VibeConfig,
+    vibe_config: VibeConfigSchema,
 ) -> None:
     """Test that no messages are displayed when only system messages exist."""
     agent_loop = build_test_agent_loop(config=vibe_config)
@@ -113,7 +117,7 @@ async def test_ui_does_not_display_messages_when_only_system_messages_exist(
 
 @pytest.mark.asyncio
 async def test_ui_displays_multiple_user_assistant_turns(
-    vibe_config: VibeConfig,
+    vibe_config: VibeConfigSchema,
 ) -> None:
     """Test that multiple conversation turns are properly displayed."""
     agent_loop = build_test_agent_loop(config=vibe_config)
@@ -146,8 +150,39 @@ async def test_ui_displays_multiple_user_assistant_turns(
 
 
 @pytest.mark.asyncio
+async def test_ui_displays_compaction_checkpoint_when_resuming_session(
+    vibe_config: VibeConfigSchema,
+) -> None:
+    agent_loop = build_test_agent_loop(config=vibe_config)
+    agent_loop.messages.extend([
+        LLMMessage(role=Role.user, content="Before compaction"),
+        LLMMessage(
+            role=Role.user,
+            content="Compacted context",
+            injected=True,
+            context_boundary="compaction",
+        ),
+        LLMMessage(role=Role.assistant, content="After compaction"),
+    ])
+    app = build_test_vibe_app(agent_loop=agent_loop)
+
+    async with app.run_test() as pilot:
+        await pilot.pause(0.5)
+
+        assert [message._content for message in app.query(UserMessage)] == [
+            "Before compaction"
+        ]
+        assert [message._content for message in app.query(AssistantMessage)] == [
+            "After compaction"
+        ]
+        assert [message.get_content() for message in app.query(CompactMessage)] == [
+            "Compaction completed."
+        ]
+
+
+@pytest.mark.asyncio
 async def test_ui_displays_messages_when_resuming_in_dangerous_directory(
-    monkeypatch: pytest.MonkeyPatch, vibe_config: VibeConfig
+    monkeypatch: pytest.MonkeyPatch, vibe_config: VibeConfigSchema
 ) -> None:
     monkeypatch.setattr(
         "vibe.cli.textual_ui.app.is_dangerous_directory",
@@ -192,9 +227,9 @@ async def test_ui_rebuilds_history_when_whats_new_is_shown(
         seen_whats_new_version=None,
     )
     update_cache_repository = FakeUpdateCacheRepository(update_cache=update_cache)
-    plan_offer_gateway = FakeWhoAmIGateway(
-        WhoAmIResponse(
-            plan_type=WhoAmIPlanType.API,
+    account_gateway = FakeAccountGateway(
+        WhoAmIResult(
+            plan_type=AccountPlanKind.API,
             plan_name="FREE",
             prompt_switching_to_pro_plan=False,
         )
@@ -203,7 +238,7 @@ async def test_ui_rebuilds_history_when_whats_new_is_shown(
         agent_loop=agent_loop,
         update_notifier=FakeUpdateGateway(update=None),
         update_cache_repository=update_cache_repository,
-        plan_offer_gateway=plan_offer_gateway,
+        account_gateway=account_gateway,
         current_version="1.0.0",
         config=config,
     )

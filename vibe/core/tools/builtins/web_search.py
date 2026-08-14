@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING, final
 
 from pydantic import BaseModel, Field
 
-from vibe.core.config import DEFAULT_MISTRAL_API_ENV_KEY, AnyVibeConfig, resolve_api_key
+from vibe.core.config import DEFAULT_MISTRAL_API_ENV_KEY, VibeConfigSchema
 from vibe.core.config.models import Backend
 from vibe.core.telemetry.build_metadata import build_request_metadata
 from vibe.core.tools.base import (
@@ -18,12 +18,14 @@ from vibe.core.tools.base import (
 )
 from vibe.core.tools.ui import ToolCallDisplay, ToolResultDisplay, ToolUIData
 from vibe.core.types import ToolStreamEvent
-from vibe.core.utils.http import (
+from vibe.utils.api_keys import resolve_api_key
+from vibe.utils.http import (
     VibeAsyncHTTPClient,
     build_ssl_context,
     get_server_url_from_api_base,
     get_user_agent,
 )
+from vibe.utils.tool_presentation import ToolEffectKind
 
 if TYPE_CHECKING:
     from mistralai.client.models import ConversationResponse
@@ -59,8 +61,10 @@ class WebSearch(
     BaseTool[WebSearchArgs, WebSearchResult, WebSearchConfig, BaseToolState],
     ToolUIData[WebSearchArgs, WebSearchResult],
 ):
+    effect_kind = ToolEffectKind.WEB_SEARCH
+
     @classmethod
-    def is_available(cls, config: AnyVibeConfig | None = None) -> bool:
+    def is_available(cls, config: VibeConfigSchema | None = None) -> bool:
         if config is None:
             return bool(resolve_api_key(DEFAULT_MISTRAL_API_ENV_KEY))
 
@@ -129,13 +133,13 @@ class WebSearch(
             return None
         return get_server_url_from_api_base(provider.api_base)
 
-    def _resolve_config(self, ctx: InvokeContext | None) -> AnyVibeConfig | None:
+    def _resolve_config(self, ctx: InvokeContext | None) -> VibeConfigSchema | None:
         if not ctx or not ctx.agent_manager:
             return None
         return ctx.agent_manager.config
 
     @classmethod
-    def _api_key_env_var(cls, config: AnyVibeConfig | None) -> str:
+    def _api_key_env_var(cls, config: VibeConfigSchema | None) -> str:
         if config is None:
             return DEFAULT_MISTRAL_API_ENV_KEY
         provider = config.get_mistral_provider()
@@ -182,10 +186,28 @@ class WebSearch(
     @classmethod
     def get_call_display(cls, event: ToolCallEvent) -> ToolCallDisplay:
         if event.args is None:
-            return ToolCallDisplay(summary="web_search")
+            return ToolCallDisplay(
+                summary="web_search",
+                verb="Running",
+                message="web_search",
+                settled_verb="Ran",
+                settled_message="web_search",
+            )
         if not isinstance(event.args, WebSearchArgs):
-            return ToolCallDisplay(summary="web_search")
-        return ToolCallDisplay(summary=f"Searching the web: {event.args.query!r}")
+            return ToolCallDisplay(
+                summary="web_search",
+                verb="Running",
+                message="web_search",
+                settled_verb="Ran",
+                settled_message="web_search",
+            )
+        return ToolCallDisplay(
+            summary=f"Searching the web: {event.args.query!r}",
+            verb="Searching",
+            message=f"the web: {event.args.query!r}",
+            settled_verb="Searched",
+            settled_message=f"the web: {event.args.query!r}",
+        )
 
     @classmethod
     def get_result_display(cls, event: ToolResultEvent) -> ToolResultDisplay:
@@ -195,8 +217,8 @@ class WebSearch(
             )
         source_count = len(event.result.sources)
         plural = "" if source_count == 1 else "s"
-        message = f"Searched {event.result.query!r} ({source_count} source{plural})"
-        return ToolResultDisplay(success=True, message=message)
+        message = f"{event.result.query!r} ({source_count} source{plural})"
+        return ToolResultDisplay(success=True, verb="Searched", message=message)
 
     @classmethod
     def get_status_text(cls) -> str:

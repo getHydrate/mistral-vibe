@@ -8,6 +8,11 @@ from textual.app import ComposeResult
 from textual.containers import Vertical
 from textual.message import Message
 
+from vibe.app_server.models import AgentSafety
+from vibe.cli.autocompletion.completers import CommandCompleter, PathCompleter
+from vibe.cli.autocompletion.inline_skill_completion import (
+    InlineSkillCompletionController,
+)
 from vibe.cli.autocompletion.path_completion import PathCompletionController
 from vibe.cli.autocompletion.slash_command import SlashCommandController
 from vibe.cli.commands import CommandRegistry
@@ -18,8 +23,6 @@ from vibe.cli.textual_ui.widgets.chat_input.completion_manager import (
 from vibe.cli.textual_ui.widgets.chat_input.completion_popup import CompletionPopup
 from vibe.cli.textual_ui.widgets.chat_input.text_area import ChatTextArea
 from vibe.cli.voice_manager.voice_manager_port import VoiceManagerPort
-from vibe.core.agents import AgentSafety
-from vibe.core.autocompletion.completers import CommandCompleter, PathCompleter
 
 SAFETY_BORDER_CLASSES: dict[AgentSafety, str] = {
     AgentSafety.SAFE: "border-safe",
@@ -67,6 +70,11 @@ class ChatInputContainer(Vertical):
                 ),
                 self,
             ),
+            InlineSkillCompletionController(
+                self._skill_entries_getter or (lambda: []),
+                self,
+                self._input_is_default_mode,
+            ),
         ])
         self._body: ChatInputBody | None = None
 
@@ -99,10 +107,14 @@ class ChatInputContainer(Vertical):
         if not self._body:
             return
 
-        self._body.set_completion_reset_callback(self._completion_manager.reset)
         if self._body.input_widget:
             self._body.input_widget.set_completion_manager(self._completion_manager)
             self._body.focus_input()
+
+    def on_chat_input_body_completion_reset_requested(
+        self, _event: ChatInputBody.CompletionResetRequested
+    ) -> None:
+        self._completion_manager.reset()
 
     @property
     def input_widget(self) -> ChatTextArea | None:
@@ -125,11 +137,12 @@ class ChatInputContainer(Vertical):
                 widget.get_full_text(), widget._get_full_cursor_offset()
             )
 
+    def _input_is_default_mode(self) -> bool:
+        widget = self.input_widget
+        return widget is None or widget.is_default_mode
+
     def dismiss_completion(self) -> bool:
-        if self._completion_manager.is_active:
-            self._completion_manager.reset()
-            return True
-        return False
+        return self._completion_manager.dismiss()
 
     def focus_input(self) -> None:
         if self._body:
@@ -150,6 +163,14 @@ class ChatInputContainer(Vertical):
         except Exception:
             return
         popup.hide()
+
+    def show_inline_suggestion(self, suggestion: str) -> None:
+        if widget := self.input_widget:
+            widget.set_inline_suggestion(suggestion)
+
+    def clear_inline_suggestion(self) -> None:
+        if widget := self.input_widget:
+            widget.clear_inline_suggestion()
 
     def _format_insertion(self, replacement: str, suffix: str) -> str:
         """Format the insertion text with appropriate spacing.

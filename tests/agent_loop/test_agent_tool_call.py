@@ -11,15 +11,16 @@ import pytest
 from tests.conftest import build_test_agent_loop, build_test_vibe_config
 from tests.mock.utils import mock_llm_chunk
 from tests.stubs.fake_backend import FakeBackend
+from tests.stubs.fake_interaction_requests import ApprovalRequestHandler
 from tests.stubs.fake_tool import FakeTool
 from vibe.core.agent_loop import AgentLoop
 from vibe.core.agents.models import BuiltinAgentName
-from vibe.core.config import VibeConfig
+from vibe.core.config import VibeConfigSchema
 from vibe.core.hooks.manager import HooksManager
 from vibe.core.tools.base import ToolPermission
 from vibe.core.tools.builtins.todo import TodoItem
 from vibe.core.types import (
-    ApprovalCallback,
+    ApprovalRequestEvent,
     ApprovalResponse,
     AssistantEvent,
     BaseEvent,
@@ -32,12 +33,41 @@ from vibe.core.types import (
     UserMessageEvent,
 )
 
+_APPROVAL_HANDLERS: dict[AgentLoop, ApprovalRequestHandler] = {}
+
 
 async def act_and_collect_events(agent_loop: AgentLoop, prompt: str) -> list[BaseEvent]:
-    return [ev async for ev in agent_loop.act(prompt)]
+    events: list[BaseEvent] = []
+    async for event in agent_loop.act(prompt):
+        events.append(event)
+        if not isinstance(event, ApprovalRequestEvent):
+            continue
+        handler = _APPROVAL_HANDLERS.get(agent_loop)
+        try:
+            response, feedback = (
+                await handler(
+                    event.tool_name,
+                    event.tool_args,
+                    event.tool_call_id,
+                    event.required_permissions,
+                )
+                if handler is not None
+                else (ApprovalResponse.NO, None)
+            )
+        except BaseException as exc:
+            agent_loop.reject_request(event.request_id, exc)
+            continue
+        agent_loop.resolve_approval_request(event.request_id, response, feedback)
+    return events
 
 
-def make_config(todo_permission: ToolPermission = ToolPermission.ALWAYS) -> VibeConfig:
+def tool_result(events: list[BaseEvent]) -> ToolResultEvent:
+    return next(event for event in events if isinstance(event, ToolResultEvent))
+
+
+def make_config(
+    todo_permission: ToolPermission = ToolPermission.ALWAYS,
+) -> VibeConfigSchema:
     return build_test_vibe_config(
         enabled_tools=["todo"], tools={"todo": {"permission": todo_permission.value}}
     )
@@ -57,18 +87,16 @@ def make_agent_loop(
     auto_approve: bool = True,
     todo_permission: ToolPermission = ToolPermission.ALWAYS,
     backend: FakeBackend,
-    approval_callback: ApprovalCallback | None = None,
+    approval_handler: ApprovalRequestHandler | None = None,
 ) -> AgentLoop:
-    agent_name = (
-        BuiltinAgentName.AUTO_APPROVE if auto_approve else BuiltinAgentName.DEFAULT
-    )
+    agent_name = BuiltinAgentName.AUTO_APPROVE if auto_approve else BuiltinAgentName.ASK
     agent_loop = build_test_agent_loop(
         config=make_config(todo_permission=todo_permission),
         agent_name=agent_name,
         backend=backend,
     )
-    if approval_callback:
-        agent_loop.set_approval_callback(approval_callback)
+    if approval_handler is not None:
+        _APPROVAL_HANDLERS[agent_loop] = approval_handler
     return agent_loop
 
 
@@ -143,14 +171,14 @@ async def test_tool_call_requires_approval_if_not_auto_approved(
     assert isinstance(events[1], AssistantEvent)
     assert isinstance(events[2], ToolCallEvent)
     assert events[2].tool_name == "todo"
-    assert isinstance(events[3], ToolResultEvent)
-    assert events[3].skipped is True
-    assert events[3].error is None
-    assert events[3].result is None
-    assert events[3].skip_reason is not None
-    assert "not permitted" in events[3].skip_reason.lower()
-    assert isinstance(events[4], AssistantEvent)
-    assert events[4].content == "I cannot execute the tool without approval."
+    assert isinstance(events[3], ApprovalRequestEvent)
+    result = tool_result(events)
+    assert result.skipped is True
+    assert result.error is None
+    assert result.result is None
+    assert result.skip_reason is not None
+    assert "user_cancellation" in result.skip_reason.lower()
+    assert result.cancelled is True
     assert agent_loop.stats.tool_calls_rejected == 1
     assert agent_loop.stats.tool_calls_agreed == 0
     assert agent_loop.stats.tool_calls_succeeded == 0
@@ -163,8 +191,10 @@ async def test_tool_call_requires_approval_if_not_auto_approved(
 
 
 @pytest.mark.asyncio
-async def test_tool_call_approved_by_callback(telemetry_events: list[dict]) -> None:
-    async def approval_callback(
+async def test_tool_call_approved_by_request_event(
+    telemetry_events: list[dict],
+) -> None:
+    async def approval_handler(
         _tool_name: str, _args: BaseModel, _tool_call_id: str, _rp: list | None = None
     ) -> tuple[ApprovalResponse, str | None]:
         return (ApprovalResponse.YES, None)
@@ -172,7 +202,7 @@ async def test_tool_call_approved_by_callback(telemetry_events: list[dict]) -> N
     agent_loop = make_agent_loop(
         auto_approve=False,
         todo_permission=ToolPermission.ASK,
-        approval_callback=approval_callback,
+        approval_handler=approval_handler,
         backend=FakeBackend([
             [
                 mock_llm_chunk(
@@ -187,10 +217,10 @@ async def test_tool_call_approved_by_callback(telemetry_events: list[dict]) -> N
     events = await act_and_collect_events(agent_loop, "What's my todo list?")
 
     assert isinstance(events[0], UserMessageEvent)
-    assert isinstance(events[3], ToolResultEvent)
-    assert events[3].skipped is False
-    assert events[3].error is None
-    assert events[3].result is not None
+    result = tool_result(events)
+    assert result.skipped is False
+    assert result.error is None
+    assert result.result is not None
     assert agent_loop.stats.tool_calls_agreed == 1
     assert agent_loop.stats.tool_calls_rejected == 0
     assert agent_loop.stats.tool_calls_succeeded == 1
@@ -203,12 +233,12 @@ async def test_tool_call_approved_by_callback(telemetry_events: list[dict]) -> N
 
 
 @pytest.mark.asyncio
-async def test_tool_call_rejected_when_auto_approve_disabled_and_rejected_by_callback(
+async def test_tool_call_rejected_by_request_event(
     telemetry_events: list[dict],
 ) -> None:
     custom_feedback = "User declined tool execution"
 
-    async def approval_callback(
+    async def approval_handler(
         _tool_name: str, _args: BaseModel, _tool_call_id: str, _rp: list | None = None
     ) -> tuple[ApprovalResponse, str | None]:
         return (ApprovalResponse.NO, custom_feedback)
@@ -216,7 +246,7 @@ async def test_tool_call_rejected_when_auto_approve_disabled_and_rejected_by_cal
     agent_loop = make_agent_loop(
         auto_approve=False,
         todo_permission=ToolPermission.ASK,
-        approval_callback=approval_callback,
+        approval_handler=approval_handler,
         backend=FakeBackend([
             [
                 mock_llm_chunk(
@@ -231,12 +261,12 @@ async def test_tool_call_rejected_when_auto_approve_disabled_and_rejected_by_cal
     events = await act_and_collect_events(agent_loop, "What's my todo list?")
 
     assert isinstance(events[0], UserMessageEvent)
-    assert isinstance(events[3], ToolResultEvent)
-    assert events[3].skipped is True
-    assert events[3].error is None
-    assert events[3].result is None
-    assert events[3].skip_reason == custom_feedback
-    assert events[3].cancelled is False
+    result = tool_result(events)
+    assert result.skipped is True
+    assert result.error is None
+    assert result.result is None
+    assert result.skip_reason == custom_feedback
+    assert result.cancelled is False
     assert agent_loop.stats.tool_calls_rejected == 1
     assert agent_loop.stats.tool_calls_agreed == 0
     assert agent_loop.stats.tool_calls_succeeded == 0
@@ -294,13 +324,13 @@ async def test_tool_call_skipped_when_permission_is_never(
 
 @pytest.mark.asyncio
 async def test_approval_always_sets_tool_permission_for_subsequent_calls() -> None:
-    callback_invocations = []
+    approval_requests = []
     agent_ref: AgentLoop | None = None
 
-    async def approval_callback(
+    async def approval_handler(
         tool_name: str, _args: BaseModel, _tool_call_id: str, _rp: list | None = None
     ) -> tuple[ApprovalResponse, str | None]:
-        callback_invocations.append(tool_name)
+        approval_requests.append(tool_name)
         # Set permission to ALWAYS for this tool (simulating the new behavior)
         assert agent_ref is not None
         if tool_name not in agent_ref.config.tools:
@@ -311,7 +341,7 @@ async def test_approval_always_sets_tool_permission_for_subsequent_calls() -> No
     agent_loop = make_agent_loop(
         auto_approve=False,
         todo_permission=ToolPermission.ASK,
-        approval_callback=approval_callback,
+        approval_handler=approval_handler,
         backend=FakeBackend([
             [
                 mock_llm_chunk(
@@ -339,16 +369,15 @@ async def test_approval_always_sets_tool_permission_for_subsequent_calls() -> No
     tool_config_help = agent_loop.tool_manager.get_tool_config("bash")
     assert tool_config_help.permission is not ToolPermission.ALWAYS
     assert agent_loop.bypass_tool_permissions is False
-    assert len(callback_invocations) == 1
-    assert callback_invocations[0] == "todo"
+    assert approval_requests == ["todo"]
     assert isinstance(events1[0], UserMessageEvent)
-    assert isinstance(events1[3], ToolResultEvent)
-    assert events1[3].skipped is False
-    assert events1[3].result is not None
+    first_result = tool_result(events1)
+    assert first_result.skipped is False
+    assert first_result.result is not None
     assert isinstance(events2[0], UserMessageEvent)
-    assert isinstance(events2[3], ToolResultEvent)
-    assert events2[3].skipped is False
-    assert events2[3].result is not None
+    second_result = tool_result(events2)
+    assert second_result.skipped is False
+    assert second_result.result is not None
     assert agent_loop.stats.tool_calls_rejected == 0
     assert agent_loop.stats.tool_calls_succeeded == 2
 
@@ -499,10 +528,10 @@ def _install_recording_hooks(agent_loop: AgentLoop) -> _RecordingHooksManager:
 
 
 @pytest.mark.asyncio
-async def test_after_tool_does_not_fire_when_cancel_lands_before_tool_execution() -> (
+async def test_post_tool_does_not_fire_when_cancel_lands_before_tool_execution() -> (
     None
 ):
-    async def approval_callback(
+    async def approval_handler(
         _tool_name: str, _args: BaseModel, _tool_call_id: str, _rp: list | None = None
     ) -> tuple[ApprovalResponse, str | None]:
         raise asyncio.CancelledError()
@@ -510,7 +539,7 @@ async def test_after_tool_does_not_fire_when_cancel_lands_before_tool_execution(
     agent_loop = make_agent_loop(
         auto_approve=False,
         todo_permission=ToolPermission.ASK,
-        approval_callback=approval_callback,
+        approval_handler=approval_handler,
         backend=FakeBackend([
             [
                 mock_llm_chunk(
@@ -529,13 +558,13 @@ async def test_after_tool_does_not_fire_when_cancel_lands_before_tool_execution(
     assert tool_result is not None
     assert tool_result.cancelled is True
 
-    assert "before_tool" in recorder.invoked
-    assert "after_tool" not in recorder.invoked
+    assert "pre_tool" in recorder.invoked
+    assert "post_tool" not in recorder.invoked
 
 
 @pytest.mark.asyncio
-async def test_after_tool_does_not_fire_when_user_denies_at_approval_prompt() -> None:
-    async def approval_callback(
+async def test_post_tool_does_not_fire_when_user_denies_at_approval_prompt() -> None:
+    async def approval_handler(
         _tool_name: str, _args: BaseModel, _tool_call_id: str, _rp: list | None = None
     ) -> tuple[ApprovalResponse, str | None]:
         return (ApprovalResponse.NO, "do not run this please")
@@ -543,7 +572,7 @@ async def test_after_tool_does_not_fire_when_user_denies_at_approval_prompt() ->
     agent_loop = make_agent_loop(
         auto_approve=False,
         todo_permission=ToolPermission.ASK,
-        approval_callback=approval_callback,
+        approval_handler=approval_handler,
         backend=FakeBackend([
             [
                 mock_llm_chunk(
@@ -563,12 +592,12 @@ async def test_after_tool_does_not_fire_when_user_denies_at_approval_prompt() ->
     assert tool_result.skipped is True
     assert tool_result.skip_reason == "do not run this please"
 
-    assert "before_tool" in recorder.invoked
-    assert "after_tool" not in recorder.invoked
+    assert "pre_tool" in recorder.invoked
+    assert "post_tool" not in recorder.invoked
 
 
 @pytest.mark.asyncio
-async def test_after_tool_does_not_fire_when_permission_is_never() -> None:
+async def test_post_tool_does_not_fire_when_permission_is_never() -> None:
     agent_loop = make_agent_loop(
         auto_approve=False,
         todo_permission=ToolPermission.NEVER,
@@ -590,12 +619,12 @@ async def test_after_tool_does_not_fire_when_permission_is_never() -> None:
     assert tool_result is not None
     assert tool_result.skipped is True
 
-    assert "before_tool" in recorder.invoked
-    assert "after_tool" not in recorder.invoked
+    assert "pre_tool" in recorder.invoked
+    assert "post_tool" not in recorder.invoked
 
 
 @pytest.mark.asyncio
-async def test_after_tool_fires_when_cancel_lands_during_tool_execution() -> None:
+async def test_post_tool_fires_when_cancel_lands_during_tool_execution() -> None:
     tool_call = ToolCall(
         id="call_cancel_mid",
         index=0,
@@ -620,7 +649,7 @@ async def test_after_tool_fires_when_cancel_lands_during_tool_execution() -> Non
     async for _ev in agent_loop.act("Execute tool"):
         pass
 
-    assert "after_tool" in recorder.invoked
+    assert "post_tool" in recorder.invoked
 
 
 @pytest.mark.asyncio
@@ -712,13 +741,13 @@ async def test_parallel_tool_calls_produce_correct_events(
 
 
 @pytest.mark.asyncio
-async def test_parallel_tool_calls_with_approval_callback(
+async def test_parallel_tool_calls_with_approval_handler(
     telemetry_events: list[dict],
 ) -> None:
     """Two parallel tool calls requiring approval should both succeed when approved."""
     approval_calls: list[str] = []
 
-    async def approval_callback(
+    async def approval_handler(
         tool_name: str, _args: BaseModel, tool_call_id: str, _rp: list | None = None
     ) -> tuple[ApprovalResponse, str | None]:
         approval_calls.append(tool_call_id)
@@ -729,7 +758,7 @@ async def test_parallel_tool_calls_with_approval_callback(
     agent_loop = make_agent_loop(
         auto_approve=False,
         todo_permission=ToolPermission.ASK,
-        approval_callback=approval_callback,
+        approval_handler=approval_handler,
         backend=FakeBackend([
             [
                 mock_llm_chunk(
@@ -755,14 +784,11 @@ async def test_parallel_tool_calls_with_approval_callback(
 
 
 @pytest.mark.asyncio
-async def test_parallel_approvals_can_run_concurrently() -> None:
-    """Approval callbacks are serialized by _approval_lock so that an 'always allow'
-    grant from the first call is visible to subsequent parallel calls.
-    """
+async def test_parallel_approval_requests_are_serialized() -> None:
     concurrency = 0
     max_concurrency = 0
 
-    async def approval_callback(
+    async def approval_handler(
         tool_name: str, _args: BaseModel, tool_call_id: str, _rp: list | None = None
     ) -> tuple[ApprovalResponse, str | None]:
         nonlocal concurrency, max_concurrency
@@ -776,7 +802,7 @@ async def test_parallel_approvals_can_run_concurrently() -> None:
     agent_loop = make_agent_loop(
         auto_approve=False,
         todo_permission=ToolPermission.ASK,
-        approval_callback=approval_callback,
+        approval_handler=approval_handler,
         backend=FakeBackend([
             [mock_llm_chunk(content="Three tools.", tool_calls=tool_calls)],
             [mock_llm_chunk(content="All done.")],
@@ -796,7 +822,7 @@ async def test_parallel_mixed_approval_and_rejection(
 ) -> None:
     """One tool approved, one rejected — both should produce correct events."""
 
-    async def approval_callback(
+    async def approval_handler(
         tool_name: str, _args: BaseModel, tool_call_id: str, _rp: list | None = None
     ) -> tuple[ApprovalResponse, str | None]:
         if tool_call_id == "call_yes":
@@ -808,7 +834,7 @@ async def test_parallel_mixed_approval_and_rejection(
     agent_loop = make_agent_loop(
         auto_approve=False,
         todo_permission=ToolPermission.ASK,
-        approval_callback=approval_callback,
+        approval_handler=approval_handler,
         backend=FakeBackend([
             [mock_llm_chunk(content="Two tools.", tool_calls=[tc_yes, tc_no])],
             [mock_llm_chunk(content="Mixed results.")],
@@ -906,8 +932,7 @@ async def test_parallel_one_tool_error_does_not_block_others() -> None:
 
 
 @pytest.mark.asyncio
-async def test_parallel_all_rejected_no_callback() -> None:
-    """Parallel tools with no approval callback should all be skipped."""
+async def test_parallel_all_rejected_without_approval_handler() -> None:
     tc1 = make_todo_tool_call("call_nc1", index=0)
     tc2 = make_todo_tool_call("call_nc2", index=1)
     agent_loop = make_agent_loop(
@@ -932,10 +957,9 @@ async def test_parallel_all_rejected_no_callback() -> None:
 
 @pytest.mark.asyncio
 async def test_parallel_all_permission_never() -> None:
-    """Parallel tools with NEVER permission skip without calling the approval callback."""
     approval_calls: list[str] = []
 
-    async def approval_callback(
+    async def approval_handler(
         tool_name: str, _args: BaseModel, tool_call_id: str, _rp: list | None = None
     ) -> tuple[ApprovalResponse, str | None]:
         approval_calls.append(tool_call_id)
@@ -946,7 +970,7 @@ async def test_parallel_all_permission_never() -> None:
     agent_loop = make_agent_loop(
         auto_approve=False,
         todo_permission=ToolPermission.NEVER,
-        approval_callback=approval_callback,
+        approval_handler=approval_handler,
         backend=FakeBackend([
             [mock_llm_chunk(content="Two tools.", tool_calls=[tc1, tc2])],
             [mock_llm_chunk(content="Both disabled.")],

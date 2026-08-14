@@ -1,71 +1,55 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Sequence
+from collections.abc import AsyncGenerator, Callable, Sequence
+from contextlib import AbstractAsyncContextManager, nullcontext
 import json
 import types
 from typing import TYPE_CHECKING, Any, ClassVar, NamedTuple
 
 import httpx
 
-from vibe.core.config import resolve_api_key
 from vibe.core.llm.backend._image import to_data_uri as _to_data_uri
 from vibe.core.llm.backend.anthropic import AnthropicAdapter
-from vibe.core.llm.backend.base import APIAdapter, PreparedRequest
-from vibe.core.llm.backend.openai_responses import OpenAIResponsesAdapter
+from vibe.core.llm.backend.base import (
+    APIAdapter,
+    PreparedRequest,
+    build_chat_payload,
+    finalize_chat_request,
+)
+from vibe.core.llm.backend.openai_responses import (
+    OpenAIResponsesAdapter,
+    OpenAIResponsesStreamError,
+)
 from vibe.core.llm.backend.reasoning_adapter import ReasoningAdapter
 from vibe.core.llm.exceptions import BackendErrorBuilder
+from vibe.core.tracing import (
+    model_call_span,
+    set_model_call_http_status,
+    set_model_call_response_metadata,
+    set_model_call_usage,
+)
 from vibe.core.types import (
     AvailableTool,
     LLMChunk,
     LLMMessage,
     LLMUsage,
     Role,
+    StopInfo,
     StrToolChoice,
 )
-from vibe.core.utils import async_generator_retry, async_retry
-from vibe.core.utils.http import VibeAsyncHTTPClient, build_ssl_context
+from vibe.core.utils import RetryObserver, async_generator_retry, async_retry
 from vibe.core.utils.sse import iter_sse_lines
+from vibe.utils.api_keys import resolve_api_key
+from vibe.utils.http import VibeAsyncHTTPClient, build_ssl_context
 
 if TYPE_CHECKING:
+    from opentelemetry import trace
+
     from vibe.core.config import ModelConfig, ProviderConfig
 
 
 class OpenAIAdapter(APIAdapter):
     endpoint: ClassVar[str] = "/chat/completions"
-
-    def build_payload(
-        self,
-        model_name: str,
-        converted_messages: list[dict[str, Any]],
-        temperature: float,
-        tools: list[AvailableTool] | None,
-        max_tokens: int | None,
-        tool_choice: StrToolChoice | AvailableTool | None,
-    ) -> dict[str, Any]:
-        payload = {
-            "model": model_name,
-            "messages": converted_messages,
-            "temperature": temperature,
-        }
-
-        if tools:
-            payload["tools"] = [tool.model_dump(exclude_none=True) for tool in tools]
-        if tool_choice:
-            payload["tool_choice"] = (
-                tool_choice
-                if isinstance(tool_choice, str)
-                else tool_choice.model_dump()
-            )
-        if max_tokens is not None:
-            payload["max_tokens"] = max_tokens
-
-        return payload
-
-    def build_headers(self, api_key: str | None = None) -> dict[str, str]:
-        headers = {"Content-Type": "application/json"}
-        if api_key:
-            headers["Authorization"] = f"Bearer {api_key}"
-        return headers
 
     def _reasoning_to_api(
         self, msg_dict: dict[str, Any], field_name: str
@@ -97,6 +81,37 @@ class OpenAIAdapter(APIAdapter):
         msg_dict["content"] = parts
         return msg_dict
 
+    def _convert_messages(
+        self, messages: Sequence[LLMMessage], provider: ProviderConfig
+    ) -> list[dict[str, Any]]:
+        field_name = provider.reasoning_field_name
+        return [
+            self._user_with_images_to_parts(
+                self._reasoning_to_api(
+                    msg.model_dump(
+                        exclude_none=True,
+                        exclude={
+                            "message_id": True,
+                            "reasoning_message_id": True,
+                            "reasoning_payloads": True,
+                            "injected": True,
+                            "images": True,
+                            "tool_result": True,
+                            "user_display_content": True,
+                            "input_text": True,
+                            "resources": True,
+                            "manual_shell": True,
+                            "context_boundary": True,
+                            "tool_calls": {"__all__": {"presentation"}},
+                        },
+                    ),
+                    field_name,
+                ),
+                msg,
+            )
+            for msg in messages
+        ]
+
     def prepare_request(
         self,
         *,
@@ -111,43 +126,29 @@ class OpenAIAdapter(APIAdapter):
         api_key: str | None = None,
         thinking: str = "off",
     ) -> PreparedRequest:
-        field_name = provider.reasoning_field_name
-        converted_messages = [
-            self._user_with_images_to_parts(
-                self._reasoning_to_api(
-                    msg.model_dump(
-                        exclude_none=True,
-                        exclude={
-                            "message_id",
-                            "reasoning_message_id",
-                            "reasoning_state",
-                            "injected",
-                            "images",
-                            "user_display_content",
-                        },
-                    ),
-                    field_name,
-                ),
-                msg,
-            )
-            for msg in messages
-        ]
+        converted_messages = self._convert_messages(messages, provider)
 
-        payload = self.build_payload(
-            model_name, converted_messages, temperature, tools, max_tokens, tool_choice
+        payload = build_chat_payload(
+            model_name=model_name,
+            messages=converted_messages,
+            temperature=temperature,
+            tools=tools,
+            max_tokens=max_tokens,
+            tool_choice=tool_choice,
+            thinking=thinking,
         )
 
-        if enable_streaming:
-            payload["stream"] = True
-            stream_options = {"include_usage": True}
-            if provider.name == "mistral":
-                stream_options["stream_tool_calls"] = True
-            payload["stream_options"] = stream_options
+        stream_options: dict[str, Any] = {"include_usage": True}
+        if provider.name == "mistral":
+            stream_options["stream_tool_calls"] = True
 
-        headers = self.build_headers(api_key)
-        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
-
-        return PreparedRequest(self.endpoint, headers, body)
+        return finalize_chat_request(
+            payload=payload,
+            enable_streaming=enable_streaming,
+            stream_options=stream_options,
+            api_key=api_key,
+            endpoint=self.endpoint,
+        )
 
     def _parse_message(
         self, data: dict[str, Any], field_name: str
@@ -159,6 +160,8 @@ class OpenAIAdapter(APIAdapter):
                 return LLMMessage.model_validate(msg_dict)
             if "delta" in choice:
                 msg_dict = self._reasoning_from_api(choice["delta"], field_name)
+                if msg_dict.get("role") is None:
+                    msg_dict["role"] = Role.assistant
                 return LLMMessage.model_validate(msg_dict)
             raise ValueError("Invalid response data: missing message or delta")
 
@@ -167,6 +170,8 @@ class OpenAIAdapter(APIAdapter):
             return LLMMessage.model_validate(msg_dict)
         if "delta" in data:
             msg_dict = self._reasoning_from_api(data["delta"], field_name)
+            if msg_dict.get("role") is None:
+                msg_dict["role"] = Role.assistant
             return LLMMessage.model_validate(msg_dict)
 
         return None
@@ -179,33 +184,58 @@ class OpenAIAdapter(APIAdapter):
             message = LLMMessage(role=Role.assistant, content="")
 
         usage_data = data.get("usage") or {}
+        prompt_details = usage_data.get("prompt_tokens_details") or {}
         usage = LLMUsage(
             prompt_tokens=usage_data.get("prompt_tokens", 0),
             completion_tokens=usage_data.get("completion_tokens", 0),
+            cached_tokens=prompt_details.get("cached_tokens", 0),
+        )
+        choices = data.get("choices") or []
+        finish_reason = choices[0].get("finish_reason") if choices else None
+        stop = (
+            StopInfo(reason=str(finish_reason)) if finish_reason is not None else None
         )
 
-        return LLMChunk(message=message, usage=usage)
+        return LLMChunk(message=message, usage=usage, stop=stop)
 
 
-_ADAPTERS: dict[str, APIAdapter] = {
-    "openai": OpenAIAdapter(),
-    "anthropic": AnthropicAdapter(),
-    "reasoning": ReasoningAdapter(),
+def _vertex_anthropic_adapter() -> APIAdapter:
+    # Imported on use because the Vertex adapter pulls in google.auth, which is
+    # heavy enough to be noticeable at CLI startup.
+    from vibe.core.llm.backend.vertex import VertexAnthropicAdapter
+
+    return VertexAnthropicAdapter()
+
+
+_ADAPTERS: dict[str, Callable[[], APIAdapter]] = {
+    "openai": OpenAIAdapter,
+    "reasoning": ReasoningAdapter,
+    "anthropic": AnthropicAdapter,
+    "openai-responses": OpenAIResponsesAdapter,
+    "vertex-anthropic": _vertex_anthropic_adapter,
 }
 
 
-def _get_adapter(api_style: str) -> APIAdapter:
-    """Load the adapter for the given API style."""
-    if api_style == "openai-responses":
-        return OpenAIResponsesAdapter()
-    if api_style not in _ADAPTERS:
-        if api_style == "vertex-anthropic":
-            from vibe.core.llm.backend.vertex import VertexAnthropicAdapter
+def _reports_usage(response_data: dict[str, Any]) -> bool:
+    if isinstance(response_data.get("usage"), dict):
+        return True
 
-            _ADAPTERS["vertex-anthropic"] = VertexAnthropicAdapter()
-        else:
-            raise KeyError(api_style)
-    return _ADAPTERS[api_style]
+    message = response_data.get("message")
+    if isinstance(message, dict) and isinstance(message.get("usage"), dict):
+        return True
+
+    response = response_data.get("response")
+    return isinstance(response, dict) and isinstance(response.get("usage"), dict)
+
+
+def _get_adapter(api_style: str) -> APIAdapter:
+    """Build the adapter for the given API style.
+
+    Adapters are built per request: several of them buffer state while parsing a
+    streamed response, and a shared instance would let concurrent sessions observe
+    each other's partial state.
+    """
+    return _ADAPTERS[api_style]()
 
 
 class GenericBackend:
@@ -215,16 +245,24 @@ class GenericBackend:
         client: VibeAsyncHTTPClient | None = None,
         provider: ProviderConfig,
         timeout: float = 720.0,
+        on_retry: RetryObserver | None = None,
+        enable_otel: bool = False,
     ) -> None:
         """Initialize the backend.
 
         Args:
             client: Optional Vibe HTTP client to use. If not provided, one will be created.
+            on_retry: Notified before each retry backoff.
         """
         self._client = client
         self._owns_client = client is None
         self._provider = provider
         self._timeout = timeout
+        self._make_request = async_retry(tries=3, on_retry=on_retry)(self._send_request)
+        self._make_streaming_request = async_generator_retry(
+            tries=3, on_retry=on_retry
+        )(self._send_streaming_request)
+        self._enable_otel = enable_otel
 
     async def __aenter__(self) -> GenericBackend:
         if self._client is None:
@@ -292,33 +330,58 @@ class GenericBackend:
         base = req.base_url or self._provider.api_base
         url = f"{base}{req.endpoint}"
 
-        try:
-            res_data, _ = await self._make_request(url, req.body, headers)
-            return adapter.parse_response(res_data, self._provider)
+        async with self._model_call_span(
+            model=model,
+            api_style=api_style,
+            streaming=False,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            metadata=metadata,
+            url=url,
+        ) as span:
 
-        except httpx.HTTPStatusError as e:
-            raise BackendErrorBuilder.build_http_error(
-                provider=self._provider.name,
-                endpoint=url,
-                error=e,
-                response=e.response,
-                model=model.name,
-                messages=messages,
-                temperature=temperature,
-                has_tools=bool(tools),
-                tool_choice=tool_choice,
-            ) from e
-        except httpx.RequestError as e:
-            raise BackendErrorBuilder.build_request_error(
-                provider=self._provider.name,
-                endpoint=url,
-                error=e,
-                model=model.name,
-                messages=messages,
-                temperature=temperature,
-                has_tools=bool(tools),
-                tool_choice=tool_choice,
-            ) from e
+            def record_response_status(status_code: int) -> None:
+                set_model_call_http_status(span, status_code)
+
+            try:
+                response = await self._make_request(
+                    url, req.body, headers, on_response_status=record_response_status
+                )
+            except httpx.HTTPStatusError as e:
+                set_model_call_http_status(span, e.response.status_code)
+                raise BackendErrorBuilder.build_http_error(
+                    provider=self._provider.name,
+                    endpoint=url,
+                    error=e,
+                    response=e.response,
+                    model=model.name,
+                    messages=messages,
+                    temperature=temperature,
+                    has_tools=bool(tools),
+                    tool_choice=tool_choice,
+                ) from e
+            except httpx.RequestError as e:
+                raise BackendErrorBuilder.build_request_error(
+                    provider=self._provider.name,
+                    endpoint=url,
+                    error=e,
+                    model=model.name,
+                    messages=messages,
+                    temperature=temperature,
+                    has_tools=bool(tools),
+                    tool_choice=tool_choice,
+                ) from e
+
+            set_model_call_http_status(span, response.status_code)
+            set_model_call_response_metadata(span, response.data)
+            chunk = adapter.parse_response(response.data, self._provider)
+            if chunk.usage is not None and _reports_usage(response.data):
+                set_model_call_usage(
+                    span,
+                    prompt_tokens=chunk.usage.prompt_tokens,
+                    completion_tokens=chunk.usage.completion_tokens,
+                )
+            return chunk
 
     async def complete_streaming(
         self,
@@ -357,54 +420,130 @@ class GenericBackend:
         base = req.base_url or self._provider.api_base
         url = f"{base}{req.endpoint}"
 
-        try:
-            async for res_data in self._make_streaming_request(url, req.body, headers):
-                yield adapter.parse_response(res_data, self._provider)
+        async with self._model_call_span(
+            model=model,
+            api_style=api_style,
+            streaming=True,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            metadata=metadata,
+            url=url,
+        ) as span:
+            usage = LLMUsage()
+            has_usage = False
 
-        except httpx.HTTPStatusError as e:
-            raise BackendErrorBuilder.build_http_error(
-                provider=self._provider.name,
-                endpoint=url,
-                error=e,
-                response=e.response,
-                model=model.name,
-                messages=messages,
-                temperature=temperature,
-                has_tools=bool(tools),
-                tool_choice=tool_choice,
-            ) from e
-        except httpx.RequestError as e:
-            raise BackendErrorBuilder.build_request_error(
-                provider=self._provider.name,
-                endpoint=url,
-                error=e,
-                model=model.name,
-                messages=messages,
-                temperature=temperature,
-                has_tools=bool(tools),
-                tool_choice=tool_choice,
-            ) from e
+            def record_response_status(status_code: int) -> None:
+                set_model_call_http_status(span, status_code)
+
+            try:
+                async for stream_chunk in self._make_streaming_request(
+                    url, req.body, headers, on_response_status=record_response_status
+                ):
+                    set_model_call_response_metadata(span, stream_chunk.data)
+                    chunk = adapter.parse_response(stream_chunk.data, self._provider)
+                    if chunk.usage is not None and _reports_usage(stream_chunk.data):
+                        has_usage = True
+                        usage += chunk.usage
+                    yield chunk
+            except OpenAIResponsesStreamError as e:
+                raise BackendErrorBuilder.build_stream_error(
+                    provider=self._provider.name,
+                    endpoint=url,
+                    status=e.status,
+                    error_type=e.error_type,
+                    error_message=e.message,
+                    model=model.name,
+                    messages=messages,
+                    temperature=temperature,
+                    has_tools=bool(tools),
+                    tool_choice=tool_choice,
+                ) from e
+            except httpx.HTTPStatusError as e:
+                set_model_call_http_status(span, e.response.status_code)
+                raise BackendErrorBuilder.build_http_error(
+                    provider=self._provider.name,
+                    endpoint=url,
+                    error=e,
+                    response=e.response,
+                    model=model.name,
+                    messages=messages,
+                    temperature=temperature,
+                    has_tools=bool(tools),
+                    tool_choice=tool_choice,
+                ) from e
+            except httpx.RequestError as e:
+                raise BackendErrorBuilder.build_request_error(
+                    provider=self._provider.name,
+                    endpoint=url,
+                    error=e,
+                    model=model.name,
+                    messages=messages,
+                    temperature=temperature,
+                    has_tools=bool(tools),
+                    tool_choice=tool_choice,
+                ) from e
+            if has_usage:
+                set_model_call_usage(
+                    span,
+                    prompt_tokens=usage.prompt_tokens,
+                    completion_tokens=usage.completion_tokens,
+                )
 
     class HTTPResponse(NamedTuple):
         data: dict[str, Any]
-        headers: dict[str, str]
+        status_code: int
 
-    @async_retry(tries=3)
-    async def _make_request(
-        self, url: str, data: bytes, headers: dict[str, str]
+    class HTTPStreamChunk(NamedTuple):
+        data: dict[str, Any]
+
+    def _model_call_span(
+        self,
+        *,
+        model: ModelConfig,
+        api_style: str,
+        streaming: bool,
+        temperature: float | None,
+        max_tokens: int | None,
+        metadata: dict[str, str] | None,
+        url: str,
+    ) -> AbstractAsyncContextManager[trace.Span | None]:
+        if not self._enable_otel:
+            return nullcontext(None)
+
+        return model_call_span(
+            provider_name=self._provider.name,
+            provider_api_style=api_style,
+            model=model.name,
+            streaming=streaming,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            metadata=metadata,
+            http_url=url,
+        )
+
+    async def _send_request(
+        self,
+        url: str,
+        data: bytes,
+        headers: dict[str, str],
+        on_response_status: Callable[[int], None] | None = None,
     ) -> HTTPResponse:
         client = self._get_client()
         response = await client.post(url, content=data, headers=headers)
         response.raise_for_status()
+        if on_response_status is not None:
+            on_response_status(response.status_code)
 
-        response_headers = dict(response.headers.items())
         response_body = response.json()
-        return self.HTTPResponse(response_body, response_headers)
+        return self.HTTPResponse(response_body, response.status_code)
 
-    @async_generator_retry(tries=3)
-    async def _make_streaming_request(
-        self, url: str, data: bytes, headers: dict[str, str]
-    ) -> AsyncGenerator[dict[str, Any]]:
+    async def _send_streaming_request(
+        self,
+        url: str,
+        data: bytes,
+        headers: dict[str, str],
+        on_response_status: Callable[[int], None] | None = None,
+    ) -> AsyncGenerator[HTTPStreamChunk]:
         client = self._get_client()
         async with client.stream(
             method="POST", url=url, content=data, headers=headers
@@ -412,15 +551,20 @@ class GenericBackend:
             if not response.is_success:
                 await response.aread()
             response.raise_for_status()
+            if on_response_status is not None:
+                on_response_status(response.status_code)
             async for line in iter_sse_lines(response):
                 if line.strip() == "":
+                    continue
+
+                if line.startswith(":"):
                     continue
 
                 DELIM_CHAR = ":"
                 if f"{DELIM_CHAR} " not in line:
                     raise ValueError(
                         f"Stream chunk improperly formatted. "
-                        f"Expected `key{DELIM_CHAR} value`, received `{line}`"
+                        f"Expected `key{DELIM_CHAR} value`."
                     )
                 delim_index = line.find(DELIM_CHAR)
                 key = line[0:delim_index]
@@ -429,9 +573,13 @@ class GenericBackend:
                 if key != "data":
                     # This might be the case with openrouter, so we just ignore it
                     continue
-                if value == "[DONE]":
+                if value.strip() == "[DONE]":
                     return
-                yield json.loads(value.strip())
+                try:
+                    chunk_data = json.loads(value.strip())
+                except json.JSONDecodeError:
+                    raise ValueError("Stream chunk contains malformed JSON.") from None
+                yield self.HTTPStreamChunk(data=chunk_data)
 
     async def close(self) -> None:
         if self._owns_client and self._client:

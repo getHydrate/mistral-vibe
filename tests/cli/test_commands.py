@@ -11,6 +11,7 @@ class TestCommandRegistry:
         assert registry.get_command_name("/model") == "model"
         assert registry.get_command_name("/connectors") == "mcp"
         assert registry.get_command_name("/clear") == "clear"
+        assert registry.get_command_name("/new") == "clear"
         assert registry.get_command_name("/exit") == "exit"
         assert registry.get_command_name("/data-retention") == "data-retention"
 
@@ -38,6 +39,35 @@ class TestCommandRegistry:
     def test_parse_command_returns_none_when_no_match(self) -> None:
         registry = CommandRegistry()
         assert registry.parse_command("/nonexistent") is None
+
+    def test_new_alias_clears_conversation_history(self) -> None:
+        registry = CommandRegistry()
+
+        result = registry.parse_command("/new")
+
+        assert result == ("clear", registry.commands["clear"], "")
+        assert registry.commands["clear"].handler == "_clear_history"
+
+    def test_clear_command_accepts_optional_prompt(self) -> None:
+        registry = CommandRegistry()
+
+        result = registry.parse_command("/clear fix the bug")
+
+        assert result is not None
+        cmd_name, cmd, cmd_args = result
+        assert cmd_name == "clear"
+        assert cmd.handler == "_clear_history"
+        assert cmd_args == "fix the bug"
+
+    def test_new_alias_accepts_optional_prompt(self) -> None:
+        registry = CommandRegistry()
+
+        result = registry.parse_command("/new hello")
+
+        assert result is not None
+        cmd_name, _, cmd_args = result
+        assert cmd_name == "clear"
+        assert cmd_args == "hello"
 
     def test_parse_command_uses_get_command_name(self) -> None:
         """parse_command and get_command_name stay in sync for same input."""
@@ -69,18 +99,11 @@ class TestCommandRegistry:
         assert registry.get_command_name("/teleport") == "teleport"
         assert registry.has_command("teleport")
 
-    def test_teleport_command_registration_ignores_project_picker_flag(self) -> None:
-        registry = CommandRegistry(
-            vibe_code_enabled=True, experimental_vibe_code_project_picker_enabled=False
-        )
+    def test_teleport_command_registration_uses_latest_context(self) -> None:
+        registry = CommandRegistry(vibe_code_enabled=True)
         assert registry.get_command_name("/teleport") == "teleport"
 
-        registry.refresh(
-            CommandContext(
-                vibe_code_enabled=False,
-                experimental_vibe_code_project_picker_enabled=True,
-            )
-        )
+        registry.refresh(CommandContext(vibe_code_enabled=False))
         assert registry.get_command_name("/teleport") is None
 
     def test_teleport_help_text_uses_resolved_context(self) -> None:
@@ -91,18 +114,8 @@ class TestCommandRegistry:
         assert eligible_registry.get("teleport") is not None
         assert "/teleport" in eligible_registry.get_help_text()
 
-    def test_vibe_code_project_command_not_registered_without_picker_flag(self) -> None:
-        registry = CommandRegistry(
-            vibe_code_enabled=True, experimental_vibe_code_project_picker_enabled=False
-        )
-
-        assert registry.get_command_name("/remote-project") is None
-        assert registry.parse_command("/remote-project") is None
-
-    def test_vibe_code_project_command_registered_with_picker_flag(self) -> None:
-        registry = CommandRegistry(
-            vibe_code_enabled=True, experimental_vibe_code_project_picker_enabled=True
-        )
+    def test_vibe_code_project_command_registered_when_vibe_code_enabled(self) -> None:
+        registry = CommandRegistry(vibe_code_enabled=True)
 
         assert registry.get_command_name("/remote-project") == "remote-project"
         result = registry.parse_command("/remote-project")

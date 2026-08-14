@@ -2,9 +2,8 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator
 import logging
+from pathlib import Path
 
-from vibe.core.hooks._after_tool import AfterToolHandler
-from vibe.core.hooks._before_tool import BeforeToolHandler
 from vibe.core.hooks._handler import (
     HookExternalAttrs,
     HookHandler,
@@ -17,9 +16,11 @@ from vibe.core.hooks._handler import (
 )
 from vibe.core.hooks._notification import NotificationHandler
 from vibe.core.hooks._permission_request import PermissionRequestHandler
-from vibe.core.hooks._post_agent_turn import PostAgentTurnHandler
+from vibe.core.hooks._post_agent import PostAgentHandler
 from vibe.core.hooks._post_compact import PostCompactHandler
+from vibe.core.hooks._post_tool import PostToolHandler
 from vibe.core.hooks._pre_compact import PreCompactHandler
+from vibe.core.hooks._pre_tool import PreToolHandler
 from vibe.core.hooks._session_end import SessionEndHandler
 from vibe.core.hooks._session_start import SessionStartHandler
 from vibe.core.hooks._stop_failure import StopFailureHandler
@@ -45,9 +46,9 @@ logger = logging.getLogger(__name__)
 
 
 _HANDLERS: dict[HookType, HookHandler] = {
-    HookType.POST_AGENT_TURN: PostAgentTurnHandler(),
-    HookType.BEFORE_TOOL: BeforeToolHandler(),
-    HookType.AFTER_TOOL: AfterToolHandler(),
+    HookType.POST_AGENT: PostAgentHandler(),
+    HookType.PRE_TOOL: PreToolHandler(),
+    HookType.POST_TOOL: PostToolHandler(),
     HookType.USER_PROMPT_SUBMIT: UserPromptSubmitHandler(),
     HookType.SESSION_START: SessionStartHandler(),
     HookType.SESSION_END: SessionEndHandler(),
@@ -69,11 +70,11 @@ class HooksManager:
     ``action.next_invocation``.
     """
 
-    def __init__(self, hooks: list[HookConfig]) -> None:
+    def __init__(self, hooks: list[HookConfig], *, cwd: Path | None = None) -> None:
         self._hooks_by_type: dict[HookType, list[HookConfig]] = {}
         for hook in hooks:
             self._hooks_by_type.setdefault(hook.type, []).append(hook)
-        self._executor = HookExecutor()
+        self._executor = HookExecutor(cwd=cwd)
         self._retry_state = HookRetryState()
 
     def has_hooks(self, hook_type: HookType) -> bool:

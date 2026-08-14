@@ -278,13 +278,11 @@ async def test_status_line_payload_provider_reflects_session() -> None:
     async with app.run_test():
         payload = app._build_status_line_payload()
 
-        assert payload["session_id"] == app.agent_loop.session_id
+        runtime = app.app_server.resources.runtime
+        assert payload["session_id"] == app.app_server.session_id
         assert payload["cwd"] == str(Path.cwd().resolve())
         assert payload["model"]["id"] == config.get_active_model().name
-        assert (
-            payload["context_window"]["size"]
-            == config.get_active_model().auto_compact_threshold
-        )
+        assert payload["context_window"]["size"] == runtime.context_window
         assert payload["context_window"]["current_usage"] == {
-            "input_tokens": app.agent_loop.stats.context_tokens
+            "input_tokens": runtime.stats.context_tokens
         }

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Iterable
-from typing import cast
+from typing import Any, cast
 
 from tests.mock.utils import mock_llm_chunk
+from vibe.core.llm.exceptions import BackendError, PayloadSummary
 from vibe.core.types import LLMChunk, LLMMessage, Role
+from vibe.core.utils import RetryObserver, RetryReason
 
 
 class FakeBackend:
@@ -22,6 +24,7 @@ class FakeBackend:
         | None = None,
         *,
         exception_to_raise: Exception | None = None,
+        retries_before_response: int = 0,
     ) -> None:
         """Fake backend that will output the given chunks in the order they are given.
 
@@ -36,7 +39,11 @@ class FakeBackend:
         self._requests_extra_headers: list[dict[str, str] | None] = []
         self._requests_metadata: list[dict[str, str] | None] = []
         self._requests_max_tokens: list[int | None] = []
+        self._requests_tools: list[Any] = []
+        self._requests_tool_choices: list[Any] = []
         self._exception_to_raise = exception_to_raise
+        self._retries_before_response = retries_before_response
+        self.on_retry: RetryObserver | None = None
 
         self._streams: list[list[LLMChunk]]
         if chunks is None:
@@ -72,11 +79,26 @@ class FakeBackend:
     def requests_max_tokens(self) -> list[int | None]:
         return self._requests_max_tokens
 
+    @property
+    def requests_tools(self) -> list[Any]:
+        return self._requests_tools
+
+    @property
+    def requests_tool_choices(self) -> list[Any]:
+        return self._requests_tool_choices
+
     async def __aenter__(self):
         return self
 
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         return None
+
+    async def notice_retries(self) -> None:
+        """Report `retries_before_response` retries, as a real backend would."""
+        if self.on_retry is None:
+            return
+        for _ in range(self._retries_before_response):
+            await self.on_retry(RetryReason.from_http_status(429))
 
     async def complete(
         self,
@@ -93,10 +115,14 @@ class FakeBackend:
         if self._exception_to_raise:
             raise self._exception_to_raise
 
+        await self.notice_retries()
+
         self._requests_messages.append(list(messages))
         self._requests_extra_headers.append(extra_headers)
         self._requests_metadata.append(metadata)
         self._requests_max_tokens.append(max_tokens)
+        self._requests_tools.append(tools)
+        self._requests_tool_choices.append(tool_choice)
 
         if self._streams:
             stream = self._streams.pop(0)
@@ -122,10 +148,14 @@ class FakeBackend:
         if self._exception_to_raise:
             raise self._exception_to_raise
 
+        await self.notice_retries()
+
         self._requests_messages.append(list(messages))
         self._requests_extra_headers.append(extra_headers)
         self._requests_metadata.append(metadata)
         self._requests_max_tokens.append(max_tokens)
+        self._requests_tools.append(tools)
+        self._requests_tool_choices.append(tool_choice)
 
         if self._streams:
             stream = list(self._streams.pop(0))
@@ -133,3 +163,33 @@ class FakeBackend:
             stream = [mock_llm_chunk(content="")]
         for chunk in stream:
             yield chunk
+
+
+class FakeInterruptedStreamingBackend(FakeBackend):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.streaming_attempts = 0
+
+    async def complete_streaming(self, **kwargs: Any) -> AsyncGenerator[LLMChunk]:
+        self.streaming_attempts += 1
+        async for chunk in super().complete_streaming(**kwargs):
+            yield chunk
+            if self.streaming_attempts == 1:
+                raise BackendError(
+                    provider="test",
+                    endpoint="https://example.test/chat",
+                    status=None,
+                    reason="network boom",
+                    headers=None,
+                    body_text=None,
+                    parsed_error="Network error",
+                    model="test",
+                    payload_summary=PayloadSummary(
+                        model="test",
+                        message_count=0,
+                        approx_chars=0,
+                        temperature=0,
+                        has_tools=False,
+                        tool_choice=None,
+                    ),
+                )

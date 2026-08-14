@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Callable, Generator
+from collections.abc import Awaitable, Callable, Generator
 import os
 from pathlib import Path
 import sys
@@ -12,35 +12,42 @@ import keyring.errors
 import pytest
 import tomli_w
 
-from tests.cli.plan_offer.adapters.fake_whoami_gateway import FakeWhoAmIGateway
+from tests.stubs.app_server import create_test_app_server_session
+from tests.stubs.fake_account_gateway import FakeAccountGateway
 from tests.stubs.fake_backend import FakeBackend
+from tests.stubs.fake_config_orchestrator import FakeConfigOrchestrator
+from tests.stubs.fake_identity_gateway import FakeIdentityGateway
 from tests.stubs.fake_mcp_registry import FakeMCPRegistry
 from tests.stubs.fake_voice_manager import FakeVoiceManager
 from tests.update_notifier.adapters.fake_update_cache_repository import (
     FakeUpdateCacheRepository,
 )
 from tests.update_notifier.adapters.fake_update_gateway import FakeUpdateGateway
-from vibe.cli.plan_offer.ports.whoami_gateway import WhoAmIPlanType, WhoAmIResponse
+from vibe.app_server._account import WhoAmIResult
+from vibe.app_server._identity import IdentityResult
+from vibe.app_server.models import AccountPlanKind
 from vibe.cli.textual_ui.app import CORE_VERSION, StartupOptions, VibeApp
+from vibe.cli.theme import resolve_auto_theme
 from vibe.core.agent_loop import AgentLoop
 from vibe.core.agents.models import BuiltinAgentName
 from vibe.core.config import (
     DEFAULT_MODELS,
-    AnyVibeConfig,
     ModelConfig,
     SessionLoggingConfig,
-    VibeConfig,
+    VibeConfigSchema,
+    VibeConfigSchemaType,
+    build_default_orchestrator,
 )
-from vibe.core.config.default_orchestrator import build_default_orchestrator
 from vibe.core.config.harness_files import (
     HarnessFilesManager,
     init_harness_files_manager,
     reset_harness_files_manager,
 )
-from vibe.core.config.vibe_schema import VibeConfigSchema
+from vibe.core.config.orchestrator import ConfigOrchestrator
 from vibe.core.llm.types import BackendLike
-from vibe.core.utils import keyring as keyring_utils
 from vibe.core.utils.concurrency import run_sync
+from vibe.utils import keyring as keyring_utils
+from vibe.utils.platform import resolve_windows_shell
 
 
 class _EmptyKeyring(KeyringBackend):
@@ -56,6 +63,13 @@ class _EmptyKeyring(KeyringBackend):
 
     def delete_password(self, service: str, username: str) -> None:
         raise keyring.errors.PasswordDeleteError()
+
+
+@pytest.fixture(autouse=True)
+def _reset_windows_shell_cache() -> None:
+    # resolve_windows_shell is cached for the process; tests vary sys.platform,
+    # env, and shutil.which between cases, so clear it before each test.
+    resolve_windows_shell.cache_clear()
 
 
 @pytest.fixture(autouse=True)
@@ -82,7 +96,7 @@ def _isolate_git_config(monkeypatch: pytest.MonkeyPatch) -> None:
 def _disable_os_keyring(monkeypatch: pytest.MonkeyPatch) -> Generator[None, None, None]:
     """Keep the suite off the real OS keyring.
 
-    ``resolve_api_key`` and ``VibeConfig._check_api_key`` now consult the keyring, so
+    ``resolve_api_key`` and ``VibeConfigSchema`` API-key validation now consult the keyring, so
     without this every config construction would touch the real Keychain. We install an
     empty backend (rather than patching ``keyring.get_password``) so tests that swap in
     their own backend via ``keyring.set_keyring`` still work. Tests that exercise keyring
@@ -142,7 +156,7 @@ def config_dir(
     config_file = config_dir / "config.toml"
     config_file.write_text(tomli_w.dumps(get_base_config()), encoding="utf-8")
 
-    monkeypatch.setattr("vibe.core.paths._vibe_home._DEFAULT_VIBE_HOME", config_dir)
+    monkeypatch.setattr("vibe.utils.paths._DEFAULT_VIBE_HOME", config_dir)
     agents_dir = tmp_path / ".agents"
     agents_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr("vibe.core.paths._agents_home._DEFAULT_AGENTS_HOME", agents_dir)
@@ -184,10 +198,6 @@ def _init_harness_files_manager():
 def _scratchpad_dir(
     monkeypatch: pytest.MonkeyPatch, tmp_path_factory: pytest.TempPathFactory
 ) -> Generator[Path]:
-    import vibe.core.scratchpad as scratchpad_mod
-
-    scratchpad_mod._active_scratchpads.clear()
-
     scratchpad_root = tmp_path_factory.mktemp("scratchpad")
     _counter = 0
 
@@ -201,8 +211,6 @@ def _scratchpad_dir(
     monkeypatch.setattr("vibe.core.scratchpad.tempfile.mkdtemp", _fake_mkdtemp)
 
     yield scratchpad_root
-
-    scratchpad_mod._active_scratchpads.clear()
 
 
 @pytest.fixture(autouse=True)
@@ -223,6 +231,11 @@ def _mock_platform(monkeypatch: pytest.MonkeyPatch) -> None:
     """
     monkeypatch.setattr(sys, "platform", "linux")
     monkeypatch.setenv("SHELL", "/bin/sh")
+    resolve_auto_theme.cache_clear()
+    monkeypatch.setattr("vibe.cli._theme_detection.detect_terminal_dark", lambda: None)
+    monkeypatch.setattr(
+        "vibe.cli._theme_detection.detect_system_preferred_dark", lambda: None
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -307,8 +320,37 @@ def agent_loop() -> AgentLoop:
 
 
 @pytest.fixture
-def vibe_config() -> VibeConfig:
+def vibe_config() -> VibeConfigSchema:
     return build_test_vibe_config()
+
+
+@pytest.fixture(params=[VibeConfigSchema], ids=["vibe_config_schema"])
+def config_cls(request: pytest.FixtureRequest) -> VibeConfigSchemaType:
+    return request.param
+
+
+@pytest.fixture
+def make_config(config_cls: VibeConfigSchemaType) -> Callable[..., VibeConfigSchema]:
+    def _make(**kwargs: Any) -> VibeConfigSchema:
+        return build_test_vibe_config(config_cls=config_cls, **kwargs)
+
+    return _make
+
+
+@pytest.fixture
+def make_orchestrator() -> Callable[
+    [], Awaitable[ConfigOrchestrator[VibeConfigSchema]]
+]:
+    """Build the default config orchestrator lazily.
+
+    The factory is async because the orchestrator builds its layer stack lazily;
+    call it after seeding the on-disk config.
+    """
+
+    async def _make() -> ConfigOrchestrator[VibeConfigSchema]:
+        return await build_default_orchestrator()
+
+    return _make
 
 
 def make_test_models(auto_compact_threshold: int) -> list[ModelConfig]:
@@ -316,6 +358,27 @@ def make_test_models(auto_compact_threshold: int) -> list[ModelConfig]:
         m.model_copy(update={"auto_compact_threshold": auto_compact_threshold})
         for m in DEFAULT_MODELS
     ]
+
+
+def set_agent_config(agent: AgentLoop, config: VibeConfigSchema) -> None:
+    orchestrator = agent.config_orchestrator
+    match orchestrator:
+        case ConfigOrchestrator() | FakeConfigOrchestrator():
+            orchestrator._config = config
+        case _:
+            raise TypeError(f"unexpected orchestrator {orchestrator!r}")
+
+
+def stub_config_reload(
+    monkeypatch: pytest.MonkeyPatch, config: VibeConfigSchema
+) -> None:
+    """Make orchestrator reloads resolve to ``config`` instead of reading disk."""
+
+    async def _reload(self: Any) -> None:
+        self._config = config
+
+    monkeypatch.setattr(ConfigOrchestrator, "reload", _reload)
+    monkeypatch.setattr(FakeConfigOrchestrator, "reload", _reload)
 
 
 def _prepare_test_config_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
@@ -329,11 +392,17 @@ def _prepare_test_config_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     kwargs["enable_update_checks"] = (
         False if enable_update_checks is None else enable_update_checks
     )
-    if kwargs.get("models"):
-        kwargs.setdefault("active_model", kwargs["models"][0].alias)
+    if models := kwargs.get("models"):
+        if isinstance(models, dict):
+            kwargs.setdefault("active_model", next(iter(models)))
+        else:
+            kwargs.setdefault("active_model", models[0].alias)
     # Connectors trigger a real HTTP discovery on agent construction; off by
     # default so tests don't pay for it. Connector tests pass enable_connectors=True.
     kwargs.setdefault("enable_connectors", False)
+    # Telemetry gates the remote experiment fetch (experiments.mistral.services);
+    # off by default so a leaked MISTRAL_API_KEY never triggers an unmocked call.
+    kwargs.setdefault("enable_telemetry", False)
     # Use the lightweight test system prompt unless a test asks for a real one.
     kwargs.setdefault("system_prompt_id", "tests")
     # Keep the test prompt minimal: skip project-context discovery and prompt
@@ -343,68 +412,71 @@ def _prepare_test_config_kwargs(kwargs: dict[str, Any]) -> dict[str, Any]:
     return kwargs
 
 
-def build_test_vibe_config(**kwargs) -> VibeConfig:
-    return VibeConfig(**_prepare_test_config_kwargs(kwargs))
+def build_test_vibe_config(
+    config_cls: VibeConfigSchemaType = VibeConfigSchema, **kwargs
+) -> VibeConfigSchema:
+    return config_cls(**_prepare_test_config_kwargs(kwargs))
 
 
 def build_test_vibe_config_schema(**kwargs) -> VibeConfigSchema:
     return VibeConfigSchema(**_prepare_test_config_kwargs(kwargs))
 
 
-type ConfigBuilder = Callable[..., AnyVibeConfig]
+type ConfigBuilder = Callable[..., VibeConfigSchema]
 
 
-@pytest.fixture(
-    params=[build_test_vibe_config, build_test_vibe_config_schema],
-    ids=["vibe_config", "vibe_config_schema"],
-)
+@pytest.fixture(params=[build_test_vibe_config_schema], ids=["vibe_config_schema"])
 def build_config(request: pytest.FixtureRequest) -> ConfigBuilder:
-    """Parametrized builder that yields both the legacy VibeConfig and the schema.
-
-    Use in tests exercising the shared API surface so each assertion runs against
-    both config types.
-    """
     return request.param
 
 
-type ConfigLoader = Callable[[], AnyVibeConfig]
-
-
-def _load_vibe_config() -> VibeConfig:
-    return VibeConfig.load()
+type ConfigLoader = Callable[[], VibeConfigSchema]
 
 
 def _load_vibe_config_schema() -> VibeConfigSchema:
     return run_sync(build_default_orchestrator()).config
 
 
-@pytest.fixture(
-    params=[_load_vibe_config, _load_vibe_config_schema],
-    ids=["vibe_config", "vibe_config_schema"],
-)
+@pytest.fixture(params=[_load_vibe_config_schema], ids=["vibe_config_schema"])
 def load_config(request: pytest.FixtureRequest) -> ConfigLoader:
-    """Parametrized loader that reads the persisted config for both types.
-
-    ``VibeConfig`` reads TOML via ``load``; the schema is built through the
-    standard orchestrator layer stack. Use when a test wants the config to
-    reflect on-disk state rather than in-memory construction.
-    """
+    """Loader that reads the persisted config through the orchestrator layer stack."""
     return request.param
+
+
+type OrchestratorLoader[C: VibeConfigSchema] = Callable[[C], ConfigOrchestrator[C]]
+
+
+async def _load_orchestrator(
+    config: VibeConfigSchema,
+) -> ConfigOrchestrator[VibeConfigSchema]:
+    return FakeConfigOrchestrator(config)
+
+
+@pytest.fixture
+def load_orchestrator() -> OrchestratorLoader[VibeConfigSchema]:
+    """Wraps a config into the default orchestrator by injecting its set fields
+    into the highest-priority OverridesLayer, exposed via ConfigOrchestrator.
+    """
+
+    def load(config: VibeConfigSchema) -> ConfigOrchestrator[VibeConfigSchema]:
+        return run_sync(_load_orchestrator(config))
+
+    return load
 
 
 def build_test_agent_loop(
     *,
-    config: VibeConfig | None = None,
-    agent_name: str = BuiltinAgentName.DEFAULT,
+    config: VibeConfigSchema | None = None,
+    agent_name: str = BuiltinAgentName.ASK,
     backend: BackendLike | None = None,
     enable_streaming: bool = False,
     **kwargs,
 ) -> AgentLoop:
 
     resolved_config = config or build_test_vibe_config()
-
+    orchestrator = run_sync(_load_orchestrator(resolved_config))
     return AgentLoop(
-        config=resolved_config,
+        config_orchestrator=orchestrator,
         agent_name=agent_name,
         backend=backend or FakeBackend(),
         enable_streaming=enable_streaming,
@@ -414,7 +486,10 @@ def build_test_agent_loop(
 
 
 def build_test_vibe_app(
-    *, config: VibeConfig | None = None, agent_loop: AgentLoop | None = None, **kwargs
+    *,
+    config: VibeConfigSchema | None = None,
+    agent_loop: AgentLoop | None = None,
+    **kwargs,
 ) -> VibeApp:
     app_config = config or build_test_vibe_config()
 
@@ -430,31 +505,45 @@ def build_test_vibe_app(
         if update_cache_repository is None
         else update_cache_repository
     )
-    plan_offer_gateway = kwargs.pop("plan_offer_gateway", None)
-    resolved_plan_offer_gateway = (
-        FakeWhoAmIGateway(
-            WhoAmIResponse(
-                plan_type=WhoAmIPlanType.CHAT,
-                plan_name="INDIVIDUAL",
-                prompt_switching_to_pro_plan=False,
-            )
+    account_gateway = kwargs.pop("account_gateway", None)
+    resolved_account_gateway = account_gateway or FakeAccountGateway(
+        WhoAmIResult(
+            plan_type=AccountPlanKind.CHAT,
+            plan_name="INDIVIDUAL",
+            prompt_switching_to_pro_plan=False,
         )
-        if plan_offer_gateway is None
-        else plan_offer_gateway
+    )
+    identity_gateway = kwargs.pop("identity_gateway", None)
+    resolved_identity_gateway = identity_gateway or FakeIdentityGateway(
+        IdentityResult(id="user-1", email="user@example.com", first_name="Ada")
     )
     current_version = kwargs.pop("current_version", None)
     resolved_current_version = (
         CORE_VERSION if current_version is None else current_version
     )
     voice_manager = kwargs.pop("voice_manager", FakeVoiceManager())
+    app_server = kwargs.pop("app_server", None)
+    app_server_source = (
+        app_server
+        if app_server is not None
+        else lambda: create_test_app_server_session(
+            resolved_agent_loop,
+            account_gateway=resolved_account_gateway,
+            identity_gateway=resolved_identity_gateway,
+        )
+    )
+    history_file = kwargs.pop("history_file", Path(".vibehistory"))
+    startup = kwargs.pop("startup", None) or StartupOptions(
+        initial_prompt=kwargs.pop("initial_prompt", None)
+    )
 
     return VibeApp(
-        agent_loop=resolved_agent_loop,
-        startup=StartupOptions(initial_prompt=kwargs.pop("initial_prompt", None)),
+        app_server=app_server_source,
+        history_file=history_file,
+        startup=startup,
         current_version=resolved_current_version,
         update_notifier=resolved_update_notifier,
         update_cache_repository=resolved_update_cache_repository,
-        plan_offer_gateway=resolved_plan_offer_gateway,
         voice_manager=voice_manager,
         **kwargs,
     )

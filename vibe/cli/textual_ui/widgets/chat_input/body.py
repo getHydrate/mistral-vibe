@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from functools import partial
 from pathlib import Path
 from typing import Any, ClassVar
@@ -13,8 +12,9 @@ from textual.widgets import Static
 
 from vibe.cli.commands import CommandRegistry
 from vibe.cli.history_manager import HistoryManager
+from vibe.cli.input_modes import InputMode
 from vibe.cli.textual_ui.recording.recording_indicator import RecordingIndicator
-from vibe.cli.textual_ui.widgets.chat_input.text_area import ChatTextArea, InputMode
+from vibe.cli.textual_ui.widgets.chat_input.text_area import ChatTextArea
 from vibe.cli.textual_ui.widgets.no_markup_static import NoMarkupStatic
 from vibe.cli.textual_ui.widgets.spinner import SpinnerMixin, SpinnerType
 from vibe.cli.voice_manager.voice_manager_port import (
@@ -22,7 +22,7 @@ from vibe.cli.voice_manager.voice_manager_port import (
     VoiceManagerListener,
     VoiceManagerPort,
 )
-from vibe.core.logger import logger
+from vibe.observability.logging import logger
 
 
 class _PromptSpinner(SpinnerMixin, Static):
@@ -44,6 +44,15 @@ class ChatInputBody(VoiceManagerListener, Widget):
             self.value = value
             super().__init__()
 
+    class CompletionResetRequested(Message):
+        pass
+
+    class InlineNoticeRequested(Message):
+        def __init__(self, message: str, *, timeout: float = 4.0) -> None:
+            self.message = message
+            self.timeout = timeout
+            super().__init__()
+
     def __init__(
         self,
         command_registry: CommandRegistry,
@@ -63,8 +72,6 @@ class ChatInputBody(VoiceManagerListener, Widget):
             self.history = HistoryManager(history_file)
         else:
             self.history = None
-
-        self._completion_reset: Callable[[], None] | None = None
 
     def compose(self) -> ComposeResult:
         with Horizontal():
@@ -235,14 +242,8 @@ class ChatInputBody(VoiceManagerListener, Widget):
         if self.input_widget:
             self.input_widget.focus()
 
-    def set_completion_reset_callback(
-        self, callback: Callable[[], None] | None
-    ) -> None:
-        self._completion_reset = callback
-
     def _notify_completion_reset(self) -> None:
-        if self._completion_reset:
-            self._completion_reset()
+        self.post_message(self.CompletionResetRequested())
 
     def replace_input(self, text: str, cursor_offset: int | None = None) -> None:
         if not self.input_widget:
@@ -265,6 +266,15 @@ class ChatInputBody(VoiceManagerListener, Widget):
         if not self.input_widget:
             return
         self.input_widget.insert(text)
+
+    def on_transcribe_error(self, message: str) -> None:
+        self._reset_recording_ui()
+        self.notify(
+            f"Voice transcription failed: {message}", severity="error", markup=False
+        )
+
+    def on_transcribe_notice(self, message: str) -> None:
+        self.post_message(self.InlineNoticeRequested(message, timeout=2.0))
 
     def _start_recording_ui(self) -> None:
         if not self._voice_manager:

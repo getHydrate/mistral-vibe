@@ -3,20 +3,31 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 import platform
-import sys
 
 from vibe.cli.constants import CLIPBOARD_IMAGE_PASTE_SUPPORTED_SYSTEM
-
-ALT_KEY = "⌥" if sys.platform == "darwin" else "Alt"
+from vibe.utils import VIBE_WARNING_TAG
 
 
 @dataclass(frozen=True)
 class CommandContext:
     vibe_code_enabled: bool = False
-    experimental_vibe_code_project_picker_enabled: bool = False
 
 
 CommandAvailability = Callable[[CommandContext], bool]
+
+
+def build_retry_prompt(additional_instructions: str) -> str:
+    message = (
+        "The previous model stream ended before reaching its end. Continue the "
+        "response exactly where it stopped without repeating text already produced. "
+        "If no response text was produced, answer the pending user request normally."
+    )
+    if instructions := additional_instructions.strip():
+        message += (
+            "\n\nFollow these additional instructions from the user while "
+            f"continuing:\n{instructions}"
+        )
+    return f"<{VIBE_WARNING_TAG}>{message}</{VIBE_WARNING_TAG}>"
 
 
 @dataclass
@@ -33,17 +44,12 @@ class CommandRegistry:
         self,
         excluded_commands: list[str] | None = None,
         vibe_code_enabled: bool = False,
-        experimental_vibe_code_project_picker_enabled: bool = False,
     ) -> None:
         if excluded_commands is None:
             excluded_commands = []
         self._disabled_commands = set(excluded_commands)
         self._commands: dict[str, Command] = {}
-        self.refresh(
-            CommandContext(
-                vibe_code_enabled, experimental_vibe_code_project_picker_enabled
-            )
-        )
+        self.refresh(CommandContext(vibe_code_enabled))
 
     def _build_commands(self) -> dict[str, Command]:
         return {
@@ -73,8 +79,10 @@ class CommandRegistry:
                 handler="_reload_config",
             ),
             "clear": Command(
-                aliases=frozenset(["/clear"]),
-                description="Clear conversation history",
+                aliases=frozenset(["/clear", "/new"]),
+                description=(
+                    "Start a new conversation. Optionally pass a prompt to seed it."
+                ),
                 handler="_clear_history",
             ),
             "copy": Command(
@@ -116,6 +124,11 @@ class CommandRegistry:
                 description="Display agent statistics",
                 handler="_show_status",
             ),
+            "whoami": Command(
+                aliases=frozenset(["/whoami"]),
+                description="Display the Mistral signed-in user, workspace, and plan",
+                handler="_show_whoami",
+            ),
             "teleport": Command(
                 aliases=frozenset(["/teleport"]),
                 description="Teleport session to Vibe Code Web",
@@ -124,12 +137,9 @@ class CommandRegistry:
             ),
             "remote-project": Command(
                 aliases=frozenset(["/remote-project"]),
-                description="Preview the Vibe Code Web project picker",
+                description="Select the Vibe Code Web project for this repository",
                 handler="_vibe_code_project_command",
-                is_available=lambda ctx: (
-                    ctx.vibe_code_enabled
-                    and ctx.experimental_vibe_code_project_picker_enabled
-                ),
+                is_available=lambda ctx: ctx.vibe_code_enabled,
             ),
             "proxy-setup": Command(
                 aliases=frozenset(["/proxy-setup"]),
@@ -173,8 +183,16 @@ class CommandRegistry:
             ),
             "rewind": Command(
                 aliases=frozenset(["/rewind"]),
-                description="Rewind to a previous message",
+                description="Rewind to a previous message (or press Esc twice)",
                 handler="_start_rewind_mode",
+            ),
+            "retry": Command(
+                aliases=frozenset(["/retry"]),
+                description=(
+                    "Continue an interrupted model response; optionally pass "
+                    "additional instructions"
+                ),
+                handler="_retry",
             ),
             "loop": Command(
                 aliases=frozenset(["/loop"]),
@@ -259,8 +277,8 @@ class CommandRegistry:
             "- `Ctrl+C` Quit (or clear input if text present)",
             "- `Ctrl+G` Edit input in external editor",
             "- `Ctrl+O` Toggle tool output view",
-            "- `Shift+Tab` Cycle through agents (default, plan, ...)",
-            f"- `{ALT_KEY}+↑↓` / `Ctrl+P/N` Rewind to previous/next message",
+            "- `Shift+Tab` Cycle through agents (ask, plan, ...)",
+            "- `Esc Esc` Rewind to a previous message (when input is empty)",
             "",
             "### Special Features",
             "",

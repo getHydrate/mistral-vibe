@@ -1,6 +1,6 @@
 """Hook orchestration mixin for AgentLoop.
 
-Provides before_tool, after_tool, and post_agent_turn hook lifecycle
+Provides pre_tool, post_tool, and post_agent hook lifecycle
 methods. Extracted from the AgentLoop implementation module to keep it
 focused on the core conversation loop and tool execution flow.
 
@@ -15,7 +15,7 @@ Attributes:
     messages         (MessageList)
 
 Methods:
-    _handle_tool_response(tool_call, text, status, decision, result, span)
+    _handle_tool_response(tool_call, text, status, decision, result, persisted_result, span)
     _serialize_tool_input(tool_call) -> dict[str, Any]
 """
 
@@ -24,6 +24,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 import contextlib
+from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, NamedTuple
@@ -31,8 +32,6 @@ from typing import TYPE_CHECKING, Any, Literal, NamedTuple
 from pydantic import ValidationError
 
 from vibe.core.hooks.models import (
-    AfterToolInvocation,
-    BeforeToolInvocation,
     HookContextInjection,
     HookEvent,
     HookPermissionDecision,
@@ -44,9 +43,11 @@ from vibe.core.hooks.models import (
     HookUserMessage,
     NotificationInvocation,
     PermissionRequestInvocation,
-    PostAgentTurnInvocation,
+    PostAgentInvocation,
     PostCompactInvocation,
+    PostToolInvocation,
     PreCompactInvocation,
+    PreToolInvocation,
     SessionEndInvocation,
     SessionStartInvocation,
     StopFailureInvocation,
@@ -57,14 +58,15 @@ from vibe.core.hooks.models import (
     WorktreeCreateInvocation,
 )
 from vibe.core.llm.format import ResolvedToolCall
-from vibe.core.logger import logger
-from vibe.core.types import ToolResultEvent
+from vibe.core.types import PersistedToolResult, ToolResultEvent
 from vibe.core.utils import (
     CANCELLATION_TAG,
     TOOL_ERROR_TAG,
     CancellationReason,
     get_user_cancellation_message,
 )
+from vibe.observability.logging import logger
+from vibe.utils.tool_presentation import ToolResultPresentation
 
 if TYPE_CHECKING:
     from opentelemetry import trace
@@ -86,7 +88,7 @@ _STOP_FAILURE_MESSAGE_MAX_CHARS = 2000
 _TASK_DESCRIPTION_MAX_CHARS = 500
 
 
-class _BeforeToolResolution(NamedTuple):
+class _PreToolResolution(NamedTuple):
     # ``denial_event`` is non-None when the pipeline ended in a denial
     # (explicit or synthesized from a failed rewrite re-validation);
     # callers yield it and stop.  Otherwise tool_call / tool_input hold
@@ -94,6 +96,20 @@ class _BeforeToolResolution(NamedTuple):
     tool_call: ResolvedToolCall
     tool_input: dict[str, Any]
     denial_event: ToolResultEvent | None
+
+
+@dataclass(frozen=True, slots=True)
+class PostToolFinalization:
+    tool_input: dict[str, Any]
+    tool_status: ToolStatus
+    response_status: Literal["success", "failure", "skipped"]
+    decision: ToolDecision | None
+    span: trace.Span
+    tool_output: dict[str, Any] | None = None
+    tool_presentation: ToolResultPresentation | None = None
+    tool_error: str | None = None
+    duration_ms: float = 0.0
+    initial_text: str = ""
 
 
 class AgentLoopHooksMixin:
@@ -112,6 +128,7 @@ class AgentLoopHooksMixin:
     _pending_session_start_source: str | None
     _pending_worktree_create: PreparedWorktree | None
     _prompt_blocked: bool
+    cwd: Path
 
     def _handle_tool_response(
         self,
@@ -120,6 +137,7 @@ class AgentLoopHooksMixin:
         status: Literal["success", "failure", "skipped"],
         decision: ToolDecision | None = None,
         result: dict[str, Any] | None = None,
+        persisted_result: PersistedToolResult | None = None,
         span: trace.Span | None = None,
     ) -> None: ...
 
@@ -137,7 +155,7 @@ class AgentLoopHooksMixin:
         return HookSessionContext(
             session_id=self.session_id,
             transcript_path=transcript,
-            cwd=str(Path.cwd().resolve()),
+            cwd=str(self.cwd),
             parent_session_id=self.parent_session_id,
         )
 
@@ -145,24 +163,22 @@ class AgentLoopHooksMixin:
     # Hook runners
     # ------------------------------------------------------------------
 
-    async def _run_post_agent_turn_hooks(
+    async def _run_post_agent_hooks(
         self,
     ) -> AsyncGenerator[HookEvent | HookUserMessage]:
         if not self._hooks_manager:
             return
-        invocation = PostAgentTurnInvocation(
-            **self._hook_session_context().model_dump()
-        )
+        invocation = PostAgentInvocation(**self._hook_session_context().model_dump())
         async for ev in self._hooks_manager.run(invocation):
             if isinstance(ev, (HookEvent, HookUserMessage)):
                 yield ev
 
-    async def _run_before_tool_hooks(
+    async def _run_pre_tool_hooks(
         self, tool_call: ResolvedToolCall, tool_input: dict[str, Any]
     ) -> AsyncGenerator[HookEvent | HookToolDenial | HookToolInputRewrite]:
         if not self._hooks_manager:
             return
-        invocation = BeforeToolInvocation(
+        invocation = PreToolInvocation(
             **self._hook_session_context().model_dump(),
             tool_name=tool_call.tool_name,
             tool_call_id=tool_call.call_id,
@@ -172,7 +188,7 @@ class AgentLoopHooksMixin:
             if isinstance(ev, (HookEvent, HookToolDenial, HookToolInputRewrite)):
                 yield ev
 
-    async def _run_after_tool_hooks(
+    async def _run_post_tool_hooks(
         self,
         tool_call: ResolvedToolCall,
         *,
@@ -185,7 +201,7 @@ class AgentLoopHooksMixin:
     ) -> AsyncGenerator[HookEvent | HookTextReplacement]:
         if not self._hooks_manager:
             return
-        invocation = AfterToolInvocation(
+        invocation = PostToolInvocation(
             **self._hook_session_context().model_dump(),
             tool_name=tool_call.tool_name,
             tool_call_id=tool_call.call_id,
@@ -513,10 +529,10 @@ class AgentLoopHooksMixin:
                 yield ev
 
     # ------------------------------------------------------------------
-    # After-tool collection helpers
+    # Post-tool collection helpers
     # ------------------------------------------------------------------
 
-    async def _collect_after_tool_events(
+    async def _collect_post_tool_events(
         self, tool_call: ResolvedToolCall, **kwargs: Any
     ) -> tuple[str, list[HookEvent]]:
         """List-returning variant for shielded paths (cancel / exception)
@@ -524,85 +540,89 @@ class AgentLoopHooksMixin:
         """
         final_text: str = kwargs.get("initial_text", "")
         events: list[HookEvent] = []
-        async for ev in self._run_after_tool_hooks(tool_call, **kwargs):
+        async for ev in self._run_post_tool_hooks(tool_call, **kwargs):
             if isinstance(ev, HookTextReplacement):
                 final_text = ev.text
             elif isinstance(ev, HookEvent):
                 events.append(ev)
         return final_text, events
 
-    async def _run_after_tool_and_finalize(
-        self,
-        tool_call: ResolvedToolCall,
-        *,
-        tool_input: dict[str, Any],
-        tool_status: ToolStatus,
-        response_status: Literal["success", "failure", "skipped"],
-        decision: ToolDecision | None = None,
-        span: trace.Span,
-        tool_output: dict[str, Any] | None = None,
-        tool_error: str | None = None,
-        duration_ms: float = 0.0,
-        initial_text: str = "",
+    async def _run_post_tool_and_finalize(
+        self, tool_call: ResolvedToolCall, finalization: PostToolFinalization
     ) -> AsyncGenerator[HookEvent]:
-        """Run after-tool hooks, apply text replacements, and record the response.
+        """Run post-tool hooks, apply text replacements, and record the response.
 
         Yields ``HookEvent`` instances for the caller to forward to the UI.
         The final text (after any ``HookTextReplacement``) is passed to
         ``_handle_tool_response`` together with the given *response_status*
         and *decision*.
         """
-        final_text = initial_text
-        async for ev in self._run_after_tool_hooks(
+        final_text = finalization.initial_text
+        async for ev in self._run_post_tool_hooks(
             tool_call,
-            tool_input=tool_input,
-            tool_status=tool_status,
-            tool_output=tool_output,
-            tool_error=tool_error,
-            duration_ms=duration_ms,
-            initial_text=initial_text,
+            tool_input=finalization.tool_input,
+            tool_status=finalization.tool_status,
+            tool_output=finalization.tool_output,
+            tool_error=finalization.tool_error,
+            duration_ms=finalization.duration_ms,
+            initial_text=finalization.initial_text,
         ):
             if isinstance(ev, HookTextReplacement):
                 final_text = ev.text
             else:
                 yield ev
+        persisted_result = (
+            PersistedToolResult(
+                output=finalization.tool_output,
+                duration=finalization.duration_ms / 1000.0,
+                cancelled=finalization.tool_status == "cancelled",
+                presentation=finalization.tool_presentation,
+            )
+            if finalization.response_status == "success"
+            and finalization.tool_output is not None
+            else None
+        )
         self._handle_tool_response(
-            tool_call, final_text, response_status, decision, tool_output, span=span
+            tool_call,
+            final_text,
+            finalization.response_status,
+            finalization.decision,
+            finalization.tool_output,
+            persisted_result,
+            span=finalization.span,
         )
 
     # ------------------------------------------------------------------
-    # Before-tool pipeline
+    # Pre-tool pipeline
     # ------------------------------------------------------------------
 
-    async def _run_before_tool_pipeline(
+    async def _run_pre_tool_pipeline(
         self,
         tool_call: ResolvedToolCall,
         tool_input: dict[str, Any],
         *,
         span: trace.Span,
-    ) -> tuple[list[HookEvent], _BeforeToolResolution]:
+    ) -> tuple[list[HookEvent], _PreToolResolution]:
         """Validate each rewrite as it arrives; first invalid one aborts the chain.
 
-        Events are buffered (not streamed) because before_tool hooks are
+        Events are buffered (not streamed) because pre_tool hooks are
         gating checks expected to complete quickly.
         """
         events: list[HookEvent] = []
-        async for ev in self._run_before_tool_hooks(tool_call, tool_input):
+        async for ev in self._run_pre_tool_hooks(tool_call, tool_input):
             if isinstance(ev, HookToolDenial):
-                return events, _BeforeToolResolution(
+                return events, _PreToolResolution(
                     tool_call=tool_call,
                     tool_input=tool_input,
-                    denial_event=self._handle_before_tool_denial(
-                        tool_call, ev, span=span
-                    ),
+                    denial_event=self._handle_pre_tool_denial(tool_call, ev, span=span),
                 )
             if isinstance(ev, HookToolInputRewrite):
                 rewritten = self._apply_tool_input_rewrite(tool_call, ev)
                 if isinstance(rewritten, HookToolDenial):
-                    return events, _BeforeToolResolution(
+                    return events, _PreToolResolution(
                         tool_call=tool_call,
                         tool_input=tool_input,
-                        denial_event=self._handle_before_tool_denial(
+                        denial_event=self._handle_pre_tool_denial(
                             tool_call, rewritten, span=span
                         ),
                     )
@@ -610,7 +630,7 @@ class AgentLoopHooksMixin:
                 continue
             events.append(ev)
 
-        return events, _BeforeToolResolution(
+        return events, _PreToolResolution(
             tool_call=tool_call, tool_input=tool_input, denial_event=None
         )
 
@@ -665,7 +685,7 @@ class AgentLoopHooksMixin:
                     tc.function.arguments = encoded
                     return
 
-    def _handle_before_tool_denial(
+    def _handle_pre_tool_denial(
         self, tool_call: ResolvedToolCall, denial: HookToolDenial, *, span: trace.Span
     ) -> ToolResultEvent:
         self.stats.tool_calls_hook_denied += 1
@@ -718,13 +738,13 @@ class AgentLoopHooksMixin:
         span: trace.Span,
         tool_started: bool,
     ) -> AsyncGenerator[HookEvent]:
-        """Shield after-tool hooks from cancellation so audit/redaction hooks
+        """Shield post-tool hooks from cancellation so audit/redaction hooks
         still observe the cancelled call.  Yields ``HookEvent`` instances.
 
-        Skips after_tool entirely when ``tool_started`` is False (cancel
+        Skips post_tool entirely when ``tool_started`` is False (cancel
         landed before the tool body ran — e.g. during the approval prompt).
-        That matches the before_tool denial path, which also doesn't fire
-        after_tool: hooks never observe a phantom completion for a tool
+        That matches the pre_tool denial path, which also doesn't fire
+        post_tool: hooks never observe a phantom completion for a tool
         that never executed.
         """
         if not tool_started:
@@ -734,7 +754,7 @@ class AgentLoopHooksMixin:
             return
         try:
             final_text, hook_events = await asyncio.shield(
-                self._collect_after_tool_events(
+                self._collect_post_tool_events(
                     tool_call,
                     tool_input=tool_input,
                     tool_status="cancelled",
@@ -768,7 +788,7 @@ class AgentLoopHooksMixin:
 
         events: list[HookEvent] = []
         retry_msg: LLMMessage | None = None
-        async for hook_event in self._run_post_agent_turn_hooks():
+        async for hook_event in self._run_post_agent_hooks():
             if isinstance(hook_event, HookUserMessage):
                 retry_msg = LLMMessage(
                     role=Role.user, content=hook_event.content, injected=True

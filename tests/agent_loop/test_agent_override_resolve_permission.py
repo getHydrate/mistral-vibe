@@ -6,9 +6,9 @@ from vibe.core.paths import PLANS_DIR
 from vibe.core.tools.base import ToolPermission
 
 
-class TestPlanAgentWriteFileResolvePermission:
-    """Plan agent sets write_file to NEVER with allowlist=[plans/*].
-    resolve_permission must use this, not the base config.
+class TestPlanAgentResolvePermission:
+    """Plan agent overrides write_file/edit to NEVER with allowlist=[plans/*]
+    and allowlists read_file on [plans/*]. resolve_permission must reflect this.
     """
 
     def test_write_file_to_non_plan_path_denied_in_plan_mode(self) -> None:
@@ -57,6 +57,38 @@ class TestPlanAgentWriteFileResolvePermission:
         assert ctx is not None
         assert ctx.permission == ToolPermission.NEVER
 
+    def test_edit_to_plan_path_allowed_in_plan_mode(self) -> None:
+        config = build_test_vibe_config()
+        agent = build_test_agent_loop(config=config, agent_name=BuiltinAgentName.PLAN)
+
+        tool = agent.tool_manager.get("edit")
+        from vibe.core.tools.builtins.edit import EditArgs
+
+        plan_path = str(PLANS_DIR.path / "my-plan.md")
+        args = EditArgs(file_path=plan_path, old_string="a", new_string="b")
+
+        ctx = tool.resolve_permission(args)
+
+        assert ctx is not None
+        assert ctx.permission == ToolPermission.ALWAYS
+
+    def test_read_file_to_plan_path_allowed_in_plan_mode(self) -> None:
+        config = build_test_vibe_config()
+        agent = build_test_agent_loop(config=config, agent_name=BuiltinAgentName.PLAN)
+
+        tool = agent.tool_manager.get("read_file")
+        from vibe.core.tools.builtins.read_file import ReadFileArgs
+
+        plan_path = str(PLANS_DIR.path / "my-plan.md")
+        args = ReadFileArgs(file_path=plan_path)
+
+        ctx = tool.resolve_permission(args)
+
+        # Plan path is in the allowlist, so should be ALWAYS even though
+        # PLANS_DIR lives outside the workdir.
+        assert ctx is not None
+        assert ctx.permission == ToolPermission.ALWAYS
+
 
 class TestAcceptEditsAgentResolvePermission:
     """Accept-edits agent sets write_file/edit to ALWAYS.
@@ -86,7 +118,7 @@ class TestAcceptEditsAgentResolvePermission:
 class TestAgentOverrideNotLeakedAcrossSwitches:
     """Switching agents must change what resolve_permission returns."""
 
-    def test_switch_from_plan_to_default_restores_write_permission(self) -> None:
+    def test_switch_from_plan_to_ask_restores_write_permission(self) -> None:
         config = build_test_vibe_config()
         agent = build_test_agent_loop(config=config, agent_name=BuiltinAgentName.PLAN)
 
@@ -100,10 +132,10 @@ class TestAgentOverrideNotLeakedAcrossSwitches:
         assert ctx_plan is not None
         assert ctx_plan.permission == ToolPermission.NEVER
 
-        # Switch to default
-        agent.agent_manager.switch_profile(BuiltinAgentName.DEFAULT)
+        # Switch to ask
+        agent.agent_manager.switch_profile(BuiltinAgentName.ASK)
 
-        # In default mode: should NOT be NEVER
-        ctx_default = tool.resolve_permission(args)
-        assert ctx_default is not None
-        assert ctx_default.permission != ToolPermission.NEVER
+        # In ask mode: should NOT be NEVER
+        ctx_ask = tool.resolve_permission(args)
+        assert ctx_ask is not None
+        assert ctx_ask.permission != ToolPermission.NEVER

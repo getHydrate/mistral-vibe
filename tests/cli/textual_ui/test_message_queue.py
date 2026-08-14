@@ -4,6 +4,7 @@ import asyncio
 
 import pytest
 
+from vibe.app_server.models import MentionStats, PreparedPrompt
 from vibe.cli.textual_ui.message_queue import (
     MessageQueue,
     QueueController,
@@ -12,7 +13,6 @@ from vibe.cli.textual_ui.message_queue import (
     QueuePorts,
 )
 from vibe.cli.textual_ui.widgets.messages import UserMessage
-from vibe.core.autocompletion.path_prompt import PathPromptPayload
 
 
 def test_empty_queue_is_falsy() -> None:
@@ -160,9 +160,11 @@ def test_item_kinds_round_trip(kind: QueuedItemKind, content: str) -> None:
 
 
 @pytest.mark.asyncio
-async def test_inject_head_item_awaits_async_payload_renderer() -> None:
-    payload = PathPromptPayload(
-        display_text="display", prompt_text="prompt", resources=[], all_resources=[]
+async def test_inject_head_item_uses_prepared_prompt() -> None:
+    prepared_prompt = PreparedPrompt(
+        display_text="display",
+        prompt_text="rendered prompt",
+        mentions=MentionStats(count=1, context_types={"file": 1}),
     )
     injected: dict[str, object] = {}
     telemetry: dict[str, object] = {}
@@ -173,22 +175,14 @@ async def test_inject_head_item_awaits_async_payload_renderer() -> None:
     def noop_task(*args, **kwargs) -> asyncio.Task[None]:
         return asyncio.create_task(noop_async())
 
-    async def render_payload(received: PathPromptPayload) -> str:
-        await asyncio.sleep(0)
-        assert received is payload
-        return "rendered prompt"
-
     async def inject_queued_prompt(content: str, **kwargs) -> None:
         injected["content"] = content
         injected["images"] = kwargs["images"]
         injected["client_message_id"] = kwargs["client_message_id"]
+        injected["mention_stats"] = kwargs["mention_stats"]
 
     def send_skill_telemetry(skill_name: str | None) -> None:
         telemetry["skill_name"] = skill_name
-
-    def send_at_mention_telemetry(received: PathPromptPayload, message_id: str) -> None:
-        telemetry["payload"] = received
-        telemetry["message_id"] = message_id
 
     controller = QueueController(
         QueuePorts(
@@ -199,28 +193,25 @@ async def test_inject_head_item_awaits_async_payload_renderer() -> None:
             remove_loading_widget=noop_async,
             set_loading_queue_count=lambda count: None,
             inject_queued_prompt=inject_queued_prompt,
-            next_message_index=lambda: 42,
             start_agent_turn=noop_task,
             await_agent_turn=noop_async,
             run_bash=noop_task,
-            maybe_show_feedback_bar=lambda: None,
+            maybe_show_feedback_bar=noop_async,
             send_skill_telemetry=send_skill_telemetry,
-            send_at_mention_telemetry=send_at_mention_telemetry,
-            render_payload=render_payload,
         )
     )
     item = QueuedItem(
-        QueuedItemKind.PROMPT, "raw prompt", skill_name="skill", payload=payload
+        QueuedItemKind.PROMPT,
+        "raw prompt",
+        skill_name="skill",
+        prepared_prompt=prepared_prompt,
     )
     widget = UserMessage("raw prompt", pending=True)
 
     await controller._inject_head_item(item, widget)
 
-    assert widget.message_index == 42
+    assert widget.history_entry_id == injected["client_message_id"]
     assert injected["content"] == "rendered prompt"
     assert isinstance(injected["client_message_id"], str)
-    assert telemetry == {
-        "skill_name": "skill",
-        "payload": payload,
-        "message_id": injected["client_message_id"],
-    }
+    assert injected["mention_stats"] == prepared_prompt.mentions
+    assert telemetry == {"skill_name": "skill"}

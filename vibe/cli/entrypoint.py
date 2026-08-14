@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+# isort: off
+# Capture the process-start monotonic timestamp as early as possible (before
+# any heavier imports below) so the vibe.startup metric measures from true
+# process start. Re-exported for any consumer that needs the same anchor.
+from vibe.cli.process_start import PROCESS_START_MONOTONIC as PROCESS_START_MONOTONIC
+# isort: on
+
 import argparse
-from collections.abc import Callable
 import os
 from pathlib import Path
 import sys
@@ -22,6 +28,8 @@ def parse_arguments() -> argparse.Namespace:
         description="Run the Mistral Vibe interactive CLI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=(
+            "Commands:\n"
+            "  mcp            Manage MCP server configuration (vibe mcp --help).\n\n"
             "Environment variables:\n"
             "  VIBE_HOME       Override the Vibe home directory (default: ~/.vibe)\n"
             "  LOG_LEVEL       Logging level: DEBUG, INFO, WARNING (default), ERROR, CRITICAL.\n"
@@ -101,7 +109,7 @@ def parse_arguments() -> argparse.Namespace:
         "--agent",
         metavar="NAME",
         default=None,
-        help="Agent to use (builtin: default, plan, accept-edits, auto-approve, "
+        help="Agent to use (builtin: ask, plan, accept-edits, auto-approve, "
         "or custom from ~/.vibe/agents/NAME.toml). Defaults to the "
         "'default_agent' config setting in both interactive and programmatic "
         "(-p/--prompt) mode.",
@@ -126,10 +134,15 @@ def parse_arguments() -> argparse.Namespace:
     )
     parser.add_argument(
         "--worktree",
+        nargs="?",
+        const=True,
+        default=None,
         metavar="NAME",
-        help="Create (or reuse) a git worktree under $VIBE_HOME/worktrees on "
-        "a branch named NAME and run inside it. Implicitly trusted for the "
-        "session. Ignored with --setup and --check-upgrade.",
+        help="Run inside a git worktree under $VIBE_HOME/worktrees. With NAME, "
+        "create (or reuse) a worktree and branch named NAME. Without NAME, "
+        "create a new one named after the prompt (or a random slug) on a "
+        "vibe/<name> branch. Implicitly trusted for the session. Ignored with "
+        "--setup and --check-upgrade.",
     )
     parser.add_argument(
         "--add-dir",
@@ -168,41 +181,6 @@ def parse_arguments() -> argparse.Namespace:
         help="Resume a session. Without SESSION_ID, shows an interactive picker.",
     )
     return parser.parse_args()
-
-
-def check_and_resolve_trusted_folder(cwd: Path) -> None:
-    from rich import print as rprint
-
-    from vibe.core.trusted_folders import (
-        apply_workspace_trust_decision,
-        maybe_build_workspace_trust_prompt,
-    )
-    from vibe.setup.trusted_folders.trust_folder_dialog import (
-        TrustDialogQuitException,
-        ask_trust_folder,
-    )
-
-    prompt = maybe_build_workspace_trust_prompt(cwd)
-    if prompt is None:
-        return
-
-    try:
-        decision = ask_trust_folder(
-            prompt.cwd,
-            prompt.repo_root,
-            prompt.detected_files,
-            repo_detected_files=prompt.repo_detected_files,
-            offer_repo_trust=prompt.offer_repo_trust,
-            repo_explicitly_untrusted=prompt.repo_explicitly_untrusted,
-        )
-    except (KeyboardInterrupt, EOFError, TrustDialogQuitException):
-        sys.exit(0)
-    except Exception as e:
-        rprint(f"[yellow]Error showing trust dialog: {e}[/]")
-        return
-
-    if decision is not None:
-        apply_workspace_trust_decision(prompt, decision)
 
 
 def _prompt_remove_worktree(
@@ -282,14 +260,52 @@ def _cleanup_worktree_on_exit(worktree: PreparedWorktree) -> None:
         rprint(f"[dim]Kept branch: {worktree.branch}[/]", file=sys.stderr)
 
 
+def _suggest_worktree_name(prompt: str | None) -> str | None:
+    # Bare `vibe --worktree` has nothing to name from, so skip the dotenv read
+    # and the event loop rather than spinning both up to be told None.
+    if not prompt:
+        return None
+
+    import asyncio
+
+    from vibe.core.config.harness_files import init_harness_files_manager
+    from vibe.core.config.vibe_schema import load_dotenv_values
+    from vibe.core.worktree_naming_model import suggest_worktree_name
+
+    # Worktrees are prepared before run_cli, so neither of the things the
+    # suggestion needs has happened yet. ~/.vibe/.env is not in os.environ, so a
+    # key that lives only there would read as absent; and loading config
+    # resolves prompts through the global harness manager, which is not
+    # initialised until later in main(). Both calls are idempotent -- the second
+    # init with these same sources returns without replacing the singleton.
+    load_dotenv_values()
+    init_harness_files_manager("user", "project")
+    return asyncio.run(suggest_worktree_name(prompt, cwd=Path.cwd()))
+
+
 def main() -> None:
+    from vibe.core.utils.windows_asyncio import (
+        silence_proactor_transport_teardown_warnings,
+    )
+
+    silence_proactor_transport_teardown_warnings()
+
+    if sys.argv[1:2] == ["mcp"]:
+        from vibe.cli.mcp_command import run_mcp_cli
+
+        run_mcp_cli(sys.argv[2:])
+        return
+
     args = parse_arguments()
     worktree_session: PreparedWorktree | None = None
 
     from rich import print as rprint
 
     from vibe.core.config.harness_files import init_harness_files_manager
-    from vibe.core.trusted_folders import trusted_folders_manager
+    from vibe.core.paths import LOG_FILE
+    from vibe.observability.logging import init_file_logging
+
+    init_file_logging(LOG_FILE.path)
 
     if args.workdir:
         workdir = args.workdir.expanduser().resolve()
@@ -306,12 +322,22 @@ def main() -> None:
         from vibe.core.worktree import (
             WorktreeError,
             announce_worktree_session,
+            prepare_auto_worktree_session,
             prepare_worktree_session,
         )
 
-        rprint(f"[dim]Preparing worktree {args.worktree!r}...[/]", file=sys.stderr)
+        requested = "" if args.worktree is True else f" {args.worktree!r}"
+        rprint(f"[dim]Preparing worktree{requested}...[/]", file=sys.stderr)
         try:
-            worktree_session = prepare_worktree_session(args.worktree, Path.cwd())
+            if args.worktree is True:
+                prompt = args.prompt or args.initial_prompt
+                worktree_session = prepare_auto_worktree_session(
+                    Path.cwd(),
+                    prompt=prompt,
+                    suggested_name=_suggest_worktree_name(prompt),
+                )
+            else:
+                worktree_session = prepare_worktree_session(args.worktree, Path.cwd())
         except WorktreeError as e:
             rprint(f"[red]Error: {e}[/]")
             sys.exit(1)
@@ -323,7 +349,7 @@ def main() -> None:
         os.chdir(target)
 
     try:
-        cwd = Path.cwd()
+        Path.cwd()
     except FileNotFoundError:
         rprint(
             "[red]Error: Current working directory no longer exists.[/]\n"
@@ -332,9 +358,6 @@ def main() -> None:
             "or use --workdir to specify a working directory.[/]"
         )
         sys.exit(1)
-
-    if args.trust or args.worktree:
-        trusted_folders_manager.trust_for_session(cwd)
 
     additional_dirs: list[Path] = []
     for d in args.add_dir:
@@ -346,31 +369,21 @@ def main() -> None:
             )
             sys.exit(1)
         additional_dirs.append(resolved)
-        trusted_folders_manager.trust_for_session(resolved)
 
-    init_harness_files_manager("user", "project", additional_dirs=additional_dirs)
+    args.add_dir = [str(path) for path in additional_dirs]
+    init_harness_files_manager("user", "project")
 
-    resolve_trusted_folder: Callable[[], None] | None = None
-    if args.prompt is None and not args.check_upgrade:
-
-        def _resolve_trusted_folder() -> None:
-            check_and_resolve_trusted_folder(cwd)
-
-        resolve_trusted_folder = _resolve_trusted_folder
-
-    _run_cli_with_worktree_cleanup(args, worktree_session, resolve_trusted_folder)
+    _run_cli_with_worktree_cleanup(args, worktree_session)
 
 
 def _run_cli_with_worktree_cleanup(
-    args: argparse.Namespace,
-    worktree_session: PreparedWorktree | None,
-    resolve_trusted_folder: Callable[[], None] | None,
+    args: argparse.Namespace, worktree_session: PreparedWorktree | None
 ) -> None:
     from vibe.cli.cli import run_cli
 
     session_started = False
     try:
-        run_cli(args, resolve_trusted_folder=resolve_trusted_folder)
+        run_cli(args)
         session_started = True
     except SystemExit as e:
         session_started = e.code in {0, None}

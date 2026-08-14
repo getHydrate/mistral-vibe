@@ -11,17 +11,21 @@ import sys
 import threading
 from typing import TYPE_CHECKING, Any, TypeGuard
 
-from vibe.core.config.harness_files import get_harness_files_manager
-from vibe.core.logger import logger
+from vibe.core.config.harness_files import (
+    HarnessFilesManager,
+    get_harness_files_manager,
+)
 from vibe.core.paths import DEFAULT_TOOL_DIR
 from vibe.core.tools.base import BaseTool, BaseToolConfig, ToolPermission
 from vibe.core.tools.remote import MCPTool
+from vibe.core.tools.terminal_runtime import TerminalRuntime
 from vibe.core.types import AvailableFunction
-from vibe.core.utils import name_matches, run_sync
-from vibe.core.utils.io import read_safe
+from vibe.core.utils import is_windows, name_matches, run_sync
+from vibe.observability.logging import logger
+from vibe.utils.io import read_safe
 
 if TYPE_CHECKING:
-    from vibe.core.config import AnyVibeConfig
+    from vibe.core.config import VibeConfigSchema
     from vibe.core.tools.connectors.connector_registry import ConnectorRegistry
     from vibe.core.tools.mcp.registry import MCPRegistry
 
@@ -37,11 +41,20 @@ def _try_canonical_module_name(path: Path) -> str | None:
     except (OSError, ValueError):
         return None
 
-    try:
-        vibe_idx = parts.index("vibe")
-    except ValueError:
+    package_indices = [
+        idx
+        for idx, part in enumerate(parts)
+        if part == "vibe"
+        and idx + 1 < len(parts)
+        and (
+            parts[idx + 1] in {"acp", "cli", "core", "setup"}
+            or parts[idx + 1].endswith(".py")
+        )
+    ]
+    if not package_indices:
         return None
 
+    vibe_idx = package_indices[-1]
     if vibe_idx + 1 >= len(parts):
         return None
 
@@ -73,15 +86,25 @@ class ToolManager:
 
     def __init__(
         self,
-        config_getter: Callable[[], AnyVibeConfig],
+        config_getter: Callable[[], VibeConfigSchema],
         mcp_registry: MCPRegistry | None = None,
         connector_registry: ConnectorRegistry | None = None,
         *,
         defer_mcp: bool = False,
         permission_getter: Callable[[str], ToolPermission | None] | None = None,
+        local_managed_shell_runtime_enabled: bool = True,
+        cwd: Path | None = None,
+        harness_files: HarnessFilesManager | None = None,
+        scratchpad_dir: Path | None = None,
+        terminal_runtime: TerminalRuntime | None = None,
     ) -> None:
         self._config_getter = config_getter
+        self._cwd = (cwd or Path.cwd()).resolve()
+        self._harness_files = harness_files or get_harness_files_manager()
+        self._scratchpad_dir = scratchpad_dir
+        self.terminal_runtime = terminal_runtime or TerminalRuntime()
         self._permission_getter = permission_getter
+        self._local_managed_shell_runtime_enabled = local_managed_shell_runtime_enabled
         self._mcp_registry = mcp_registry
         self._connector_registry = connector_registry
         self._instances: dict[str, BaseTool] = {}
@@ -117,16 +140,15 @@ class ToolManager:
         return self._mcp_registry
 
     @property
-    def _config(self) -> AnyVibeConfig:
+    def _config(self) -> VibeConfigSchema:
         return self._config_getter()
 
-    @staticmethod
-    def _compute_search_paths(config: AnyVibeConfig) -> list[Path]:
+    def _compute_search_paths(self, config: VibeConfigSchema) -> list[Path]:
         paths: list[Path] = [DEFAULT_TOOL_DIR.path]
 
         paths.extend(config.tool_paths)
 
-        mgr = get_harness_files_manager()
+        mgr = self._harness_files
         paths.extend(mgr.project_tools_dirs)
         paths.extend(mgr.user_tools_dirs)
 
@@ -182,9 +204,17 @@ class ToolManager:
             except Exception:
                 return
 
+        # Builtin tool modules import shared base classes (e.g. BashOutput) from
+        # sibling files; drop those re-exports so they are not registered twice
+        # under the importing module. Custom tool files may legitimately re-export
+        # tool classes, so the filter is scoped to the builtin directory only.
+        is_builtin = file_path.resolve().is_relative_to(DEFAULT_TOOL_DIR.path.resolve())
+
         tools = []
         for tool_obj in vars(module).values():
             if not inspect.isclass(tool_obj):
+                continue
+            if is_builtin and tool_obj.__module__ != module.__name__:
                 continue
             if not issubclass(tool_obj, BaseTool) or tool_obj is BaseTool:
                 continue
@@ -293,11 +323,36 @@ class ToolManager:
         return result
 
     def _is_tool_available(self, cls: type[BaseTool]) -> bool:
+        if (
+            cls.local_managed_shell_only
+            and not self._local_managed_shell_runtime_enabled
+        ):
+            return False
+        if not self._is_enabled_for_shell_rollout(cls):
+            return False
+        return self._is_tool_runtime_available(cls)
+
+    def _is_tool_runtime_available(self, cls: type[BaseTool]) -> bool:
         # Backwards-compatibility check to avoid breaking
         # existing custom tools that call is_available without parameters
         if inspect.signature(cls.is_available).parameters:
             return cls.is_available(self._config)
         return cls.is_available()
+
+    def _is_enabled_for_shell_rollout(self, cls: type[BaseTool]) -> bool:
+        match cls.shell_rollout:
+            case None:
+                return True
+            case "managed":
+                return self._config.managed_shell_tools_enabled
+            case "legacy":
+                if not self._config.managed_shell_tools_enabled:
+                    return True
+                if not is_windows():
+                    return True
+                return False
+            case _:
+                return True
 
     def _tool_variants_for_name(
         self, name: str, fallback: type[BaseTool]
@@ -601,9 +656,21 @@ class ToolManager:
         cached = self._instances.get(tool_name)
         if cached is not None and type(cached) is tool_class:
             return cached
-        instance = tool_class.from_config(lambda: self.get_tool_config(tool_name))
+        instance = tool_class.from_config(
+            lambda: self.get_tool_config(tool_name),
+            cwd=self._cwd,
+            harness_files=self._harness_files,
+            scratchpad_dir=self._scratchpad_dir,
+            terminal_runtime=self.terminal_runtime,
+        )
         self._instances[tool_name] = instance
         return instance
+
+    def pop_mcp_errors(self) -> dict[str, str]:
+        """Return and clear pending MCP discovery errors (server name -> message)."""
+        if self._mcp_registry is None:
+            return {}
+        return self._mcp_registry.pop_failed()
 
     def reset_all(self) -> None:
         self._instances.clear()

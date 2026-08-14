@@ -3,13 +3,13 @@ from __future__ import annotations
 import pytest
 from textual import events
 
+from tests.stubs.app_config import build_test_app_config
 from vibe.cli.textual_ui.widgets.voice_app import VoiceApp
-from vibe.core.config import VibeConfig
 
 
 @pytest.fixture
 def app(monkeypatch: pytest.MonkeyPatch) -> VoiceApp:
-    widget = VoiceApp(VibeConfig())
+    widget = VoiceApp(build_test_app_config())
     monkeypatch.setattr(widget, "_update_display", lambda: None)
     return widget
 

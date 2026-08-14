@@ -4,20 +4,21 @@ import json
 from pathlib import Path
 from typing import Any
 
-from acp.schema import TextContentBlock
+from acp.schema import TextContentBlock, UserMessageChunk
 from pydantic import ValidationError
 import pytest
 
 from tests.stubs.fake_backend import FakeBackend
 from tests.stubs.fake_client import FakeClient
-from vibe.acp.acp_agent_loop import VibeAcpAgentLoop
+from vibe.acp.agent import VibeAcpAgent as VibeAcpAgentLoop
 from vibe.acp.exceptions import InvalidRequestError
 from vibe.acp.user_display_content import (
     USER_DISPLAY_CONTENT_META_KEY,
     parse_user_display_content_metadata,
 )
 from vibe.core.session.session_loader import SessionLoader
-from vibe.core.types import Role, UserDisplayContentMetadata
+from vibe.core.types import Role
+from vibe.user_content import UserDisplayContent
 
 
 def _metadata_payload() -> dict[str, object]:
@@ -55,7 +56,7 @@ def test_parse_validates_present_metadata() -> None:
         "content": [],
     })
 
-    assert metadata == UserDisplayContentMetadata(
+    assert metadata == UserDisplayContent(
         version="1.0.0", host="mistral-vscode", content=[]
     )
 
@@ -67,6 +68,34 @@ def test_parse_rejects_invalid_metadata() -> None:
             "host": "mistral-vscode",
             "content": [],
         })
+
+
+@pytest.mark.asyncio
+async def test_prompt_streams_user_display_content_on_user_message_chunk(
+    acp_agent_loop: VibeAcpAgentLoop,
+) -> None:
+    session_response = await acp_agent_loop.new_session(
+        cwd=str(Path.cwd()), mcp_servers=[]
+    )
+    fake_client: FakeClient = acp_agent_loop.client  # type: ignore[assignment]
+    fake_client._session_updates.clear()
+    payload = _metadata_payload()
+
+    response = await acp_agent_loop.prompt(
+        prompt=[TextContentBlock(type="text", text="Look at app.ts")],
+        session_id=session_response.session_id,
+        **_metadata_kwargs(payload),
+    )
+
+    assert response.stop_reason == "end_turn"
+    user_updates = [
+        update
+        for update in fake_client._session_updates
+        if isinstance(update.update, UserMessageChunk)
+    ]
+
+    assert len(user_updates) == 1
+    assert user_updates[0].update.field_meta == {USER_DISPLAY_CONTENT_META_KEY: payload}
 
 
 @pytest.mark.asyncio
@@ -90,9 +119,8 @@ async def test_prompt_attaches_user_display_content_to_user_message(
     )
     assert user_message is not None
     assert user_message.content == "Look at app.ts"
-    assert (
-        user_message.user_display_content
-        == UserDisplayContentMetadata.model_validate(payload)
+    assert user_message.user_display_content == UserDisplayContent.model_validate(
+        payload
     )
 
 
@@ -140,5 +168,5 @@ async def test_prompt_persists_user_display_content(
     loaded_messages, _metadata = SessionLoader.load_session(session_dir)
     loaded_user_message = next(msg for msg in loaded_messages if msg.role == Role.user)
     assert loaded_user_message.user_display_content == (
-        UserDisplayContentMetadata.model_validate(payload)
+        UserDisplayContent.model_validate(payload)
     )
