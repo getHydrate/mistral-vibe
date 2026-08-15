@@ -3,10 +3,10 @@
 > [!IMPORTANT]
 > This is the **[Hydrate](https://github.com/getHydrate/hydrate-public) fork** of
 > [Mistral Vibe](https://github.com/mistralai/mistral-vibe), tracking
-> upstream (currently **v2.19.1**) as a strict superset. It adds:
+> upstream (currently **v2.24.1**) as a strict superset. It adds:
 >
 > - **Ten lifecycle hook events** on top of upstream's native
->   `post_agent_turn` / `before_tool` / `after_tool`: `user_prompt_submit`,
+>   `post_agent` / `pre_tool` / `post_tool`: `user_prompt_submit`,
 >   `session_start`, `session_end`, `pre_compact`, `post_compact`,
 >   `stop_failure`, `notification`, `subagent_start`, `subagent_stop`,
 >   `worktree_create` — plus a blocking `permission_request` tool hook.
@@ -843,7 +843,7 @@ Fires per tool call, **before** the user permission prompt. First deny short-cir
 
 Fires per tool call **if and only if the tool body actually ran**. `tool_status` is `success`, `failure`, or `cancelled` (cancellation during the tool body — cancellation is shielded so audit hooks still run). Does not fire when the tool never executed: `pre_tool` denial, user denial at the approval prompt, permission `NEVER`, or cancellation before the body started.
 
-In addition to the tool-name `match`, an `after_tool` TOML entry accepts an optional `match_status = "success" | "failure" | "cancelled"` — the hook then fires only for that `tool_status` (unset fires on all). The two matchers combine: `match = "bash"` + `match_status = "failure"` runs only on failing bash calls. `match_status = "failure"` covers Claude Code's `PostToolUseFailure` without a separate event.
+In addition to the tool-name `match`, a `post_tool` TOML entry accepts an optional `match_status = "success" | "failure" | "cancelled"` — the hook then fires only for that `tool_status` (unset fires on all). The two matchers combine: `match = "bash"` + `match_status = "failure"` runs only on failing bash calls. `match_status = "failure"` covers Claude Code's `PostToolUseFailure` without a separate event.
 
 - **Receives** (in addition to the session context): `tool_name`, `tool_call_id`, `tool_input` (post-rewrite), `tool_status`, `tool_output` (structured result dict; null on failure), `tool_output_text` (the running text the LLM will see, mutable by prior hooks), `tool_error`, `duration_ms`.
 - **Can return**:
@@ -858,27 +858,27 @@ Skills load through the built-in `skill` tool, so tool hooks target them with `m
 ```toml
 [[hooks]]
 name = "skill-audit"
-type = "before_tool"
+type = "pre_tool"
 match = "skill"                      # tool_input is {"name": "<skill-name>"}
 command = "/path/to/audit-skill"
 ```
 
-This covers **model-invoked** loads — the model calling the `skill` tool — which run the full pipeline: `before_tool` fires (a deny blocks the load), then `after_tool`. A **user-typed** `/skill-name` command is different: Vibe expands it by injecting a synthetic `skill` tool call directly into the transcript, so the tool pipeline never runs and tool hooks do **not** fire for it (the synthetic call is still visible in the transcript). To observe or gate user-typed skill invocations, use a `user_prompt_submit` hook and check for the leading `/` in `prompt`.
+This covers **model-invoked** loads — the model calling the `skill` tool — which run the full pipeline: `pre_tool` fires (a deny blocks the load), then `post_tool`. A **user-typed** `/skill-name` command is different: Vibe expands it by injecting a synthetic `skill` tool call directly into the transcript, so the tool pipeline never runs and tool hooks do **not** fire for it (the synthetic call is still visible in the transcript). To observe or gate user-typed skill invocations, use a `user_prompt_submit` hook and check for the leading `/` in `prompt`.
 
 #### `permission_request` (Hydrate fork)
 
 > Added by the [Hydrate](https://github.com/getHydrate/hydrate-public) fork. A **tool hook**
-> (accepts `match` / `strict`) like `before_tool` / `after_tool`.
+> (accepts `match` / `strict`) like `pre_tool` / `post_tool`.
 
-Fires per tool call whose permission verdict is ASK — after `before_tool`, **before** the `notification` hook and before the approval prompt. A hook can approve or decline on the user's behalf, or pass through to the normal prompt. The first hook to return an explicit decision wins (allow OR deny — `before_tool`'s first-deny-wins convention extended to both decisive outcomes); the rest of the chain is skipped. Does not fire when no approval is needed (permission `ALWAYS`/`NEVER`, `--yolo`, or a session rule already covering the call).
+Fires per tool call whose permission verdict is ASK — after `pre_tool`, **before** the `notification` hook and before the approval prompt. A hook can approve or decline on the user's behalf, or pass through to the normal prompt. The first hook to return an explicit decision wins (allow OR deny — `pre_tool`'s first-deny-wins convention extended to both decisive outcomes); the rest of the chain is skipped. Does not fire when no approval is needed (permission `ALWAYS`/`NEVER`, `--yolo`, or a session rule already covering the call).
 
-- **Receives** (in addition to the session context): `tool_name`, `tool_call_id`, `tool_input` (serialized validated arguments, post-`before_tool`-rewrite), `required_permissions` (a list of objects — `scope`, `invocation_pattern`, `session_pattern`, `label` — describing the uncovered permissions the prompt would ask for).
+- **Receives** (in addition to the session context): `tool_name`, `tool_call_id`, `tool_input` (serialized validated arguments, post-`pre_tool`-rewrite), `required_permissions` (a list of objects — `scope`, `invocation_pattern`, `session_pattern`, `label` — describing the uncovered permissions the prompt would ask for).
 - **Can return** — `decision` for this hook type is three-valued and **defaults to `"ask"`**, so an observational hook echoing `{}` can never auto-approve:
   - `decision: "allow"` — approve on the user's behalf. No prompt is shown and the `notification` hook does not fire; downstream is indistinguishable from an interactive "yes". No session rule is recorded — the approval covers this call only.
   - `decision: "deny"` + `reason` — decline on the user's behalf. The tool is skipped exactly as if the user had declined, with `reason` as the model-visible feedback.
   - `decision: "ask"` (or empty stdout / omitted `decision`) — pass through: next hook, then the normal notification + approval prompt flow.
   - `system_message` — UI-only.
-- **Failures** (non-zero exit, timeout, non-conforming stdout) pass through by default; under `strict = true` they deny (same escalation convention as `before_tool`).
+- **Failures** (non-zero exit, timeout, non-conforming stdout) pass through by default; under `strict = true` they deny (same escalation convention as `pre_tool`).
 
 > **Deliberate divergence from Claude Code**: Claude Code's
 > `PermissionRequest` hook only fires interactively. Vibe's
